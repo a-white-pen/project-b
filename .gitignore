@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+*.egg-info/
+tests/
+cloud-sql-proxy
+*.docx
+~$*.docx
+HANDOFF.md
+.claude/settings.local.json
