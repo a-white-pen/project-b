@@ -16,6 +16,7 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["telegram*", "domains*", "pulls*", "outbound*", "system*"]
+namespaces = true
 
 [build-system]
 requires = ["setuptools>=68"]

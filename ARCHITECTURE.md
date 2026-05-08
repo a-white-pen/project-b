@@ -50,6 +50,28 @@ Cloud Tasks
 
 ---
 
+## Intent classification — planned RAG upgrade
+
+Current: LLM classifies intent from message type + text + caption alone. Works for clear messages, falls back to `unknown` for ambiguous ones.
+
+Planned upgrade — retrieval-augmented few-shot prompting:
+
+1. **Embeddings** — every inbound message is embedded via Gemini's embedding model (`text-embedding-004` or similar). Vectors stored in a `system.classification_history` table using the `pgvector` Postgres extension (same DB, no new infra).
+
+2. **Retrieval** — when classifying a new message, embed it, find the top-K most similar past messages that B has confirmed or corrected, inject those as few-shot examples into the prompt. Token-efficient: only the most relevant examples, not all of them.
+
+3. **Feedback loop** — B can correct a misclassification inline ("wrong, that was log_expense"). Correction stored with embedding + correct label. Immediately improves future similar classifications.
+
+4. **Near-exact cache** — if cosine similarity to a known past message exceeds threshold (e.g. 0.95), return cached intent without an LLM call entirely.
+
+5. **Tiered model escalation** — start with MODEL_LITE. If confidence below threshold, retry with MODEL_FLASH, then MODEL_PRO. Confidence is returned as JSON alongside the intent. If still uncertain after MODEL_PRO, bot asks B a clarifying question rather than guessing.
+
+Build this after food logging is live and there is real data to learn from.
+
+**Not yet implemented:** tiered escalation, confidence scoring, and clarifying questions are all noted here but not in code. Current classifier always uses MODEL_LITE with no fallback.
+
+---
+
 ## No migrations folder
 
 The schema's source of truth is the live database. The git history of `schema/data_dictionary.md` is the change log — each commit states what changed and why. The dictionary is generated from the live DB and cannot drift.

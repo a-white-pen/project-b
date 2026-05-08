@@ -113,7 +113,8 @@ Functions:
 
 ## Stack gotchas
 
-- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model config lives in `system/config.py` — do not hardcode model names.
+- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model constants live in `system/llm.py` — pick by task complexity (`MODEL_LITE` / `MODEL_FLASH` / `MODEL_PRO`). Verify current model IDs by running `client.models.list()`. Non-Gemini providers may be added later; route all LLM calls through `system/llm.py`.
+- `GEMINI_API_KEY` is a required secret — Secret Manager for Cloud Run, `.env` for local dev.
 - Postgres folds unquoted identifiers to lowercase. Never use camelCase for table or column names.
 - Secret Manager values created via `gcloud` often have a trailing newline. Always `.strip()` at load time.
 - Cloud SQL Auth Proxy may bind to 5433 if 5432 is taken. Check `lsof -i :5432` before assuming.

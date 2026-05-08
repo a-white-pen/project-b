@@ -17,7 +17,9 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 
 from system.config import get_config
 from system.db import get_connection
+from telegram.normalizer import normalize
 from telegram.replies import send_reply
+from telegram.router import route
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +50,11 @@ def create_app() -> FastAPI:
         await asyncio.to_thread(_store_raw, payload, update_id)
         logger.info("update_id=%s stored", update_id)
 
-        # Fire reply in the background so 200 returns to Telegram immediately after
-        # persistence. Awaiting send_reply here would block up to 10 s, causing Telegram
-        # to retry the update and produce duplicate rows + duplicate replies.
+        # Normalize, classify intent, and reply — all in the background so 200 returns
+        # to Telegram immediately after persistence. Awaiting here would block up to 10 s
+        # and cause Telegram to retry, producing duplicate rows and duplicate replies.
         if chat_id is not None:
-            asyncio.create_task(asyncio.to_thread(send_reply, chat_id, "got it", message_id))
+            asyncio.create_task(_process_and_reply(payload, chat_id, message_id))
 
         return {"ok": True}
 
@@ -68,6 +70,15 @@ def create_app() -> FastAPI:
         return {"status": overall, "db": db_status}
 
     return app
+
+
+# Normalizes the payload, classifies intent, and sends the reply.
+# Runs as a background task — errors are logged by route() and send_reply(), never raised.
+# Inputs: raw payload dict, chat_id and message_id from the inbound update.
+async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
+    msg = normalize(payload)
+    reply_text = await asyncio.to_thread(route, msg)
+    await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
 
 
 # Extracts chat_id and message_id from the Telegram Update payload.

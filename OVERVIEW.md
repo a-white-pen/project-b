@@ -3,8 +3,9 @@
 ## Status
 
 Slice 1 live: Telegram webhook receives messages and stores raw payloads to `system.telegram_raw`.
+Slice 2 in progress: Normalizer + LLM intent classifier + router — fully wired but domain handlers are stubs. Bot classifies intent and replies; nothing is persisted to domain tables yet.
 
-**Next slice:** Normalizer + router + reply — parse the update type, route to a domain handler, send a response back to B.
+**Next slice:** First domain handler — food logging (`nutrition.food_log`).
 
 ## Scope
 
