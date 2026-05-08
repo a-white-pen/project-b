@@ -1,11 +1,13 @@
 """
 Routes normalized inbound messages to domain handlers based on LLM-classified intent.
 Callback query updates are routed deterministically from callback_data, not via the LLM.
+Slash commands are routed deterministically and the command token is stripped before dispatch.
 
 Functions:
-  route(msg) — classifies intent (or resolves callback) and returns a reply string
+  route(msg) — classifies intent (or resolves callback/command) and returns a reply string
 """
 
+import dataclasses
 import logging
 from enum import Enum
 
@@ -31,6 +33,19 @@ class Intent(str, Enum):
     UNKNOWN = "unknown"             # cannot determine intent
 
 
+# Maps slash commands to intents — bypasses LLM entirely.
+# /eat@BotName form (used in groups) is handled by stripping the @suffix.
+# Note: @suffix is not validated against the bot's own username — acceptable for a
+# single-user private bot, but worth tightening if the bot is ever added to groups.
+_COMMAND_MAP: dict[str, Intent] = {
+    "/eat": Intent.LOG_FOOD,
+    "/weight": Intent.LOG_WEIGHT,
+    "/spend": Intent.LOG_EXPENSE,
+    "/focus": Intent.LOG_ATTENTION,
+    "/data": Intent.QUERY_DATA,
+    "/ask": Intent.ASK_GENERAL,
+}
+
 _CLASSIFY_PROMPT = """\
 You are an intent classifier for a personal data tracking system. \
 The user is one person tracking nutrition, body metrics, training, expenses, and attention.
@@ -52,12 +67,16 @@ Respond with only the intent name. Nothing else."""
 
 
 # Routes an inbound message to the right domain handler and returns a reply string.
-# Callback queries are routed deterministically. All other types go through the LLM classifier.
+# Priority: callback_query → slash command → LLM classifier.
 # Inputs: InboundMessage from normalizer.
 # Outputs: reply string to send back to B.
 def route(msg: InboundMessage) -> str:
     if msg.message_type == MessageType.CALLBACK_QUERY:
         return _route_callback(msg)
+    command_intent = _extract_command(msg)
+    if command_intent is not None:
+        logger.info("update_id=%s command=%s", msg.update_id, command_intent.value)
+        return _dispatch(command_intent, _strip_command(msg))
     intent = _classify_intent(msg)
     logger.info("update_id=%s intent=%s", msg.update_id, intent.value)
     return _dispatch(intent, msg)
@@ -71,6 +90,26 @@ def _route_callback(msg: InboundMessage) -> str:
     # No inline buttons implemented yet — all callback_data falls through to stub.
     # When buttons are added, dispatch here by callback_data value.
     return "button press captured — not implemented yet"
+
+
+# Extracts a slash command from the message text and maps it to an Intent.
+# Handles /command and /command@BotName forms. Returns None if no known command found.
+def _extract_command(msg: InboundMessage) -> Intent | None:
+    if not msg.text or not msg.text.startswith("/"):
+        return None
+    cmd = msg.text.split()[0].split("@")[0].lower()
+    return _COMMAND_MAP.get(cmd)
+
+
+# Strips the leading slash command token from msg.text before handing to domain handlers.
+# Domains should receive "chicken rice", not "/eat chicken rice".
+# Inputs: InboundMessage where text starts with a slash command.
+# Outputs: new InboundMessage with text set to the post-command content (or None if no content).
+def _strip_command(msg: InboundMessage) -> InboundMessage:
+    if not msg.text:
+        return msg
+    parts = msg.text.split(maxsplit=1)
+    return dataclasses.replace(msg, text=parts[1] if len(parts) > 1 else None)
 
 
 # Sends the message context to the LLM and parses the intent.
