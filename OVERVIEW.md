@@ -2,9 +2,9 @@
 
 ## Status
 
-Nothing is implemented. The repo is a skeleton.
+Slice 1 live: Telegram webhook receives messages and stores raw payloads to `system.telegram_raw`.
 
-**Next slice:** Telegram webhook endpoint → store raw payloads in `system.telegram_raw` → reply. Smallest complete path through the stack.
+**Next slice:** Normalizer + router + reply — parse the update type, route to a domain handler, send a response back to B.
 
 ## Scope
 
@@ -18,7 +18,7 @@ Nothing is implemented. The repo is a skeleton.
 |---|---|
 | OLTP | Cloud SQL Postgres 16, `asia-southeast1`, instance `projectb-db`, database `projectb` |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | `google-genai` SDK, model `gemini-2.5-flash-lite` |
+| LLM | `google-genai` SDK, model `gemini-2.0-flash` (override via `GEMINI_MODEL` env var) |
 | Async | Cloud Tasks (reminders, delayed work) |
 | Secrets | GCP Secret Manager; `.env` for local dev only |
 

@@ -4,6 +4,14 @@ Data conventions and rules. Read before any schema change. See `schema/data_dict
 
 ---
 
+## Why Postgres
+
+JSONB. Telegram payloads, scraped menus, and external API responses land as JSON. Postgres stores JSONB as a parsed binary tree with GIN indexing — we can query inside the payload without schema changes and without a full table scan. MySQL JSON is text with a thin query wrapper; no real index.
+
+Secondary reasons: native `TIMESTAMPTZ`, array column types, full window function support for analytics, BSD license.
+
+---
+
 ## OLTP first
 
 This is an OLTP store. Optimize for **accuracy, correctness, and write throughput** — not query performance.

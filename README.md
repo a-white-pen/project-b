@@ -60,7 +60,7 @@ schema/      Auto-generated data dictionary + dump script
 
 ```bash
 # Python environment
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
 # Environment variables
@@ -70,8 +70,8 @@ cp .env.example .env
 # Cloud SQL Auth Proxy (keep the binary outside the repo — it's gitignored)
 ./cloud-sql-proxy awhitepen-project-b:asia-southeast1:projectb-db
 
-# Run (entry point TBD — will be updated once app is implemented)
-uvicorn telegram.app:app --reload
+# Run locally
+uvicorn telegram.webhook:app --reload
 ```
 
 ---
