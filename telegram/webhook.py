@@ -1,0 +1,77 @@
+"""
+Telegram webhook receiver — the single entry point for all inbound Telegram updates.
+
+Functions:
+  create_app()        — builds and returns the FastAPI application instance
+  receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
+"""
+
+import asyncio
+import hmac
+import json
+import logging
+from json import JSONDecodeError
+
+from fastapi import FastAPI, Header, HTTPException, Request, status
+
+from system.config import get_config
+from system.db import get_connection
+
+logger = logging.getLogger(__name__)
+
+
+def create_app() -> FastAPI:
+    # Builds the FastAPI app and registers routes. Called once at startup.
+    config = get_config()
+    app = FastAPI(title="project-b", docs_url=None, redoc_url=None)
+
+    @app.post("/telegram/webhook", status_code=status.HTTP_200_OK)
+    async def receive_webhook(
+        request: Request,
+        x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    ) -> dict:
+        # Validates the Telegram webhook secret, stores the raw payload, returns 200.
+        # Inputs: HTTP POST from Telegram servers.
+        # Outputs: {"ok": True} on success; raises 403 on bad secret.
+        _validate_secret(x_telegram_bot_api_secret_token, config.telegram_webhook_secret)
+
+        raw_body = await request.body()
+        try:
+            payload = json.loads(raw_body)
+        except JSONDecodeError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
+        update_id = payload.get("update_id")
+
+        await asyncio.to_thread(_store_raw, payload, update_id)
+
+        logger.info("update_id=%s stored", update_id)
+        return {"ok": True}
+
+    return app
+
+
+# Checks the X-Telegram-Bot-Api-Secret-Token header against our configured secret.
+# Raises 403 if missing or wrong. Uses hmac.compare_digest to prevent timing attacks.
+def _validate_secret(received: str | None, expected: str) -> None:
+    if not received:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing secret")
+    if not hmac.compare_digest(received, expected):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad secret")
+
+
+# Inserts one row into system.telegram_raw. Opens a short-lived connection per call.
+# Inputs: payload dict and update_id from the Telegram Update.
+def _store_raw(payload: dict, update_id: int | None) -> None:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO system.telegram_raw (update_id, payload) VALUES (%s, %s)",
+                    (update_id, json.dumps(payload)),
+                )
+    finally:
+        conn.close()
+
+
+app = create_app()
