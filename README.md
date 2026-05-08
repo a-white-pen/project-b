@@ -76,6 +76,35 @@ uvicorn telegram.webhook:app --reload
 
 ---
 
+## Health check
+
+`GET /health` — confirms the app is running and DB is reachable.
+
+Note: `/healthz` is intercepted by GCP infrastructure and returns 404 — always use `/health`.
+
+```bash
+# Production (get BOT_URL from Cloud Run console or gcloud run services describe)
+curl https://<BOT_URL>/health
+
+# Local (requires Cloud SQL Auth Proxy running + .env set)
+curl http://localhost:8080/health
+```
+
+**Response when healthy:**
+```json
+{"status": "ok", "db": "ok"}
+```
+
+**Response when DB is down:**
+```json
+{"status": "degraded", "db": "connection refused"}
+```
+
+Always returns HTTP 200 — check the `status` field, not the status code.
+If degraded, check Cloud Run logs: `gcloud run services logs read project-b --region asia-southeast1 --project awhitepen-project-b --limit 50`
+
+---
+
 ## Docs
 
 | File | What's in it |

@@ -4,6 +4,7 @@ Telegram webhook receiver — the single entry point for all inbound Telegram up
 Functions:
   create_app()        — builds and returns the FastAPI application instance
   receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
+  check_health()      — GET /health; checks app and DB connectivity, returns status dict
 """
 
 import asyncio
@@ -47,6 +48,17 @@ def create_app() -> FastAPI:
         logger.info("update_id=%s stored", update_id)
         return {"ok": True}
 
+    @app.get("/health", status_code=status.HTTP_200_OK)
+    async def check_health() -> dict:
+        # Deep health check — verifies app is running and DB is reachable.
+        # Inputs: none. Outputs: {"status": "ok"|"degraded", "db": "ok"|"<error>"}.
+        # Returns 200 always — status field indicates actual health.
+        # Note: /healthz is intercepted by GCP infrastructure — use /health instead.
+        # Use this to confirm the app is alive and connected before debugging logs.
+        db_status = await asyncio.to_thread(_ping_db)
+        overall = "ok" if db_status == "ok" else "degraded"
+        return {"status": overall, "db": db_status}
+
     return app
 
 
@@ -72,6 +84,22 @@ def _store_raw(payload: dict, update_id: int | None) -> None:
                 )
     finally:
         conn.close()
+
+
+# Runs SELECT 1 against the DB. Returns "ok" or the error message string.
+# Used by check_health() to verify DB connectivity.
+def _ping_db() -> str:
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        finally:
+            conn.close()
+        return "ok"
+    except Exception as e:
+        logger.error("DB health check failed: %s", e)
+        return str(e)
 
 
 app = create_app()
