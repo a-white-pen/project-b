@@ -37,7 +37,7 @@ This is not a product. No multi-user support. Not open-source.
 |---|---|
 | Database | Cloud SQL Postgres 16, `asia-southeast1` |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | `google-genai` SDK (model config in `system/config.py`) |
+| LLM | Gemini via `google-genai` SDK (primary); model and provider selected per task |
 | Async | Cloud Tasks |
 | Secrets | GCP Secret Manager |
 

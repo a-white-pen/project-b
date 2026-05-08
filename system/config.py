@@ -14,7 +14,6 @@ class Config:
     database_url: str
     telegram_bot_token: str
     telegram_webhook_secret: str
-    gemini_model: str
 
 
 # Reads env vars at import time; raises early if required values are missing.
@@ -31,7 +30,6 @@ def get_config() -> Config:
         database_url=require("DATABASE_URL"),
         telegram_bot_token=require("TELEGRAM_BOT_TOKEN"),
         telegram_webhook_secret=require("TELEGRAM_WEBHOOK_SECRET"),
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip(),
     )
 
     if missing:

@@ -18,7 +18,7 @@ Slice 1 live: Telegram webhook receives messages and stores raw payloads to `sys
 |---|---|
 | OLTP | Cloud SQL Postgres 16, `asia-southeast1`, instance `projectb-db`, database `projectb` |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | `google-genai` SDK, model `gemini-2.0-flash` (override via `GEMINI_MODEL` env var) |
+| LLM | Gemini via `google-genai` SDK (primary); other providers possible depending on task |
 | Async | Cloud Tasks (reminders, delayed work) |
 | Secrets | GCP Secret Manager; `.env` for local dev only |
 

@@ -14,6 +14,8 @@ Read before writing or editing anything. Also read:
 
 `telegram/replies.py` is the **single send path** for outbound Telegram messages. Do not introduce a second one.
 
+**Quoting rule for `send_reply`:** pass `reply_to_message_id` when the bot is responding to something B sent — so B can see exactly which message triggered the response. Omit it when the bot initiates the message unprompted (reminders, nudges, proactive alerts) — there is nothing to quote.
+
 `domains/<x>/` knows nothing about how data arrived. It receives a normalized event and returns a result. This is what makes adding new input sources cheap.
 
 The Telegram bot is named `B_extended`.

@@ -17,6 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 
 from system.config import get_config
 from system.db import get_connection
+from telegram.replies import send_reply
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +43,17 @@ def create_app() -> FastAPI:
         except JSONDecodeError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
         update_id = payload.get("update_id")
+        chat_id, message_id = _extract_chat_and_message_id(payload)
 
         await asyncio.to_thread(_store_raw, payload, update_id)
-
         logger.info("update_id=%s stored", update_id)
+
+        # Fire reply in the background so 200 returns to Telegram immediately after
+        # persistence. Awaiting send_reply here would block up to 10 s, causing Telegram
+        # to retry the update and produce duplicate rows + duplicate replies.
+        if chat_id is not None:
+            asyncio.create_task(asyncio.to_thread(send_reply, chat_id, "got it", message_id))
+
         return {"ok": True}
 
     @app.get("/health", status_code=status.HTTP_200_OK)
@@ -60,6 +68,27 @@ def create_app() -> FastAPI:
         return {"status": overall, "db": db_status}
 
     return app
+
+
+# Extracts chat_id and message_id from the Telegram Update payload.
+# Covers message, edited_message, channel_post, edited_channel_post, and callback_query
+# (inline button presses — chat is nested under callback_query.message).
+# Returns (None, None) if no chat is found (e.g. pure inline-mode updates).
+def _extract_chat_and_message_id(payload: dict) -> tuple[int | None, int | None]:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        msg = payload.get(key)
+        if msg:
+            chat = msg.get("chat")
+            if chat:
+                return chat.get("id"), msg.get("message_id")
+    cq = payload.get("callback_query")
+    if cq:
+        msg = cq.get("message")
+        if msg:
+            chat = msg.get("chat")
+            if chat:
+                return chat.get("id"), msg.get("message_id")
+    return None, None
 
 
 # Checks the X-Telegram-Bot-Api-Secret-Token header against our configured secret.
