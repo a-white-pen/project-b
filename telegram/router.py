@@ -9,6 +9,7 @@ Functions:
 
 import dataclasses
 import logging
+import os
 from enum import Enum
 
 from domains.attention.service import handle_attention_log
@@ -17,8 +18,9 @@ from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
 from domains.query.service import handle_query_data
 from domains.weight.service import handle_weight_log
-from system.llm import MODEL_LITE, generate_text
+from system.llm import MODEL_LITE, generate_text, transcribe_audio
 from system.messages import InboundMessage, MessageType
+from telegram.files import get_file_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,7 @@ Respond with only the intent name. Nothing else."""
 
 
 # Routes an inbound message to the right domain handler and returns a reply string.
-# Priority: callback_query → slash command → LLM classifier.
+# Priority: callback_query → slash command → voice transcription → LLM classifier.
 # Inputs: InboundMessage from normalizer.
 # Outputs: reply string to send back to B.
 def route(msg: InboundMessage) -> str:
@@ -77,6 +79,8 @@ def route(msg: InboundMessage) -> str:
     if command_intent is not None:
         logger.info("update_id=%s command=%s", msg.update_id, command_intent.value)
         return _dispatch(command_intent, _strip_command(msg))
+    if msg.message_type == MessageType.VOICE:
+        msg = _transcribe_voice(msg)
     intent = _classify_intent(msg)
     logger.info("update_id=%s intent=%s", msg.update_id, intent.value)
     return _dispatch(intent, msg)
@@ -126,6 +130,22 @@ def _classify_intent(msg: InboundMessage) -> Intent:
     except Exception as e:
         logger.warning("intent classification failed: %s", e)
         return Intent.UNKNOWN
+
+
+# Downloads a voice message and transcribes it via Gemini.
+# Returns a new InboundMessage with message_type=TEXT and text set to the transcription.
+# Falls back to UNKNOWN text on error so routing can continue.
+def _transcribe_voice(msg: InboundMessage) -> InboundMessage:
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        audio = get_file_bytes(msg.file_id, token)
+        text = transcribe_audio(audio)
+        logger.info("update_id=%s voice transcribed length=%d", msg.update_id, len(text))
+        return dataclasses.replace(msg, message_type=MessageType.TEXT, text=text)
+    except Exception as e:
+        # Log type only — not the message, which may contain the bot token via httpx URL.
+        logger.warning("update_id=%s voice transcription failed: %s", msg.update_id, type(e).__name__)
+        return dataclasses.replace(msg, message_type=MessageType.TEXT, text=None)
 
 
 # Extracts the intent name from an LLM response string.
