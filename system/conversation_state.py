@@ -72,18 +72,19 @@ def load_state(telegram_reply_message_id: int) -> dict | None:
     """
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (telegram_reply_message_id,))
-            row = cur.fetchone()
-            if row is None:
-                return None
-            return {
-                "telegram_reply_message_id": row[0],
-                "parent_telegram_reply_message_id": row[1],
-                "triggering_telegram_update_id": row[2],
-                "domain": row[3],
-                "context": row[4],
-            }
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (telegram_reply_message_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return {
+                    "telegram_reply_message_id": row[0],
+                    "parent_telegram_reply_message_id": row[1],
+                    "triggering_telegram_update_id": row[2],
+                    "domain": row[3],
+                    "context": row[4],
+                }
     finally:
         conn.close()
 
@@ -157,20 +158,21 @@ def get_thread(telegram_reply_message_id: int) -> list[dict]:
     """
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (telegram_reply_message_id,))
-            rows = cur.fetchall()
-            return [
-                {
-                    "telegram_reply_message_id": r[0],
-                    "parent_telegram_reply_message_id": r[1],
-                    "triggering_telegram_update_id": r[2],
-                    "domain": r[3],
-                    "context": r[4],
-                    "inbound_payload": r[5],
-                    "outbound_payload": r[6],
-                }
-                for r in rows
-            ]
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (telegram_reply_message_id,))
+                rows = cur.fetchall()
+                return [
+                    {
+                        "telegram_reply_message_id": r[0],
+                        "parent_telegram_reply_message_id": r[1],
+                        "triggering_telegram_update_id": r[2],
+                        "domain": r[3],
+                        "context": r[4],
+                        "inbound_payload": r[5],
+                        "outbound_payload": r[6],
+                    }
+                    for r in rows
+                ]
     finally:
         conn.close()

@@ -5,6 +5,15 @@ Functions:
   create_app()        — builds and returns the FastAPI application instance
   receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
   check_health()      — GET /health; checks app and DB connectivity, returns status dict
+
+Processing model:
+  _store_inbound() is called first and returns True if the row was newly inserted, False for a
+  duplicate (ON CONFLICT DO NOTHING). Duplicates return 200 immediately without processing —
+  this makes Telegram retries safe and idempotent. On a new update, _process_and_reply() is
+  awaited synchronously before returning 200. This keeps work in-process for the lifetime of
+  the request and avoids CPU-throttled background tasks being silently dropped on Cloud Run.
+  If LLM latency causes Telegram to retry before the reply is sent, the retry is detected as
+  a duplicate by _store_inbound() and skipped — the original request continues to completion.
 """
 
 import asyncio
@@ -46,9 +55,19 @@ def create_app() -> FastAPI:
         except JSONDecodeError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
         update_id = payload.get("update_id")
+        if update_id is None:
+            # Every real Telegram update has update_id. A missing one means the payload is
+            # malformed. Postgres NULL != NULL so ON CONFLICT would not deduplicate it, and
+            # a second such request would produce duplicate domain rows. Reject early.
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing update_id")
         chat_id, message_id = _extract_chat_and_message_id(payload)
 
-        await asyncio.to_thread(_store_inbound, payload, update_id)
+        inserted = await asyncio.to_thread(_store_inbound, payload, update_id)
+        if not inserted:
+            # Duplicate update_id — Telegram retry for a message we already stored.
+            # Return 200 immediately without processing to avoid duplicate replies and domain rows.
+            logger.info("update_id=%s duplicate — skipped", update_id)
+            return {"ok": True}
         logger.info("update_id=%s stored", update_id)
 
         # Skip routing for edited messages — stored in telegram_inbound for audit but not processed.
@@ -57,11 +76,13 @@ def create_app() -> FastAPI:
             logger.info("update_id=%s edited message — stored, not routed", update_id)
             return {"ok": True}
 
-        # Normalize, classify intent, and reply — all in the background so 200 returns
-        # to Telegram immediately after persistence. Awaiting here would block up to 10 s
-        # and cause Telegram to retry, producing duplicate rows and duplicate replies.
+        # Process synchronously — work stays alive for the duration of this request.
+        # Telegram retries are caught by the duplicate check above, so long LLM calls won't
+        # produce double replies even if Telegram times out and retries before we respond.
         if chat_id is not None:
-            asyncio.create_task(_process_and_reply(payload, chat_id, message_id))
+            await _process_and_reply(payload, chat_id, message_id)
+        else:
+            logger.info("update_id=%s no chat_id — stored, not routed", update_id)
 
         return {"ok": True}
 
@@ -140,10 +161,10 @@ def _validate_secret(received: str | None, expected: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad secret")
 
 
-# Inserts one row into system.telegram_inbound. Idempotent — ON CONFLICT DO NOTHING means
-# Telegram retries (same update_id) are silently ignored rather than producing duplicates or 500s.
-# Inputs: payload dict and update_id from the Telegram Update.
-def _store_inbound(payload: dict, update_id: int | None) -> None:
+# Inserts one row into system.telegram_inbound.
+# Returns True if the row was inserted, False if update_id already existed (ON CONFLICT DO NOTHING).
+# Callers must check the return value and skip processing for duplicates to prevent double replies.
+def _store_inbound(payload: dict, update_id: int | None) -> bool:
     conn = get_connection()
     try:
         with conn:
@@ -153,6 +174,7 @@ def _store_inbound(payload: dict, update_id: int | None) -> None:
                     " ON CONFLICT (update_id) DO NOTHING",
                     (update_id, json.dumps(payload)),
                 )
+                return cur.rowcount == 1
     finally:
         conn.close()
 

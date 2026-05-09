@@ -129,8 +129,14 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         logger.error("correction apply failed update_id=%s: %s", msg.update_id, e)
         return ("Correction parsed but failed to save — please try again.", None)
 
-    # Build updated item list for the reply
-    updated_items = _fetch_items(surviving_ids) if surviving_ids else []
+    # Build updated item list for the reply.
+    # _apply_corrections already committed — guard this re-fetch so a DB hiccup here
+    # does not silence the reply entirely after a successful write.
+    try:
+        updated_items = _fetch_items(surviving_ids) if surviving_ids else []
+    except Exception as e:
+        logger.warning("post-correction re-fetch failed update_id=%s: %s", msg.update_id, e)
+        updated_items = []
     reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
 
     new_state = {
@@ -154,24 +160,25 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
     """
     conn = get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (food_log_ids,))
-            rows = cur.fetchall()
-            return [
-                {
-                    "food_log_id": r[0],
-                    "food_item": r[1],
-                    "meal_type": r[2],
-                    "kcal": r[3],
-                    "protein_g": r[4],
-                    "carbs_g": r[5],
-                    "fat_g": r[6],
-                    "fibre_g": r[7],
-                    "sugar_g": r[8],
-                    "sodium_mg": r[9],
-                }
-                for r in rows
-            ]
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (food_log_ids,))
+                rows = cur.fetchall()
+                return [
+                    {
+                        "food_log_id": r[0],
+                        "food_item": r[1],
+                        "meal_type": r[2],
+                        "kcal": r[3],
+                        "protein_g": r[4],
+                        "carbs_g": r[5],
+                        "fat_g": r[6],
+                        "fibre_g": r[7],
+                        "sugar_g": r[8],
+                        "sodium_mg": r[9],
+                    }
+                    for r in rows
+                ]
     finally:
         conn.close()
 

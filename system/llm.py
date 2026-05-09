@@ -55,13 +55,13 @@ def generate_with_image(
         ],
     )
     logger.debug("generate_with_image model=%s bytes=%d", model, len(image_bytes))
-    return response.text.strip()
+    return _extract_text(response)
 
 
 def generate_text(prompt: str, model: str = MODEL_LITE) -> str:
     response = _get_client().models.generate_content(model=model, contents=prompt)
     logger.debug("llm model=%s", model)
-    return response.text.strip()
+    return _extract_text(response)
 
 
 # Transcribes a voice message using Gemini's multimodal input.
@@ -86,4 +86,14 @@ def transcribe_audio(
         ],
     )
     logger.debug("transcribe model=%s bytes=%d", model, len(audio_bytes))
+    return _extract_text(response)
+
+
+# Extracts the text from a GenerateContentResponse.
+# response.text is Optional[str] — it is None when the model returns no text parts
+# (e.g. safety-filtered response, function-call-only response, empty candidates).
+# Raises RuntimeError with a clear message rather than letting .strip() raise AttributeError.
+def _extract_text(response) -> str:
+    if response.text is None:
+        raise RuntimeError("LLM returned no text (safety filter or empty response)")
     return response.text.strip()

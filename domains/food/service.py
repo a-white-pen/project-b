@@ -11,6 +11,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import psycopg2.extras
@@ -22,8 +23,7 @@ from telegram.files import get_file_bytes
 
 logger = logging.getLogger(__name__)
 
-# B's default timezone. TODO: retrieve from b.location when that table exists.
-_DEFAULT_TZ = ZoneInfo("Asia/Bangkok")
+_FALLBACK_TZ = ZoneInfo("Asia/Bangkok")  # used when b.latest_location has no rows
 
 _VALID_MEAL_TYPES = {
     "breakfast", "brunch", "lunch", "snack",
@@ -73,6 +73,7 @@ Rules:
 - macro_method: use "llm" since you are estimating from description.
 - Estimate macros as accurately as you can from nutritional knowledge. Only use null if truly unknowable.
 - food_meta keys are optional — omit any key that is not meaningful for this item.
+- A named dish is ONE item even if it contains multiple components. "Chicken rice" = 1 item (not chicken + rice separately). "Laksa" = 1 item. Only split into multiple items when B explicitly lists separate things (e.g. "2 eggs, yoghurt, blueberries").
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
@@ -156,7 +157,7 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
     if not text:
         return ("I didn't catch what you ate — can you describe it in text?", None)
 
-    local_time = _local_time_str()
+    local_time = _local_time_str(msg.timestamp)
 
     try:
         raw = generate_text(
@@ -214,7 +215,7 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         return ("Couldn't download the photo — please try again.", None)
 
     caption = msg.caption or ""
-    local_time = _local_time_str()
+    local_time = _local_time_str(msg.timestamp)
 
     try:
         raw = generate_with_image(
@@ -264,9 +265,44 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
     return (reply, state)
 
 
-# Returns B's current local time as a readable string for the LLM prompt.
-def _local_time_str() -> str:
-    local_now = datetime.now(tz=_DEFAULT_TZ)
+# Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
+# Queries b.location for the most recent row at or before `as_of` so timezone resolves
+# to wherever B actually was when the message was sent — not where she is right now.
+# This handles delayed messages, Telegram retries, and travel between meals correctly.
+# Falls back to b.latest_location (most recent row regardless of time) if as_of is None,
+# and to Asia/Singapore if the table is empty or unreachable.
+def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                if as_of is not None:
+                    cur.execute(
+                        "SELECT timezone FROM b.location"
+                        " WHERE created_at <= %s ORDER BY created_at DESC LIMIT 1",
+                        (as_of,),
+                    )
+                else:
+                    cur.execute("SELECT timezone FROM b.latest_location")
+                row = cur.fetchone()
+                if row:
+                    return ZoneInfo(row[0])
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("timezone lookup failed, using fallback: %s", e)
+    return _FALLBACK_TZ
+
+
+# Returns B's local time at the given event timestamp as a readable string for the LLM prompt.
+# Resolves timezone as-of the event so meal_type inference is correct for delayed messages.
+def _local_time_str(as_of: datetime | None = None) -> str:
+    tz = _get_timezone(as_of)
+    # Use the event's own timestamp if available; otherwise use current time in that zone.
+    if as_of is not None:
+        local_now = as_of.astimezone(tz)
+    else:
+        local_now = datetime.now(tz=tz)
     return local_now.strftime("%H:%M on %A")  # e.g. "08:30 on Monday"
 
 

@@ -7,6 +7,7 @@ Functions:
 
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,10 @@ class Config:
     gemini_api_key: str
 
 
-# Reads env vars at import time; raises early if required values are missing.
+# Reads env vars once and caches the result for the lifetime of the process.
+# lru_cache makes this safe to call on every send_reply without redundant env reads.
+# Tests that need different env values must call get_config.cache_clear() between cases.
+@lru_cache(maxsize=None)
 def get_config() -> Config:
     missing = []
 

@@ -3,8 +3,35 @@ _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py
 
 ## Schema: `b`
 
-### `b.location`
-Log of every location B shares via Telegram. Append-only — never update rows. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API). location_name is a human-readable district and city in English via Nominatim (OpenStreetMap, free, no API key). Application code falls back to Asia/Bangkok if this table has no rows. Use b.latest_location view to get the active timezone.
+### View: `b.latest_location`
+Most recent location B has shared. Used by domain services to get the active timezone for local time-of-day inference. Falls back to Asia/Bangkok if no rows exist.
+
+**View definition:**
+```sql
+SELECT location_id,
+    telegram_update_id,
+    latitude,
+    longitude,
+    timezone,
+    location_name,
+    created_at
+   FROM b.location
+  ORDER BY created_at DESC
+ LIMIT 1;
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `location_id` | `integer` | yes |  |  |
+| `telegram_update_id` | `bigint` | yes |  |  |
+| `latitude` | `numeric(9,6)` | yes |  |  |
+| `longitude` | `numeric(9,6)` | yes |  |  |
+| `timezone` | `text` | yes |  |  |
+| `location_name` | `text` | yes |  |  |
+| `created_at` | `timestamp with time zone` | yes |  |  |
+
+### Table: `b.location`
+Log of every location B shares via Telegram. One row per LOCATION message. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API) and is immutable after insert. location_name is backfilled in a single UPDATE after the row is committed — Nominatim (OpenStreetMap, free, no API key) is called best-effort and may leave location_name NULL on geocoding failure; no other columns are ever changed. Application code falls back to Asia/Bangkok if this table has no rows. Use b.latest_location view to get the active timezone.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -18,7 +45,7 @@ Log of every location B shares via Telegram. Append-only — never update rows. 
 
 ## Schema: `nutrition`
 
-### `nutrition.food_log`
+### Table: `nutrition.food_log`
 One row per distinct food item. A single message from B may produce one or multiple rows — the system parses the input and inserts one row per identifiable item. A described combo ("2 eggs, yoghurt, blueberries") becomes 3 rows; a single named dish ("Viking chicken wrap") becomes 1.
 
 | Column | Type | Nullable | Default | Notes |
@@ -43,8 +70,8 @@ One row per distinct food item. A single message from B may produce one or multi
 
 ## Schema: `system`
 
-### `system.conversation_state`
-One row per bot reply that participates in a quoted correction chain. Root rows are written when a loggable domain handler returns state (currently food only — weight, expense, and attention handlers return None until those domains are built). Follow-up rows are written when B quotes a bot reply and a correction is applied. Full thread is rebuilt via a two-phase recursive CTE: walk up to root, then walk all descendants. context holds only the minimal structured state needed for the next correction turn.
+### Table: `system.conversation_state`
+One row per bot reply that may participate in a quoted correction chain. Root rows are written for every bot reply to a loggable action (food, weight, expense, attention). Follow-up rows are written when B quotes a bot reply and a correction is applied. Full thread is rebuilt via recursive CTE joining telegram_outbound and telegram_inbound. context holds only the minimal structured state needed for the next correction turn.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -52,10 +79,10 @@ One row per bot reply that participates in a quoted correction chain. Root rows 
 | `parent_telegram_reply_message_id` | `integer` | yes |  | Bot reply B quoted when triggering this correction round. NULL for root rows (initial log reply). |
 | `triggering_telegram_update_id` | `bigint` | no |  | Inbound update_id that caused this bot reply. References system.telegram_inbound(update_id). Used to reconstruct user text from telegram_inbound.payload. |
 | `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
-| `context` | `jsonb` | no |  | Minimal structured payload for the next correction turn. food: {food_log_ids:[int], meal_type:str}. Other domains TBD as they are built. |
+| `context` | `jsonb` | no |  | Minimal structured payload. food: {food_log_ids:[int], meal_type:str}. weight/expense/attention: TBD. query/general: domain-specific prompt context. unknown: {original_text:str, original_message_type:str}. |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 
-### `system.telegram_inbound`
+### Table: `system.telegram_inbound`
 Every inbound Telegram update received by the webhook, stored as raw JSON. One row per update_id. Written before any processing so nothing is lost even if routing fails. Counterpart to system.telegram_outbound.
 
 | Column | Type | Nullable | Default | Notes |
@@ -65,7 +92,7 @@ Every inbound Telegram update received by the webhook, stored as raw JSON. One r
 | `payload` | `jsonb` | no |  | Full raw Telegram Update JSON as received. |
 | `received_at` | `timestamp with time zone` | no | now() | Time the update was received by the webhook. |
 
-### `system.telegram_outbound`
+### Table: `system.telegram_outbound`
 Every message the bot sends to Telegram, logged immediately after the API call returns. payload stores the full JSON body sent to the Telegram API — covers text, inline keyboards, photos, and any future message type without schema changes. Counterpart to system.telegram_inbound.
 
 | Column | Type | Nullable | Default | Notes |

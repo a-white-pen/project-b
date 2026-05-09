@@ -17,6 +17,7 @@ from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
 from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
+from domains.location.service import handle_location
 from domains.query.service import handle_query_data
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
@@ -81,6 +82,11 @@ Respond with only the intent name. Nothing else."""
 def route(msg: InboundMessage) -> tuple[str, dict | None]:
     if msg.message_type == MessageType.CALLBACK_QUERY:
         return _route_callback(msg)
+    # Location is always deterministic — no LLM needed.
+    if msg.message_type == MessageType.LOCATION:
+        if msg.location:
+            logger.info("update_id=%s location lat=%s lon=%s", msg.update_id, *msg.location)
+        return handle_location(msg)
     command_intent = _extract_command(msg)
     if command_intent is not None:
         logger.info("update_id=%s command=%s", msg.update_id, command_intent.value)
@@ -165,11 +171,18 @@ def _transcribe_voice(msg: InboundMessage) -> InboundMessage:
 
 
 # Extracts the intent name from an LLM response string.
-# Looks for any known intent value inside the response, returns UNKNOWN if none found.
+# Tries exact match first (Intent(cleaned)), then falls back to scanning for the first known
+# intent value that appears as a whole word — avoids "correct" matching inside "incorrect".
 def _parse_intent(raw: str) -> Intent:
     cleaned = raw.lower().strip()
+    try:
+        return Intent(cleaned)
+    except ValueError:
+        pass
+    # Fallback: find the first intent value that appears as a whole word in the response.
+    import re
     for intent in Intent:
-        if intent.value in cleaned:
+        if re.search(rf"\b{re.escape(intent.value)}\b", cleaned):
             return intent
     return Intent.UNKNOWN
 
