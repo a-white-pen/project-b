@@ -1,6 +1,21 @@
 # Data Dictionary
 _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py` to refresh._
 
+## Schema: `b`
+
+### `b.location`
+Log of every location B shares via Telegram. Append-only — never update rows. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API). location_name is a human-readable district and city in English via Nominatim (OpenStreetMap, free, no API key). Application code falls back to Asia/Bangkok if this table has no rows. Use b.latest_location view to get the active timezone.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `location_id` | `integer` | no | nextval('b.location_location_id_seq'::regclass) | Surrogate primary key. |
+| `telegram_update_id` | `bigint` | yes |  | update_id of the inbound location update. Joins to system.telegram_inbound.update_id. |
+| `latitude` | `numeric(9,6)` | no |  | WGS-84 latitude from the Telegram location message. |
+| `longitude` | `numeric(9,6)` | no |  | WGS-84 longitude from the Telegram location message. |
+| `timezone` | `text` | no |  | IANA timezone string derived offline via timezonefinder. e.g. Asia/Bangkok, Asia/Singapore. |
+| `location_name` | `text` | yes |  | Human-readable district and city in English via Nominatim. e.g. Bang Sue, Bangkok. Null if geocoding fails. |
+| `created_at` | `timestamp with time zone` | no | now() | Timestamp of the Telegram location message. |
+
 ## Schema: `nutrition`
 
 ### `nutrition.food_log`
@@ -10,7 +25,7 @@ One row per distinct food item. A single message from B may produce one or multi
 |--------|------|----------|---------|-------|
 | `food_log_id` | `integer` | no | nextval('nutrition.food_log_food_log_id_seq'::regclass) |  |
 | `meal_type` | `text` | no |  | Meal slot. Values: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout. |
-| `telegram_update_id` | `integer` | yes |  | Telegram update_id. Joins to system.telegram_raw.update_id to retrieve the full original payload. NULL for system-inserted rows. |
+| `telegram_update_id` | `bigint` | yes |  | Telegram update_id of the inbound message that triggered this row. Joins to system.telegram_inbound.update_id. NULL for system-inserted rows. |
 | `food_item` | `text` | no |  | Free-text description of the food item as logged (e.g. "2 boiled eggs", "Greek yoghurt 150g"). |
 | `food_meta` | `jsonb` | yes |  | Optional structured metadata. Shape: {"qty": {"amount": 150, "unit": "g"}, "prep": "grilled", "brand": "Chobani", "notes": "free text"}. All keys optional. qty.amount is numeric; qty.unit is a string (g, ml, pieces, cups, etc.). |
 | `kcal` | `numeric(7,2)` | yes |  | Kilocalories. NULL if unknown. |
@@ -28,12 +43,23 @@ One row per distinct food item. A single message from B may produce one or multi
 
 ## Schema: `system`
 
-### `system.telegram_raw`
-Append-only store of every raw Telegram Update payload received by the webhook. One row per inbound update. Used for debugging and replay — never mutated after insert.
+### `system.telegram_inbound`
+Every inbound Telegram update received by the webhook, stored as raw JSON. One row per update_id. Written before any processing so nothing is lost even if routing fails. Counterpart to system.telegram_outbound.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `telegram_raw_id` | `integer` | no | nextval('system.telegram_raw_telegram_raw_id_seq'::regclass) | Surrogate primary key. |
-| `update_id` | `bigint` | no |  | Telegram-assigned update_id from the payload. Not a primary key — Telegram guarantees uniqueness per bot but we store it for deduplication checks. |
-| `payload` | `jsonb` | no |  | Full Telegram Update object as received, stored verbatim as JSONB. |
-| `received_at` | `timestamp with time zone` | no | now() | Wall-clock time the webhook handler received the update (UTC). |
+| `telegram_inbound_id` | `integer` | no | nextval('system.telegram_inbound_id_seq'::regclass) | Surrogate primary key. |
+| `update_id` | `bigint` | no |  | Telegram-assigned ID for this webhook delivery event. Unique per bot globally. Joins to domain tables e.g. nutrition.food_log.telegram_update_id and to system.telegram_outbound.telegram_update_id. |
+| `payload` | `jsonb` | no |  | Full raw Telegram Update JSON as received. |
+| `received_at` | `timestamp with time zone` | no | now() | Time the update was received by the webhook. |
+
+### `system.telegram_outbound`
+Every message the bot sends to Telegram, logged immediately after the API call returns. payload stores the full JSON body sent to the Telegram API — covers text, inline keyboards, photos, and any future message type without schema changes. Counterpart to system.telegram_inbound.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `telegram_outbound_id` | `integer` | no | nextval('system.telegram_outbound_telegram_outbound_id_seq'::regclass) | Surrogate primary key. |
+| `message_id` | `integer` | no |  | Telegram-assigned message_id for this sent message, from the API response result.message_id. Used to look up this row when B quotes the bot reply. |
+| `telegram_update_id` | `bigint` | yes |  | update_id of the inbound update that triggered this reply. Joins to system.telegram_inbound.update_id. Null for proactive bot messages. |
+| `payload` | `jsonb` | no |  | Full JSON body sent to the Telegram API. Contains text, reply_parameters, inline_keyboard, parse_mode, etc. |
+| `created_at` | `timestamp with time zone` | no | now() | Time the API call returned successfully. |

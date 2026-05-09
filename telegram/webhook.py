@@ -47,8 +47,14 @@ def create_app() -> FastAPI:
         update_id = payload.get("update_id")
         chat_id, message_id = _extract_chat_and_message_id(payload)
 
-        await asyncio.to_thread(_store_raw, payload, update_id)
+        await asyncio.to_thread(_store_inbound, payload, update_id)
         logger.info("update_id=%s stored", update_id)
+
+        # Skip routing for edited messages — stored in telegram_inbound for audit but not processed.
+        # Re-processing an edit would duplicate domain rows (e.g. double food_log entries).
+        if "edited_message" in payload or "edited_channel_post" in payload:
+            logger.info("update_id=%s edited message — stored, not routed", update_id)
+            return {"ok": True}
 
         # Normalize, classify intent, and reply — all in the background so 200 returns
         # to Telegram immediately after persistence. Awaiting here would block up to 10 s
@@ -72,18 +78,31 @@ def create_app() -> FastAPI:
     return app
 
 
-# Normalizes the payload, classifies intent, and sends the reply.
-# Runs as a background task — errors are logged by route() and send_reply(), never raised.
+# Normalizes the payload, classifies intent, sends the reply, and logs to telegram_outbound.
+# Runs as a background task — all errors are caught and logged, never raised.
+# Outbound logging failure is non-fatal: the reply was already sent to Telegram.
 # Inputs: raw payload dict, chat_id and message_id from the inbound update.
 async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
-    msg = normalize(payload)
-    reply_text = await asyncio.to_thread(route, msg)
-    await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
+    update_id = payload.get("update_id")
+    try:
+        msg = normalize(payload)
+        reply_text = await asyncio.to_thread(route, msg)
+        sent_message_id, sent_payload = await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
+        if sent_message_id is not None:
+            try:
+                await asyncio.to_thread(_store_outbound, sent_message_id, update_id, sent_payload)
+            except Exception as e:
+                # Outbound audit log failed — reply already delivered, so non-fatal.
+                # Log at warning so gaps are visible without blocking the user.
+                logger.warning("update_id=%s outbound logging failed: %s", update_id, e)
+    except Exception as e:
+        logger.error("update_id=%s _process_and_reply failed: %s", update_id, e)
 
 
 # Extracts chat_id and message_id from the Telegram Update payload.
-# Covers message, edited_message, channel_post, edited_channel_post, and callback_query
-# (inline button presses — chat is nested under callback_query.message).
+# message_id is used as reply_to_message_id so B can see which message triggered the reply.
+# For callback_query, message_id is the bot's own keyboard message — returning None prevents
+# the bot from quoting itself, per the quoting rule in AGENTS.md.
 # Returns (None, None) if no chat is found (e.g. pure inline-mode updates).
 def _extract_chat_and_message_id(payload: dict) -> tuple[int | None, int | None]:
     for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
@@ -98,7 +117,7 @@ def _extract_chat_and_message_id(payload: dict) -> tuple[int | None, int | None]
         if msg:
             chat = msg.get("chat")
             if chat:
-                return chat.get("id"), msg.get("message_id")
+                return chat.get("id"), None  # don't quote bot's own keyboard message
     return None, None
 
 
@@ -111,16 +130,34 @@ def _validate_secret(received: str | None, expected: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad secret")
 
 
-# Inserts one row into system.telegram_raw. Opens a short-lived connection per call.
+# Inserts one row into system.telegram_inbound. Idempotent — ON CONFLICT DO NOTHING means
+# Telegram retries (same update_id) are silently ignored rather than producing duplicates or 500s.
 # Inputs: payload dict and update_id from the Telegram Update.
-def _store_raw(payload: dict, update_id: int | None) -> None:
+def _store_inbound(payload: dict, update_id: int | None) -> None:
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO system.telegram_raw (update_id, payload) VALUES (%s, %s)",
+                    "INSERT INTO system.telegram_inbound (update_id, payload) VALUES (%s, %s)"
+                    " ON CONFLICT (update_id) DO NOTHING",
                     (update_id, json.dumps(payload)),
+                )
+    finally:
+        conn.close()
+
+
+# Inserts one row into system.telegram_outbound after a successful send_reply call.
+# Inputs: Telegram message_id from the API response, triggering update_id, full sent payload.
+def _store_outbound(message_id: int, update_id: int | None, payload: dict) -> None:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO system.telegram_outbound (message_id, telegram_update_id, payload)"
+                    " VALUES (%s, %s, %s)",
+                    (message_id, update_id, json.dumps(payload)),
                 )
     finally:
         conn.close()
