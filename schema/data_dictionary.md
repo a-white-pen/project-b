@@ -43,6 +43,18 @@ One row per distinct food item. A single message from B may produce one or multi
 
 ## Schema: `system`
 
+### `system.conversation_state`
+One row per bot reply that participates in a quoted correction chain. Root rows are written when a loggable domain handler returns state (currently food only — weight, expense, and attention handlers return None until those domains are built). Follow-up rows are written when B quotes a bot reply and a correction is applied. Full thread is rebuilt via a two-phase recursive CTE: walk up to root, then walk all descendants. context holds only the minimal structured state needed for the next correction turn.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `telegram_reply_message_id` | `integer` | no |  | Telegram message_id of this bot reply. References system.telegram_outbound(message_id). |
+| `parent_telegram_reply_message_id` | `integer` | yes |  | Bot reply B quoted when triggering this correction round. NULL for root rows (initial log reply). |
+| `triggering_telegram_update_id` | `bigint` | no |  | Inbound update_id that caused this bot reply. References system.telegram_inbound(update_id). Used to reconstruct user text from telegram_inbound.payload. |
+| `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
+| `context` | `jsonb` | no |  | Minimal structured payload for the next correction turn. food: {food_log_ids:[int], meal_type:str}. Other domains TBD as they are built. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+
 ### `system.telegram_inbound`
 Every inbound Telegram update received by the webhook, stored as raw JSON. One row per update_id. Written before any processing so nothing is lost even if routing fails. Counterpart to system.telegram_outbound.
 

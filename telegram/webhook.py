@@ -16,6 +16,7 @@ from json import JSONDecodeError
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
 from system.config import get_config
+from system.conversation_state import save_state
 from system.db import get_connection
 from telegram.normalizer import normalize
 from telegram.replies import send_reply
@@ -80,17 +81,26 @@ def create_app() -> FastAPI:
 
 # Normalizes the payload, classifies intent, sends the reply, and logs to telegram_outbound.
 # Runs as a background task — all errors are caught and logged, never raised.
-# Outbound logging failure is non-fatal: the reply was already sent to Telegram.
+# Outbound logging and state saving failures are non-fatal: the reply was already sent to Telegram.
 # Inputs: raw payload dict, chat_id and message_id from the inbound update.
 async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
     update_id = payload.get("update_id")
     try:
         msg = normalize(payload)
-        reply_text = await asyncio.to_thread(route, msg)
+        reply_text, pending_state = await asyncio.to_thread(route, msg)
         sent_message_id, sent_payload = await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
         if sent_message_id is not None:
             try:
                 await asyncio.to_thread(_store_outbound, sent_message_id, update_id, sent_payload)
+                if pending_state is not None:
+                    await asyncio.to_thread(
+                        save_state,
+                        sent_message_id,
+                        update_id,
+                        pending_state["domain"],
+                        pending_state["context"],
+                        pending_state.get("parent_telegram_reply_message_id"),
+                    )
             except Exception as e:
                 # Outbound audit log failed — reply already delivered, so non-fatal.
                 # Log at warning so gaps are visible without blocking the user.

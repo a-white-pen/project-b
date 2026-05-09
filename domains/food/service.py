@@ -147,14 +147,14 @@ Rules:
 
 # Handles a food logging request from B.
 # Inputs: InboundMessage with text or photo.
-# Outputs: reply string summarising what was logged.
-def handle_food_log(msg: InboundMessage) -> str:
+# Outputs: (reply string, pending_state dict | None). pending_state is non-None when items were logged.
+def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
     if msg.message_type == MessageType.PHOTO:
         return _handle_photo(msg)
 
     text = msg.text or msg.caption
     if not text:
-        return "I didn't catch what you ate — can you describe it in text?"
+        return ("I didn't catch what you ate — can you describe it in text?", None)
 
     local_time = _local_time_str()
 
@@ -166,11 +166,11 @@ def handle_food_log(msg: InboundMessage) -> str:
         extracted = _parse_json(raw)
     except Exception as e:
         logger.error("food extraction failed update_id=%s: %s", msg.update_id, e)
-        return "Couldn't parse what you ate — can you rephrase?"
+        return ("Couldn't parse what you ate — can you rephrase?", None)
 
     items = extracted.get("items", [])
     if not items:
-        return "Couldn't identify any food items — can you rephrase?"
+        return ("Couldn't identify any food items — can you rephrase?", None)
 
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
@@ -181,7 +181,7 @@ def handle_food_log(msg: InboundMessage) -> str:
     macro_meta = {"model": MODEL_FLASH}
 
     try:
-        _insert_items(
+        food_log_ids = _insert_items(
             items=items,
             meal_type=meal_type,
             update_id=msg.update_id,
@@ -192,24 +192,26 @@ def handle_food_log(msg: InboundMessage) -> str:
         )
     except Exception as e:
         logger.error("food insert failed update_id=%s: %s", msg.update_id, e)
-        return "Logged the intent but failed to save — please try again."
+        return ("Logged the intent but failed to save — please try again.", None)
 
-    return _format_reply(meal_type, items, macro_method)
+    reply = _format_reply(meal_type, items, macro_method)
+    state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
+    return (reply, state)
 
 
 # Handles a food photo — nutrition label or food image.
 # Downloads the image, sends to Gemini vision with caption for full context.
-# Returns a reply string. Does not log if needs_quantity=True.
-def _handle_photo(msg: InboundMessage) -> str:
+# Returns (reply, state). state is None if nothing was logged (needs_quantity, errors).
+def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
     if not msg.file_id:
-        return "Couldn't access the photo — please try again."
+        return ("Couldn't access the photo — please try again.", None)
 
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         image_bytes = get_file_bytes(msg.file_id, token)
     except Exception as e:
         logger.error("photo download failed update_id=%s: %s", msg.update_id, type(e).__name__)
-        return "Couldn't download the photo — please try again."
+        return ("Couldn't download the photo — please try again.", None)
 
     caption = msg.caption or ""
     local_time = _local_time_str()
@@ -223,16 +225,14 @@ def _handle_photo(msg: InboundMessage) -> str:
         extracted = _parse_json(raw)
     except Exception as e:
         logger.error("photo extraction failed update_id=%s: %s", msg.update_id, e)
-        return "Couldn't read the photo — can you try again or describe it in text?"
+        return ("Couldn't read the photo — can you try again or describe it in text?", None)
 
     if extracted.get("needs_quantity"):
-        # Can't ask and wait — no stateful context yet to tie the reply back to this photo.
-        # TODO: replace with proper ask-then-log flow once stateful conversation is built.
-        return "I can see the label but need to know how much you had. Resend the photo with a caption (e.g. '150g', '1 serving', 'half a bar')."
+        return ("I can see the label but need to know how much you had. Resend the photo with a caption (e.g. '150g', '1 serving', 'half a bar').", None)
 
     items = extracted.get("items", [])
     if not items:
-        return "Couldn't identify any food in the photo — can you describe it in text?"
+        return ("Couldn't identify any food in the photo — can you describe it in text?", None)
 
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
@@ -246,7 +246,7 @@ def _handle_photo(msg: InboundMessage) -> str:
         macro_meta["file_id"] = msg.file_id
 
     try:
-        _insert_items(
+        food_log_ids = _insert_items(
             items=items,
             meal_type=meal_type,
             update_id=msg.update_id,
@@ -257,9 +257,11 @@ def _handle_photo(msg: InboundMessage) -> str:
         )
     except Exception as e:
         logger.error("photo food insert failed update_id=%s: %s", msg.update_id, e)
-        return "Logged the intent but failed to save — please try again."
+        return ("Logged the intent but failed to save — please try again.", None)
 
-    return _format_reply(meal_type, items, macro_method)
+    reply = _format_reply(meal_type, items, macro_method)
+    state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
+    return (reply, state)
 
 
 # Returns B's current local time as a readable string for the LLM prompt.
@@ -285,6 +287,7 @@ def _to_float(val) -> float | None:
 
 
 # Inserts one row per food item into nutrition.food_log.
+# Returns the list of food_log_ids assigned by the DB (used to write conversation_state.context).
 def _insert_items(
     items: list[dict],
     meal_type: str,
@@ -293,7 +296,7 @@ def _insert_items(
     macro_input: str,
     macro_method: str,
     macro_meta: dict,
-) -> None:
+) -> list[int]:
     sql = """
         INSERT INTO nutrition.food_log (
             meal_type, telegram_update_id, food_item, food_meta,
@@ -303,8 +306,9 @@ def _insert_items(
             %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s
-        )
+        ) RETURNING food_log_id
     """
+    ids: list[int] = []
     conn = get_connection()
     try:
         with conn:
@@ -328,8 +332,12 @@ def _insert_items(
                         macro_method,
                         psycopg2.extras.Json(macro_meta),
                     ))
+                    row = cur.fetchone()
+                    if row:
+                        ids.append(row[0])
     finally:
         conn.close()
+    return ids
 
 
 # Formats the reply shown to B after logging.

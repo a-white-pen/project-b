@@ -45,6 +45,7 @@ def normalize(payload: dict) -> InboundMessage:
 
         chat = msg.get("chat") or {}
         sender = msg.get("from") or {}
+        reply_to = msg.get("reply_to_message") or {}
         base = dict(
             update_id=update_id,
             message_id=msg.get("message_id"),
@@ -52,6 +53,7 @@ def normalize(payload: dict) -> InboundMessage:
             sender_id=sender.get("id"),
             caption=msg.get("caption"),
             timestamp=_parse_ts(msg.get("date")),
+            quoted_message_id=reply_to.get("message_id"),
         )
 
         if "text" in msg:

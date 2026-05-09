@@ -14,10 +14,12 @@ from enum import Enum
 
 from domains.attention.service import handle_attention_log
 from domains.expense.service import handle_expense_log
+from domains.food.correction import handle_food_correction
 from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
 from domains.query.service import handle_query_data
 from domains.weight.service import handle_weight_log
+from system.conversation_state import load_state
 from system.llm import MODEL_LITE, generate_text, transcribe_audio
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
@@ -32,6 +34,7 @@ class Intent(str, Enum):
     LOG_ATTENTION = "log_attention" # logging what B is working on / paying attention to
     QUERY_DATA = "query_data"       # question about B's own stored data
     ASK_GENERAL = "ask_general"     # general question — use as an LLM, unrelated to personal data
+    CORRECT = "correct"             # correction to a previously logged item (quoted bot reply)
     UNKNOWN = "unknown"             # cannot determine intent
 
 
@@ -68,19 +71,30 @@ Caption: {caption}
 Respond with only the intent name. Nothing else."""
 
 
-# Routes an inbound message to the right domain handler and returns a reply string.
-# Priority: callback_query → slash command → voice transcription → LLM classifier.
+# Routes an inbound message to the right domain handler.
+# Priority: callback_query → slash command → voice transcription → quoted correction → LLM classifier.
+# Voice is transcribed before the correction check so that a quoted voice note works as a
+# correction — handle_food_correction reads msg.text, which would be None for an untranscribed voice.
 # Inputs: InboundMessage from normalizer.
-# Outputs: reply string to send back to B.
-def route(msg: InboundMessage) -> str:
+# Outputs: (reply_text, pending_state) where pending_state is non-None for loggable actions.
+#   pending_state keys: domain, context, [parent_telegram_reply_message_id].
+def route(msg: InboundMessage) -> tuple[str, dict | None]:
     if msg.message_type == MessageType.CALLBACK_QUERY:
         return _route_callback(msg)
     command_intent = _extract_command(msg)
     if command_intent is not None:
         logger.info("update_id=%s command=%s", msg.update_id, command_intent.value)
         return _dispatch(command_intent, _strip_command(msg))
+    # Transcribe voice before correction check — correction handlers read msg.text.
+    # A quoted voice note must be transcribed first so the correction can read the text.
     if msg.message_type == MessageType.VOICE:
         msg = _transcribe_voice(msg)
+    # Correction path: B quoted a previous bot reply → check conversation_state before LLM.
+    if msg.quoted_message_id is not None:
+        result = _try_correction(msg)
+        if result is not None:
+            logger.info("update_id=%s intent=%s quoted=%s", msg.update_id, Intent.CORRECT.value, msg.quoted_message_id)
+            return result
     # PHOTO: classified by LLM from message_type + caption.
     # Bare photos with no caption are unreliable — future fix is vision-based intent classification.
     intent = _classify_intent(msg)
@@ -90,12 +104,12 @@ def route(msg: InboundMessage) -> str:
 
 # Routes a callback_query update deterministically from callback_data.
 # Inputs: InboundMessage with message_type=CALLBACK_QUERY.
-# Outputs: reply string. No LLM call — callback_data is explicit, not ambiguous.
-def _route_callback(msg: InboundMessage) -> str:
+# Outputs: (reply, None). No LLM call — callback_data is explicit, not ambiguous.
+def _route_callback(msg: InboundMessage) -> tuple[str, None]:
     logger.info("update_id=%s callback_data=%s", msg.update_id, msg.callback_data)
     # No inline buttons implemented yet — all callback_data falls through to stub.
     # When buttons are added, dispatch here by callback_data value.
-    return "button press captured — not implemented yet"
+    return ("button press captured — not implemented yet", None)
 
 
 # Extracts a slash command from the message text and maps it to an Intent.
@@ -160,9 +174,27 @@ def _parse_intent(raw: str) -> Intent:
     return Intent.UNKNOWN
 
 
-# Dispatches to the right domain handler and returns a reply string.
-# Inputs: Intent, InboundMessage. Outputs: reply string from the domain handler.
-def _dispatch(intent: Intent, msg: InboundMessage) -> str:
+# Checks whether a quoted bot reply has loggable conversation_state. Returns correction result or None.
+# Returning None means the quoted message has no state — fall through to normal LLM routing.
+def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
+    try:
+        state = load_state(msg.quoted_message_id)
+    except Exception as e:
+        logger.warning("update_id=%s correction state lookup failed: %s", msg.update_id, e)
+        return None
+    if state is None:
+        return None
+    domain = state.get("domain")
+    if domain == "food":
+        return handle_food_correction(msg, state)
+    # Other domains: not implemented yet — fall through to normal routing
+    logger.info("update_id=%s correction for domain=%s not implemented", msg.update_id, domain)
+    return None
+
+
+# Dispatches to the right domain handler.
+# Inputs: Intent, InboundMessage. Outputs: (reply, pending_state) from the domain handler.
+def _dispatch(intent: Intent, msg: InboundMessage) -> tuple[str, dict | None]:
     if intent == Intent.LOG_FOOD:
         return handle_food_log(msg)
     if intent == Intent.LOG_WEIGHT:
@@ -175,4 +207,4 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> str:
         return handle_query_data(msg)
     if intent == Intent.ASK_GENERAL:
         return handle_general_ask(msg)
-    return "not sure what to do with that yet"
+    return ("not sure what to do with that yet", None)

@@ -37,3 +37,4 @@ class InboundMessage:
     location: tuple[float, float] | None  # (latitude, longitude) for LOCATION
     callback_data: str | None  # button payload for CALLBACK_QUERY
     timestamp: datetime | None
+    quoted_message_id: int | None = None  # message_id of the bot reply B is quoting (reply_to_message)

@@ -11,5 +11,5 @@ from system.messages import InboundMessage
 # Handles a weight logging request from B.
 # Inputs: InboundMessage with text containing weight or body measurement.
 # Outputs: reply string. Stub until weight schema and extraction are built.
-def handle_weight_log(msg: InboundMessage) -> str:
-    return "weight intent captured — logging not built yet"
+def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
+    return ("weight intent captured — logging not built yet", None)
