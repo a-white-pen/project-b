@@ -36,6 +36,28 @@ def _get_client() -> genai.Client:
 # Sends a prompt to the specified LLM and returns the stripped text response.
 # Inputs: prompt string, model name (default: MODEL_LITE).
 # Outputs: stripped response string. Raises on API error.
+def generate_with_image(
+    image_bytes: bytes,
+    prompt: str,
+    mime_type: str = "image/jpeg",
+    model: str = MODEL_FLASH,
+) -> str:
+    """Sends an image + text prompt to Gemini and returns the response.
+
+    Inputs: raw image bytes, prompt string, MIME type, model.
+    Outputs: stripped response string. Raises on API error.
+    """
+    response = _get_client().models.generate_content(
+        model=model,
+        contents=[
+            types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)),
+            types.Part(text=prompt),
+        ],
+    )
+    logger.debug("generate_with_image model=%s bytes=%d", model, len(image_bytes))
+    return response.text.strip()
+
+
 def generate_text(prompt: str, model: str = MODEL_LITE) -> str:
     response = _get_client().models.generate_content(model=model, contents=prompt)
     logger.debug("llm model=%s", model)

@@ -81,6 +81,8 @@ def route(msg: InboundMessage) -> str:
         return _dispatch(command_intent, _strip_command(msg))
     if msg.message_type == MessageType.VOICE:
         msg = _transcribe_voice(msg)
+    # PHOTO: classified by LLM from message_type + caption.
+    # Bare photos with no caption are unreliable — future fix is vision-based intent classification.
     intent = _classify_intent(msg)
     logger.info("update_id=%s intent=%s", msg.update_id, intent.value)
     return _dispatch(intent, msg)

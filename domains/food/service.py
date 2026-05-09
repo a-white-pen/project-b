@@ -8,6 +8,7 @@ Functions:
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -15,8 +16,9 @@ from zoneinfo import ZoneInfo
 import psycopg2.extras
 
 from system.db import get_connection
-from system.llm import MODEL_FLASH, generate_text
-from system.messages import InboundMessage
+from system.llm import MODEL_FLASH, generate_text, generate_with_image
+from system.messages import InboundMessage, MessageType
+from telegram.files import get_file_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +76,82 @@ Rules:
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
+_PHOTO_EXTRACT_PROMPT = """\
+You are extracting food log entries from a photo for a personal nutrition tracker.
+
+About the user: Singaporean Chinese, based between Singapore and Bangkok. \
+Eats Singaporean, Thai, and Southern Chinese food on top of regular western fare. \
+Common meals include hawker dishes (chicken rice, char kway teow, laksa, wonton noodles), \
+Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chinese food \
+(dim sum, congee, braised meats). Use this context when estimating portion sizes and macros.
+
+Current local time: {local_time}
+Caption from user (may be empty): {caption}
+
+Examine the image and caption together.
+
+Step 1 — determine photo type:
+- nutrition_label: photo shows a nutrition facts panel, packaging label, or nutrition information table
+- food_image: photo shows actual food, a plate, a dish, or a meal
+
+Step 2 — extract based on type:
+
+If nutrition_label:
+- Read macro values directly from the label per serving
+- Check the caption for quantity consumed (e.g. "150g", "2 servings", "half a bar")
+- If the caption does NOT specify how much was consumed, set needs_quantity=true and return immediately with empty items
+- If quantity is known, pro-rate the macros: (consumed / serving_size) × per_serving_macros
+- Set macro_input="nutrition_label", macro_method="nutrition_label"
+
+If food_image:
+- Identify each distinct food item visible
+- Use the caption for additional context (dish name, portion size, extras)
+- Estimate portion sizes from visual cues, plate size, and typical serving sizes for this cuisine
+- Estimate macros for each item
+- Set macro_input="image", macro_method="llm", needs_quantity=false
+
+Return a JSON object with this exact structure:
+{{
+  "photo_type": "<nutrition_label or food_image>",
+  "needs_quantity": <true or false>,
+  "meal_type": "<one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout>",
+  "macro_input": "<nutrition_label or image>",
+  "macro_method": "<nutrition_label or llm>",
+  "items": [
+    {{
+      "food_item": "<description>",
+      "kcal": <number or null>,
+      "protein_g": <number or null>,
+      "carbs_g": <number or null>,
+      "fat_g": <number or null>,
+      "fibre_g": <number or null>,
+      "sugar_g": <number or null>,
+      "sodium_mg": <number or null>,
+      "food_meta": {{
+        "qty": {{"amount": <number>, "unit": "<string>"}},
+        "prep": "<string>",
+        "brand": "<string>",
+        "notes": "<string>"
+      }}
+    }}
+  ]
+}}
+
+Rules:
+- If needs_quantity=true, items should be empty
+- meal_type: infer from local time if not stated in caption
+- food_meta keys are optional — omit if not meaningful
+- Return valid JSON only. No explanation, no markdown, no code blocks.\
+"""
+
 
 # Handles a food logging request from B.
-# Inputs: InboundMessage with text describing food consumed.
+# Inputs: InboundMessage with text or photo.
 # Outputs: reply string summarising what was logged.
 def handle_food_log(msg: InboundMessage) -> str:
+    if msg.message_type == MessageType.PHOTO:
+        return _handle_photo(msg)
+
     text = msg.text or msg.caption
     if not text:
         return "I didn't catch what you ate — can you describe it in text?"
@@ -119,6 +192,71 @@ def handle_food_log(msg: InboundMessage) -> str:
         )
     except Exception as e:
         logger.error("food insert failed update_id=%s: %s", msg.update_id, e)
+        return "Logged the intent but failed to save — please try again."
+
+    return _format_reply(meal_type, items, macro_method)
+
+
+# Handles a food photo — nutrition label or food image.
+# Downloads the image, sends to Gemini vision with caption for full context.
+# Returns a reply string. Does not log if needs_quantity=True.
+def _handle_photo(msg: InboundMessage) -> str:
+    if not msg.file_id:
+        return "Couldn't access the photo — please try again."
+
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        image_bytes = get_file_bytes(msg.file_id, token)
+    except Exception as e:
+        logger.error("photo download failed update_id=%s: %s", msg.update_id, type(e).__name__)
+        return "Couldn't download the photo — please try again."
+
+    caption = msg.caption or ""
+    local_time = _local_time_str()
+
+    try:
+        raw = generate_with_image(
+            image_bytes=image_bytes,
+            prompt=_PHOTO_EXTRACT_PROMPT.format(local_time=local_time, caption=caption),
+            model=MODEL_FLASH,
+        )
+        extracted = _parse_json(raw)
+    except Exception as e:
+        logger.error("photo extraction failed update_id=%s: %s", msg.update_id, e)
+        return "Couldn't read the photo — can you try again or describe it in text?"
+
+    if extracted.get("needs_quantity"):
+        # Can't ask and wait — no stateful context yet to tie the reply back to this photo.
+        # TODO: replace with proper ask-then-log flow once stateful conversation is built.
+        return "I can see the label but need to know how much you had. Resend the photo with a caption (e.g. '150g', '1 serving', 'half a bar')."
+
+    items = extracted.get("items", [])
+    if not items:
+        return "Couldn't identify any food in the photo — can you describe it in text?"
+
+    meal_type = extracted.get("meal_type", "snack")
+    if meal_type not in _VALID_MEAL_TYPES:
+        logger.warning("update_id=%s unrecognised meal_type=%r, defaulting to snack", msg.update_id, meal_type)
+        meal_type = "snack"
+
+    macro_input = extracted.get("macro_input", "image")
+    macro_method = extracted.get("macro_method", "llm")
+    macro_meta: dict = {"model": MODEL_FLASH}
+    if macro_input == "nutrition_label" and msg.file_id:
+        macro_meta["file_id"] = msg.file_id
+
+    try:
+        _insert_items(
+            items=items,
+            meal_type=meal_type,
+            update_id=msg.update_id,
+            source="telegram",
+            macro_input=macro_input,
+            macro_method=macro_method,
+            macro_meta=macro_meta,
+        )
+    except Exception as e:
+        logger.error("photo food insert failed update_id=%s: %s", msg.update_id, e)
         return "Logged the intent but failed to save — please try again."
 
     return _format_reply(meal_type, items, macro_method)
