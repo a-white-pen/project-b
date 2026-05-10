@@ -11,6 +11,8 @@ import os
 import psycopg2
 import psycopg2.extensions
 
+from system.logging import log_failure
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,5 +26,5 @@ def get_connection() -> psycopg2.extensions.connection:
         conn = psycopg2.connect(url)
         return conn
     except Exception as e:
-        logger.error("DB connection failed: %s", e)
+        log_failure(logger, logging.ERROR, "db_connection_failed", e)
         raise

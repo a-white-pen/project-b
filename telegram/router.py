@@ -23,6 +23,7 @@ from domains.sleep.service import handle_sleep_log, handle_wake_log
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
 from system.llm import MODEL_LITE, generate_text, transcribe_audio
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
 
@@ -87,16 +88,32 @@ Respond with only the intent name. Nothing else."""
 # Outputs: (reply_text, pending_state) where pending_state is non-None for loggable actions.
 #   pending_state keys: domain, context, [parent_telegram_reply_message_id].
 def route(msg: InboundMessage) -> tuple[str, dict | None]:
+    log_event(
+        logger,
+        logging.INFO,
+        "route_started",
+        update_id=msg.update_id,
+        message_type=msg.message_type.value,
+        has_text=bool(msg.text),
+        has_caption=bool(msg.caption),
+        quoted_message_id=msg.quoted_message_id,
+    )
     if msg.message_type == MessageType.CALLBACK_QUERY:
         return _route_callback(msg)
     # Location is always deterministic — no LLM needed.
     if msg.message_type == MessageType.LOCATION:
         if msg.location:
-            logger.info("update_id=%s location lat=%s lon=%s", msg.update_id, *msg.location)
+            log_event(logger, logging.INFO, "route_location_received", update_id=msg.update_id)
         return handle_location(msg)
     command_intent = _extract_command(msg)
     if command_intent is not None:
-        logger.info("update_id=%s command=%s", msg.update_id, command_intent.value)
+        log_event(
+            logger,
+            logging.INFO,
+            "route_command_matched",
+            update_id=msg.update_id,
+            intent=command_intent.value,
+        )
         return _dispatch(command_intent, _strip_command(msg))
     # Transcribe voice before correction check — correction handlers read msg.text.
     # A quoted voice note must be transcribed first so the correction can read the text.
@@ -106,12 +123,19 @@ def route(msg: InboundMessage) -> tuple[str, dict | None]:
     if msg.quoted_message_id is not None:
         result = _try_correction(msg)
         if result is not None:
-            logger.info("update_id=%s intent=%s quoted=%s", msg.update_id, Intent.CORRECT.value, msg.quoted_message_id)
+            log_event(
+                logger,
+                logging.INFO,
+                "route_correction_matched",
+                update_id=msg.update_id,
+                intent=Intent.CORRECT.value,
+                quoted_message_id=msg.quoted_message_id,
+            )
             return result
     # PHOTO: classified by LLM from message_type + caption.
     # Bare photos with no caption are unreliable — future fix is vision-based intent classification.
     intent = _classify_intent(msg)
-    logger.info("update_id=%s intent=%s", msg.update_id, intent.value)
+    log_event(logger, logging.INFO, "route_intent_resolved", update_id=msg.update_id, intent=intent.value)
     return _dispatch(intent, msg)
 
 
@@ -119,7 +143,13 @@ def route(msg: InboundMessage) -> tuple[str, dict | None]:
 # Inputs: InboundMessage with message_type=CALLBACK_QUERY.
 # Outputs: (reply, None). No LLM call — callback_data is explicit, not ambiguous.
 def _route_callback(msg: InboundMessage) -> tuple[str, None]:
-    logger.info("update_id=%s callback_data=%s", msg.update_id, msg.callback_data)
+    log_event(
+        logger,
+        logging.INFO,
+        "route_callback_received",
+        update_id=msg.update_id,
+        callback_data=msg.callback_data,
+    )
     # No inline buttons implemented yet — all callback_data falls through to stub.
     # When buttons are added, dispatch here by callback_data value.
     return ("button press captured — not implemented yet", None)
@@ -157,7 +187,14 @@ def _classify_intent(msg: InboundMessage) -> Intent:
         raw = generate_text(prompt, model=MODEL_LITE)
         return _parse_intent(raw)
     except Exception as e:
-        logger.warning("intent classification failed: %s", e)
+        log_failure(
+            logger,
+            logging.WARNING,
+            "route_intent_classification_failed",
+            e,
+            update_id=msg.update_id,
+            message_type=msg.message_type.value,
+        )
         return Intent.UNKNOWN
 
 
@@ -168,13 +205,30 @@ def _transcribe_voice(msg: InboundMessage) -> InboundMessage:
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         audio = get_file_bytes(msg.file_id, token)
-        logger.info("update_id=%s voice downloaded bytes=%d", msg.update_id, len(audio))
+        log_event(
+            logger,
+            logging.INFO,
+            "route_voice_downloaded",
+            update_id=msg.update_id,
+            bytes_downloaded=len(audio),
+        )
         text = transcribe_audio(audio)
-        logger.info("update_id=%s voice transcribed text=%r", msg.update_id, text)
+        log_event(
+            logger,
+            logging.INFO,
+            "route_voice_transcribed",
+            update_id=msg.update_id,
+            text_chars=len(text),
+        )
         return dataclasses.replace(msg, message_type=MessageType.TEXT, text=text)
     except Exception as e:
-        # Log type only — not the message, which may contain the bot token via httpx URL.
-        logger.warning("update_id=%s voice transcription failed: %s", msg.update_id, type(e).__name__)
+        log_failure(
+            logger,
+            logging.WARNING,
+            "route_voice_transcription_failed",
+            e,
+            update_id=msg.update_id,
+        )
         return dataclasses.replace(msg, message_type=MessageType.TEXT, text=None)
 
 
@@ -201,7 +255,14 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
     try:
         state = load_state(msg.quoted_message_id)
     except Exception as e:
-        logger.warning("update_id=%s correction state lookup failed: %s", msg.update_id, e)
+        log_failure(
+            logger,
+            logging.WARNING,
+            "route_correction_state_lookup_failed",
+            e,
+            update_id=msg.update_id,
+            quoted_message_id=msg.quoted_message_id,
+        )
         return None
     if state is None:
         return None
@@ -209,7 +270,13 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
     if domain == "food":
         return handle_food_correction(msg, state)
     # Other domains: not implemented yet — fall through to normal routing
-    logger.info("update_id=%s correction for domain=%s not implemented", msg.update_id, domain)
+    log_event(
+        logger,
+        logging.INFO,
+        "route_correction_domain_not_implemented",
+        update_id=msg.update_id,
+        domain=domain,
+    )
     return None
 
 

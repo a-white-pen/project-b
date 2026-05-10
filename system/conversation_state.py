@@ -18,6 +18,7 @@ import logging
 import psycopg2.extras
 
 from system.db import get_connection
+from system.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,15 @@ def save_state(
                     domain,
                     psycopg2.extras.Json(context),
                 ))
+        log_event(
+            logger,
+            logging.INFO,
+            "conversation_state_saved",
+            telegram_reply_message_id=telegram_reply_message_id,
+            triggering_telegram_update_id=triggering_telegram_update_id,
+            domain=domain,
+            parent_telegram_reply_message_id=parent_telegram_reply_message_id,
+        )
     finally:
         conn.close()
 
@@ -77,7 +87,20 @@ def load_state(telegram_reply_message_id: int) -> dict | None:
                 cur.execute(sql, (telegram_reply_message_id,))
                 row = cur.fetchone()
                 if row is None:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "conversation_state_not_found",
+                        telegram_reply_message_id=telegram_reply_message_id,
+                    )
                     return None
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "conversation_state_loaded",
+                    telegram_reply_message_id=telegram_reply_message_id,
+                    domain=row[3],
+                )
                 return {
                     "telegram_reply_message_id": row[0],
                     "parent_telegram_reply_message_id": row[1],
@@ -162,6 +185,13 @@ def get_thread(telegram_reply_message_id: int) -> list[dict]:
             with conn.cursor() as cur:
                 cur.execute(sql, (telegram_reply_message_id,))
                 rows = cur.fetchall()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "conversation_thread_loaded",
+                    telegram_reply_message_id=telegram_reply_message_id,
+                    row_count=len(rows),
+                )
                 return [
                     {
                         "telegram_reply_message_id": r[0],

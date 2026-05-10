@@ -2,6 +2,7 @@
 LLM client — thin wrappers for text generation and audio transcription.
 
 Functions:
+  generate_with_image(image_bytes, prompt, mime_type, model) — sends image+text prompt and returns the response
   generate_text(prompt, model)                   — sends a text prompt and returns the response
   transcribe_audio(audio_bytes, mime_type, model) — transcribes a voice message via Gemini
 """
@@ -11,6 +12,8 @@ import os
 
 from google import genai
 from google.genai import types
+
+from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,7 @@ def _get_client() -> genai.Client:
     global _gemini
     if _gemini is None:
         _gemini = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None)
+        log_event(logger, logging.INFO, "llm_client_created")
     return _gemini
 
 
@@ -47,21 +51,75 @@ def generate_with_image(
     Inputs: raw image bytes, prompt string, MIME type, model.
     Outputs: stripped response string. Raises on API error.
     """
-    response = _get_client().models.generate_content(
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_generate_with_image_started",
         model=model,
-        contents=[
-            types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)),
-            types.Part(text=prompt),
-        ],
+        image_bytes=len(image_bytes),
+        mime_type=mime_type,
+        prompt_chars=len(prompt),
     )
-    logger.info("generate_with_image model=%s bytes=%d", model, len(image_bytes))
-    return _extract_text(response)
+    try:
+        response = _get_client().models.generate_content(
+            model=model,
+            contents=[
+                types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)),
+                types.Part(text=prompt),
+            ],
+        )
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_generate_with_image_completed",
+            model=model,
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_generate_with_image_failed",
+            e,
+            model=model,
+            image_bytes=len(image_bytes),
+            mime_type=mime_type,
+            prompt_chars=len(prompt),
+        )
+        raise
 
 
 def generate_text(prompt: str, model: str = MODEL_LITE) -> str:
-    response = _get_client().models.generate_content(model=model, contents=prompt)
-    logger.info("generate_text model=%s prompt_chars=%d", model, len(prompt))
-    return _extract_text(response)
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_generate_text_started",
+        model=model,
+        prompt_chars=len(prompt),
+    )
+    try:
+        response = _get_client().models.generate_content(model=model, contents=prompt)
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_generate_text_completed",
+            model=model,
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_generate_text_failed",
+            e,
+            model=model,
+            prompt_chars=len(prompt),
+        )
+        raise
 
 
 # Transcribes a voice message using Gemini's multimodal input.
@@ -72,28 +130,53 @@ def transcribe_audio(
     mime_type: str = "audio/ogg",
     model: str = MODEL_FLASH,
 ) -> str:
-    logger.info("transcribe_audio model=%s bytes=%d mime_type=%s", model, len(audio_bytes), mime_type)
-    response = _get_client().models.generate_content(
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_transcribe_audio_started",
         model=model,
-        contents=[
-            types.Part(inline_data=types.Blob(data=audio_bytes, mime_type=mime_type)),
-            types.Part(text=(
-                "Transcribe this voice message exactly as spoken. "
-                "The speaker is Singaporean and may speak in Singaporean English (Singlish), "
-                "or mix in Hokkien, Mandarin, Cantonese, Malay, or Thai words. "
-                "Preserve the words as spoken — do not translate or normalise to standard English. "
-                "Context: the speaker logs personal health data by voice. Common messages include "
-                "sleep/wake phrases (e.g. 'night night', 'good night', 'going to sleep', "
-                "'woke up', 'good morning', 'wakey wakey', 'rise and shine') and weight numbers "
-                "(e.g. '57.2', '63 kg'). Prefer sleep/wake phrase interpretations for greetings "
-                "and bedtime expressions over digit sequences. "
-                "Return only the transcription, nothing else."
-            )),
-        ],
+        audio_bytes=len(audio_bytes),
+        mime_type=mime_type,
     )
-    result = _extract_text(response)
-    logger.info("transcribe_audio result=%r", result)
-    return result
+    try:
+        response = _get_client().models.generate_content(
+            model=model,
+            contents=[
+                types.Part(inline_data=types.Blob(data=audio_bytes, mime_type=mime_type)),
+                types.Part(text=(
+                    "Transcribe this voice message exactly as spoken. "
+                    "The speaker is Singaporean and may speak in Singaporean English (Singlish), "
+                    "or mix in Hokkien, Mandarin, Cantonese, Malay, or Thai words. "
+                    "Preserve the words as spoken — do not translate or normalise to standard English. "
+                    "Context: the speaker logs personal health data by voice. Common messages include "
+                    "sleep/wake phrases (e.g. 'night night', 'good night', 'going to sleep', "
+                    "'woke up', 'good morning', 'wakey wakey', 'rise and shine') and weight numbers "
+                    "(e.g. '57.2', '63 kg'). Prefer sleep/wake phrase interpretations for greetings "
+                    "and bedtime expressions over digit sequences. "
+                    "Return only the transcription, nothing else."
+                )),
+            ],
+        )
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_transcribe_audio_completed",
+            model=model,
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_transcribe_audio_failed",
+            e,
+            model=model,
+            audio_bytes=len(audio_bytes),
+            mime_type=mime_type,
+        )
+        raise
 
 
 # Extracts the text from a GenerateContentResponse.

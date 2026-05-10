@@ -13,6 +13,7 @@ import logging
 import httpx
 
 from system.config import get_config
+from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,24 @@ def send_reply(
         response = httpx.post(url, json=payload, timeout=10)
         response.raise_for_status()
         message_id = response.json().get("result", {}).get("message_id")
-        logger.info("reply sent chat_id=%s message_id=%s", chat_id, message_id)
+        log_event(
+            logger,
+            logging.INFO,
+            "reply_sent",
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_to_message_id=reply_to_message_id,
+            text_chars=len(text),
+        )
         return message_id, payload
     except httpx.HTTPError as e:
-        logger.warning("failed to send reply to chat_id=%s: %s", chat_id, e)
+        log_failure(
+            logger,
+            logging.WARNING,
+            "reply_send_failed",
+            e,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text_chars=len(text),
+        )
         return None, payload

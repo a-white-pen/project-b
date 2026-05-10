@@ -109,6 +109,14 @@ Functions:
 """
 ```
 
+**Logging:** all non-trivial runtime paths should log enough to trace what happened without leaking secrets or raw user content.
+- Use `system/logging.py` helpers: `configure_logging()` at app startup, `log_event(...)` for normal flow, `log_failure(...)` for caught exceptions, and `get_error_summary(...)` when a redacted error string is needed.
+- Log structured context only: `update_id`, `message_type`, row counts, IDs, model names, byte counts, timestamps, booleans, chosen intent, etc.
+- Do **not** log secrets or anything that may contain them: bot tokens, API keys, webhook secrets, `DATABASE_URL`, authorization headers, or raw exception strings from HTTP clients unless passed through the redaction helper.
+- Do **not** log raw freeform user content by default: message text, captions, full transcriptions, prompts, model responses, exact coordinates, or full payload JSON. Prefer lengths, presence flags, IDs, and summaries.
+- `INFO` = normal lifecycle milestones and successful decisions; `WARNING` = degraded fallback, retries, or non-fatal misses; `ERROR` = request-affecting failure where the current action could not complete.
+- When adding a new domain or external call, include logs for: entry into the handler, key branch decisions, successful write/send completion, and any caught failure path.
+
 ---
 
 ## Stack gotchas

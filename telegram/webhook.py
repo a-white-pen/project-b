@@ -20,21 +20,11 @@ import asyncio
 import hmac
 import json
 import logging
-import sys
 from json import JSONDecodeError
 
-# Configure root logger so all app loggers (domains.*, telegram.*, system.*) emit to stderr.
-# Without this, Python's default root logger has no handlers and all our logger.info/warning
-# calls are silently dropped. Must be called before any module imports that use logging.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s: %(message)s",
-    stream=sys.stderr,
-)
-# Suppress httpx and google_genai transport logs — they log full URLs including the bot token.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("google_genai").setLevel(logging.WARNING)
+from system.logging import configure_logging, get_error_summary, log_event, log_failure
+
+configure_logging()
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
@@ -80,14 +70,14 @@ def create_app() -> FastAPI:
         if not inserted:
             # Duplicate update_id — Telegram retry for a message we already stored.
             # Return 200 immediately without processing to avoid duplicate replies and domain rows.
-            logger.info("update_id=%s duplicate — skipped", update_id)
+            log_event(logger, logging.INFO, "webhook_duplicate_skipped", update_id=update_id)
             return {"ok": True}
-        logger.info("update_id=%s stored", update_id)
+        log_event(logger, logging.INFO, "webhook_update_stored", update_id=update_id)
 
         # Skip routing for edited messages — stored in telegram_inbound for audit but not processed.
         # Re-processing an edit would duplicate domain rows (e.g. double food_log entries).
         if "edited_message" in payload or "edited_channel_post" in payload:
-            logger.info("update_id=%s edited message — stored, not routed", update_id)
+            log_event(logger, logging.INFO, "webhook_edited_message_skipped", update_id=update_id)
             return {"ok": True}
 
         # Process synchronously — work stays alive for the duration of this request.
@@ -96,7 +86,7 @@ def create_app() -> FastAPI:
         if chat_id is not None:
             await _process_and_reply(payload, chat_id, message_id)
         else:
-            logger.info("update_id=%s no chat_id — stored, not routed", update_id)
+            log_event(logger, logging.INFO, "webhook_no_chat_id_skipped", update_id=update_id)
 
         return {"ok": True}
 
@@ -121,6 +111,14 @@ def create_app() -> FastAPI:
 async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
     update_id = payload.get("update_id")
     try:
+        log_event(
+            logger,
+            logging.INFO,
+            "process_reply_started",
+            update_id=update_id,
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+        )
         msg = normalize(payload)
         reply_text, pending_state = await asyncio.to_thread(route, msg)
         sent_message_id, sent_payload = await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
@@ -139,9 +137,31 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
             except Exception as e:
                 # Outbound audit log failed — reply already delivered, so non-fatal.
                 # Log at warning so gaps are visible without blocking the user.
-                logger.warning("update_id=%s outbound logging failed: %s", update_id, e)
+                log_failure(
+                    logger,
+                    logging.WARNING,
+                    "process_reply_audit_failed",
+                    e,
+                    update_id=update_id,
+                    sent_message_id=sent_message_id,
+                )
+        log_event(
+            logger,
+            logging.INFO,
+            "process_reply_completed",
+            update_id=update_id,
+            sent_message_id=sent_message_id,
+            pending_state_domain=(pending_state or {}).get("domain"),
+        )
     except Exception as e:
-        logger.error("update_id=%s _process_and_reply failed: %s", update_id, e)
+        log_failure(
+            logger,
+            logging.ERROR,
+            "process_reply_failed",
+            e,
+            update_id=update_id,
+            chat_id=chat_id,
+        )
 
 
 # Extracts chat_id and message_id from the Telegram Update payload.
@@ -221,8 +241,8 @@ def _ping_db() -> str:
             conn.close()
         return "ok"
     except Exception as e:
-        logger.error("DB health check failed: %s", e)
-        return str(e)
+        log_failure(logger, logging.ERROR, "health_check_db_failed", e)
+        return get_error_summary(e)
 
 
 app = create_app()

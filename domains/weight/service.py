@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import psycopg2.extras
 
 from system.db import get_connection
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,26 @@ def _extract_weight_kg(text: str) -> float | None:
 # Outputs: (reply string, None). No pending_state — no correction flow for weight.
 def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
     if not msg.text:
+        log_event(logger, logging.WARNING, "weight_log_missing_text", update_id=msg.update_id)
         return ("What weight would you like to log? Send a number in kg, e.g. 57.1", None)
 
     weight_kg = _extract_weight_kg(msg.text)
-    logger.info("update_id=%s weight extracted=%.1f from text=%r", msg.update_id, weight_kg or 0, msg.text)
+    log_event(
+        logger,
+        logging.INFO,
+        "weight_log_parsed",
+        update_id=msg.update_id,
+        parsed_weight_kg=weight_kg,
+        text_chars=len(msg.text),
+    )
     if weight_kg is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "weight_log_invalid_value",
+            update_id=msg.update_id,
+            text_chars=len(msg.text),
+        )
         return ("Couldn't find a valid weight in your message. Send a number in kg, e.g. 57.1", None)
 
     measured_at = msg.timestamp if msg.timestamp is not None else datetime.now(timezone.utc)
@@ -70,8 +86,15 @@ def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
         finally:
             conn.close()
     except Exception as e:
-        logger.error("weight insert failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "weight_insert_failed", e, update_id=msg.update_id)
         return ("Couldn't save your weight — please try again.", None)
 
-    logger.info("update_id=%s weight_kg=%.1f inserted measured_at=%s", msg.update_id, weight_kg, measured_at)
+    log_event(
+        logger,
+        logging.INFO,
+        "weight_inserted",
+        update_id=msg.update_id,
+        weight_kg=weight_kg,
+        measured_at=measured_at.isoformat(),
+    )
     return (f"⚖️ {weight_kg:.1f} kg logged.", None)

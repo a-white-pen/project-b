@@ -13,6 +13,7 @@ import psycopg2.extras
 
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage
 
 logger = logging.getLogger(__name__)
@@ -115,22 +116,34 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     context = state.get("context") or {}
     food_log_ids = context.get("food_log_ids") or []
     original_meal_type = context.get("meal_type", "snack")
+    log_event(
+        logger,
+        logging.INFO,
+        "food_correction_started",
+        update_id=msg.update_id,
+        food_log_id_count=len(food_log_ids),
+        has_text=bool(msg.text),
+        has_caption=bool(msg.caption),
+    )
 
     if not food_log_ids:
+        log_event(logger, logging.WARNING, "food_correction_missing_food_log_ids", update_id=msg.update_id)
         return ("Nothing to correct — couldn't find the original log entries.", None)
 
     correction_text = msg.text or msg.caption
     if not correction_text:
+        log_event(logger, logging.WARNING, "food_correction_missing_text", update_id=msg.update_id)
         return ("What would you like to change? Send me a text description of the correction.", None)
 
     # Fetch current state of the logged items from the DB
     try:
         current_items = _fetch_items(food_log_ids)
     except Exception as e:
-        logger.error("correction fetch failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_correction_fetch_failed", e, update_id=msg.update_id)
         return ("Couldn't load the original log — please try again.", None)
 
     if not current_items:
+        log_event(logger, logging.WARNING, "food_correction_original_items_missing", update_id=msg.update_id)
         return ("Nothing to correct — the original items may have been deleted already.", None)
 
     # Format items for LLM context
@@ -147,7 +160,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         )
         parsed = _parse_json(raw)
     except Exception as e:
-        logger.error("correction parse failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_correction_parse_failed", e, update_id=msg.update_id)
         return ("Couldn't understand the correction — can you rephrase?", None)
 
     new_meal_type = parsed.get("meal_type", original_meal_type)
@@ -155,7 +168,16 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         new_meal_type = original_meal_type
 
     correction_items = parsed.get("items", [])
+    log_event(
+        logger,
+        logging.INFO,
+        "food_correction_parsed",
+        update_id=msg.update_id,
+        item_count=len(correction_items),
+        meal_type=new_meal_type,
+    )
     if not correction_items and new_meal_type == original_meal_type:
+        log_event(logger, logging.WARNING, "food_correction_no_changes", update_id=msg.update_id)
         return ("Got your message — nothing seemed to need changing. What did you want to correct?", None)
 
     # Enrich correction items with re-estimated macros and accurate provenance.
@@ -188,7 +210,13 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
             if original is not None:
                 reestimated = _reestimate_item(original, correction_text, msg.update_id)
                 if reestimated is None:
-                    logger.warning("update_id=%s reestimate failed for food_log_id=%s — rename only", msg.update_id, fid)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "food_correction_reestimate_skipped",
+                        update_id=msg.update_id,
+                        food_log_id=fid,
+                    )
                 else:
                     # food_item: use re-estimation (has full context of original + correction text)
                     item["food_item"] = reestimated.get("food_item") or item["food_item"]
@@ -238,7 +266,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
             all_ids=food_log_ids,
         )
     except Exception as e:
-        logger.error("correction apply failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_correction_apply_failed", e, update_id=msg.update_id)
         return ("Correction parsed but failed to save — please try again.", None)
 
     # Build updated item list for the reply.
@@ -247,8 +275,16 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     try:
         updated_items = _fetch_items(surviving_ids) if surviving_ids else []
     except Exception as e:
-        logger.warning("post-correction re-fetch failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.WARNING, "food_correction_refetch_failed", e, update_id=msg.update_id)
         updated_items = []
+    log_event(
+        logger,
+        logging.INFO,
+        "food_correction_completed",
+        update_id=msg.update_id,
+        surviving_item_count=len(surviving_ids),
+        meal_type=new_meal_type,
+    )
     reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
 
     new_state = {
@@ -288,10 +324,17 @@ def _reestimate_item(original: dict, correction_text: str, update_id: int | None
             model=MODEL_FLASH,
         )
         result = _parse_json(raw)
-        logger.info("reestimate update_id=%s original=%r -> new=%r", update_id, original.get("food_item"), result.get("food_item"))
+        log_event(
+            logger,
+            logging.INFO,
+            "food_correction_reestimate_completed",
+            update_id=update_id,
+            original_food_chars=len(original.get("food_item") or ""),
+            new_food_chars=len(result.get("food_item") or ""),
+        )
         return result
     except Exception as e:
-        logger.error("reestimate failed update_id=%s: %s", update_id, e)
+        log_failure(logger, logging.ERROR, "food_correction_reestimate_failed", e, update_id=update_id)
         return None
 
 
@@ -312,6 +355,13 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
             with conn.cursor() as cur:
                 cur.execute(sql, (food_log_ids,))
                 rows = cur.fetchall()
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "food_correction_items_loaded",
+                    food_log_id_count=len(food_log_ids),
+                    row_count=len(rows),
+                )
                 return [
                     {
                         "food_log_id": r[0],
@@ -418,10 +468,18 @@ def _apply_corrections(
                         "UPDATE nutrition.food_log SET meal_type = %s WHERE food_log_id = ANY(%s)",
                         (new_meal_type, surviving),
                     )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "food_correction_db_updates_completed",
+                    deleted_count=len(deleted_ids),
+                    updated_count=len(updated_ids),
+                    surviving_count=len(surviving),
+                    meal_type_changed=new_meal_type != original_meal_type,
+                )
+                return surviving
     finally:
         conn.close()
-
-    return [i for i in all_ids if i not in deleted_ids]
 
 
 # Formats the correction confirmation reply.

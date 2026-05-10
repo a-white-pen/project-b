@@ -9,6 +9,8 @@ import logging
 
 import httpx
 
+from system.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 _GETFILE_URL = "https://api.telegram.org/bot{token}/getFile"
@@ -19,6 +21,7 @@ _DOWNLOAD_URL = "https://api.telegram.org/file/bot{token}/{file_path}"
 # Inputs: file_id (from InboundMessage), bot_token from env.
 # Outputs: raw file bytes. Raises on HTTP or API error.
 def get_file_bytes(file_id: str, bot_token: str) -> bytes:
+    log_event(logger, logging.INFO, "telegram_file_lookup_started", file_id=file_id)
     try:
         resp = httpx.get(
             _GETFILE_URL.format(token=bot_token),
@@ -35,7 +38,13 @@ def get_file_bytes(file_id: str, bot_token: str) -> bytes:
         raise RuntimeError(f"getFile API error for file_id={file_id}")
 
     file_path = data["result"]["file_path"]
-    logger.info("get_file_bytes file_id=%s file_path=%s", file_id, file_path)
+    log_event(
+        logger,
+        logging.INFO,
+        "telegram_file_lookup_completed",
+        file_id=file_id,
+        file_path=file_path,
+    )
 
     try:
         dl = httpx.get(
@@ -46,5 +55,11 @@ def get_file_bytes(file_id: str, bot_token: str) -> bytes:
     except httpx.HTTPStatusError as e:
         raise RuntimeError(f"file download HTTP {e.response.status_code} for file_id={file_id}") from None
 
-    logger.info("get_file_bytes downloaded file_id=%s bytes=%d", file_id, len(dl.content))
+    log_event(
+        logger,
+        logging.INFO,
+        "telegram_file_downloaded",
+        file_id=file_id,
+        bytes_downloaded=len(dl.content),
+    )
     return dl.content

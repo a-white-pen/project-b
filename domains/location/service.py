@@ -16,6 +16,7 @@ import httpx
 from timezonefinder import TimezoneFinder
 
 from system.db import get_connection
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage
 
 logger = logging.getLogger(__name__)
@@ -37,13 +38,15 @@ _tf = TimezoneFinder()
 # Outputs: (reply_text, None) — no conversation state needed for location updates.
 def handle_location(msg: InboundMessage) -> tuple[str, None]:
     if not msg.location:
+        log_event(logger, logging.WARNING, "location_missing_coordinates", update_id=msg.update_id)
         return ("Couldn't read the location — please try again.", None)
 
     lat, lon = msg.location
+    log_event(logger, logging.INFO, "location_received", update_id=msg.update_id)
 
     timezone = _coords_to_timezone(lat, lon)
     if timezone is None:
-        logger.warning("update_id=%s timezone lookup failed for lat=%s lon=%s", msg.update_id, lat, lon)
+        log_event(logger, logging.WARNING, "location_timezone_lookup_failed", update_id=msg.update_id)
         timezone = "Asia/Bangkok"
 
     # Insert immediately with location_name=None — timezone is the critical field.
@@ -60,7 +63,7 @@ def handle_location(msg: InboundMessage) -> tuple[str, None]:
             created_at=msg.timestamp,
         )
     except Exception as e:
-        logger.error("location insert failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "location_insert_failed", e, update_id=msg.update_id)
         return ("Got your location but failed to save it — please try again.", None)
 
     # Enrich location_name best-effort — slow/rate-limited Nominatim won't block the insert.
@@ -69,7 +72,23 @@ def handle_location(msg: InboundMessage) -> tuple[str, None]:
         try:
             _update_location_name(location_id, location_name)
         except Exception as e:
-            logger.warning("location_name update failed location_id=%s: %s", location_id, e)
+            log_failure(
+                logger,
+                logging.WARNING,
+                "location_name_update_failed",
+                e,
+                location_id=location_id,
+            )
+
+    log_event(
+        logger,
+        logging.INFO,
+        "location_saved",
+        update_id=msg.update_id,
+        location_id=location_id,
+        timezone=timezone,
+        has_location_name=bool(location_name),
+    )
 
     if location_name:
         return (f"📍 Location saved — using {location_name} ({timezone}).", None)
@@ -82,7 +101,7 @@ def _coords_to_timezone(lat: float, lon: float) -> str | None:
     try:
         return _tf.timezone_at(lat=lat, lng=lon)
     except Exception as e:
-        logger.warning("timezonefinder error lat=%s lon=%s: %s", lat, lon, e)
+        log_failure(logger, logging.WARNING, "location_timezonefinder_failed", e)
         return None
 
 
@@ -117,7 +136,7 @@ def _get_location_name(lat: float, lon: float) -> str | None:
             return f"{district}, {city}"
         return city or district or None
     except Exception as e:
-        logger.warning("nominatim lookup failed lat=%s lon=%s: %s", lat, lon, type(e).__name__)
+        log_failure(logger, logging.WARNING, "location_reverse_geocode_failed", e)
         return None
 
 

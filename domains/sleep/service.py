@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import psycopg2.extras
 
 from system.db import get_connection
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage
 
 logger = logging.getLogger(__name__)
@@ -20,13 +21,21 @@ logger = logging.getLogger(__name__)
 # Inserts a sleep or wake event into b.sleep_wake_events.
 # Inputs: InboundMessage, event_type ("sleep" or "wake").
 # Outputs: (reply string, None). No pending_state needed.
-def _log_event(msg: InboundMessage, event_type: str) -> tuple[str, None]:
+def _insert_sleep_event(msg: InboundMessage, event_type: str) -> tuple[str, None]:
     occurred_at = msg.timestamp if msg.timestamp is not None else datetime.now(timezone.utc)
     meta = {
         "source": "telegram",
         "self_reported": True,
         "telegram_update_id": msg.update_id,
     }
+    log_event(
+        logger,
+        logging.INFO,
+        "sleep_wake_log_started",
+        update_id=msg.update_id,
+        event_type=event_type,
+        occurred_at=occurred_at.isoformat(),
+    )
 
     try:
         conn = get_connection()
@@ -43,10 +52,24 @@ def _log_event(msg: InboundMessage, event_type: str) -> tuple[str, None]:
         finally:
             conn.close()
     except Exception as e:
-        logger.error("sleep_wake insert failed event_type=%s update_id=%s: %s", event_type, msg.update_id, e)
+        log_failure(
+            logger,
+            logging.ERROR,
+            "sleep_wake_insert_failed",
+            e,
+            event_type=event_type,
+            update_id=msg.update_id,
+        )
         return ("Couldn't save that — please try again.", None)
 
-    logger.info("update_id=%s sleep_wake event_type=%s occurred_at=%s inserted", msg.update_id, event_type, occurred_at)
+    log_event(
+        logger,
+        logging.INFO,
+        "sleep_wake_inserted",
+        update_id=msg.update_id,
+        event_type=event_type,
+        occurred_at=occurred_at.isoformat(),
+    )
     if event_type == "wake":
         return ("🌅 Wake time logged.", None)
     return ("🌙 Sleep time logged.", None)
@@ -54,9 +77,9 @@ def _log_event(msg: InboundMessage, event_type: str) -> tuple[str, None]:
 
 # Handles a wake logging request from B.
 def handle_wake_log(msg: InboundMessage) -> tuple[str, None]:
-    return _log_event(msg, "wake")
+    return _insert_sleep_event(msg, "wake")
 
 
 # Handles a sleep logging request from B.
 def handle_sleep_log(msg: InboundMessage) -> tuple[str, None]:
-    return _log_event(msg, "sleep")
+    return _insert_sleep_event(msg, "sleep")

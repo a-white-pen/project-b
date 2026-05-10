@@ -18,6 +18,7 @@ import psycopg2.extras
 
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
+from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
 
@@ -150,11 +151,21 @@ Rules:
 # Inputs: InboundMessage with text or photo.
 # Outputs: (reply string, pending_state dict | None). pending_state is non-None when items were logged.
 def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
+    log_event(
+        logger,
+        logging.INFO,
+        "food_log_started",
+        update_id=msg.update_id,
+        message_type=msg.message_type.value,
+        has_text=bool(msg.text),
+        has_caption=bool(msg.caption),
+    )
     if msg.message_type == MessageType.PHOTO:
         return _handle_photo(msg)
 
     text = msg.text or msg.caption
     if not text:
+        log_event(logger, logging.WARNING, "food_log_missing_text", update_id=msg.update_id)
         return ("I didn't catch what you ate — can you describe it in text?", None)
 
     local_time = _local_time_str(msg.timestamp)
@@ -166,16 +177,30 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
         )
         extracted = _parse_json(raw)
     except Exception as e:
-        logger.error("food extraction failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_extraction_failed", e, update_id=msg.update_id)
         return ("Couldn't parse what you ate — can you rephrase?", None)
 
     items = extracted.get("items", [])
+    log_event(
+        logger,
+        logging.INFO,
+        "food_extraction_completed",
+        update_id=msg.update_id,
+        item_count=len(items),
+    )
     if not items:
+        log_event(logger, logging.WARNING, "food_extraction_empty", update_id=msg.update_id)
         return ("Couldn't identify any food items — can you rephrase?", None)
 
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
-        logger.warning("update_id=%s unrecognised meal_type=%r, defaulting to snack", msg.update_id, meal_type)
+        log_event(
+            logger,
+            logging.WARNING,
+            "food_invalid_meal_type",
+            update_id=msg.update_id,
+            meal_type=meal_type,
+        )
         meal_type = "snack"
     macro_input = extracted.get("macro_input", "description")
     macro_method = extracted.get("macro_method", "llm")
@@ -192,9 +217,18 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
             macro_meta=macro_meta,
         )
     except Exception as e:
-        logger.error("food insert failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_insert_failed", e, update_id=msg.update_id)
         return ("Logged the intent but failed to save — please try again.", None)
 
+    log_event(
+        logger,
+        logging.INFO,
+        "food_inserted",
+        update_id=msg.update_id,
+        item_count=len(food_log_ids),
+        meal_type=meal_type,
+        macro_method=macro_method,
+    )
     reply = _format_reply(meal_type, items, macro_method)
     state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
     return (reply, state)
@@ -205,14 +239,23 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
 # Returns (reply, state). state is None if nothing was logged (needs_quantity, errors).
 def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
     if not msg.file_id:
+        log_event(logger, logging.WARNING, "food_photo_missing_file_id", update_id=msg.update_id)
         return ("Couldn't access the photo — please try again.", None)
 
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         image_bytes = get_file_bytes(msg.file_id, token)
     except Exception as e:
-        logger.error("photo download failed update_id=%s: %s", msg.update_id, type(e).__name__)
+        log_failure(logger, logging.ERROR, "food_photo_download_failed", e, update_id=msg.update_id)
         return ("Couldn't download the photo — please try again.", None)
+
+    log_event(
+        logger,
+        logging.INFO,
+        "food_photo_downloaded",
+        update_id=msg.update_id,
+        image_byte_count=len(image_bytes),
+    )
 
     caption = msg.caption or ""
     local_time = _local_time_str(msg.timestamp)
@@ -225,19 +268,35 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         )
         extracted = _parse_json(raw)
     except Exception as e:
-        logger.error("photo extraction failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_photo_extraction_failed", e, update_id=msg.update_id)
         return ("Couldn't read the photo — can you try again or describe it in text?", None)
 
     if extracted.get("needs_quantity"):
+        log_event(logger, logging.INFO, "food_photo_needs_quantity", update_id=msg.update_id)
         return ("I can see the label but need to know how much you had. Resend the photo with a caption (e.g. '150g', '1 serving', 'half a bar').", None)
 
     items = extracted.get("items", [])
+    log_event(
+        logger,
+        logging.INFO,
+        "food_photo_extraction_completed",
+        update_id=msg.update_id,
+        photo_type=extracted.get("photo_type"),
+        item_count=len(items),
+    )
     if not items:
+        log_event(logger, logging.WARNING, "food_photo_extraction_empty", update_id=msg.update_id)
         return ("Couldn't identify any food in the photo — can you describe it in text?", None)
 
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
-        logger.warning("update_id=%s unrecognised meal_type=%r, defaulting to snack", msg.update_id, meal_type)
+        log_event(
+            logger,
+            logging.WARNING,
+            "food_photo_invalid_meal_type",
+            update_id=msg.update_id,
+            meal_type=meal_type,
+        )
         meal_type = "snack"
 
     macro_input = extracted.get("macro_input", "image")
@@ -257,9 +316,18 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
             macro_meta=macro_meta,
         )
     except Exception as e:
-        logger.error("photo food insert failed update_id=%s: %s", msg.update_id, e)
+        log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
         return ("Logged the intent but failed to save — please try again.", None)
 
+    log_event(
+        logger,
+        logging.INFO,
+        "food_photo_inserted",
+        update_id=msg.update_id,
+        item_count=len(food_log_ids),
+        meal_type=meal_type,
+        macro_method=macro_method,
+    )
     reply = _format_reply(meal_type, items, macro_method)
     state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
     return (reply, state)
@@ -286,11 +354,13 @@ def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
                     cur.execute("SELECT timezone FROM b.latest_location")
                 row = cur.fetchone()
                 if row:
+                    log_event(logger, logging.INFO, "food_timezone_resolved", timezone=row[0], as_of=as_of.isoformat() if as_of else None)
                     return ZoneInfo(row[0])
         finally:
             conn.close()
     except Exception as e:
-        logger.warning("timezone lookup failed, using fallback: %s", e)
+        log_failure(logger, logging.WARNING, "food_timezone_lookup_failed", e)
+    log_event(logger, logging.INFO, "food_timezone_fallback_used", timezone=str(_FALLBACK_TZ))
     return _FALLBACK_TZ
 
 
@@ -373,6 +443,16 @@ def _insert_items(
                         ids.append(row[0])
     finally:
         conn.close()
+    log_event(
+        logger,
+        logging.INFO,
+        "food_db_insert_completed",
+        update_id=update_id,
+        item_count=len(ids),
+        meal_type=meal_type,
+        macro_input=macro_input,
+        macro_method=macro_method,
+    )
     return ids
 
 

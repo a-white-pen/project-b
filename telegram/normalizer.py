@@ -8,6 +8,7 @@ Functions:
 import logging
 from datetime import datetime, timezone
 
+from system.logging import log_event
 from system.messages import InboundMessage, MessageType
 
 logger = logging.getLogger(__name__)
@@ -93,11 +94,17 @@ def normalize(payload: dict) -> InboundMessage:
                                   text=None, file_id=msg["sticker"]["file_id"],
                                   location=None, callback_data=None)
 
-        logger.warning("update_id=%s unrecognised message content", update_id)
+        log_event(logger, logging.WARNING, "normalize_unrecognized_message_content", update_id=update_id)
         return InboundMessage(**base, message_type=MessageType.UNKNOWN,
                               text=None, file_id=None, location=None,
                               callback_data=None)
 
+    has_known_non_message_update = any(
+        payload.get(key) is not None
+        for key in ("callback_query", "inline_query", "chosen_inline_result", "shipping_query", "pre_checkout_query")
+    )
+    if not has_known_non_message_update:
+        log_event(logger, logging.WARNING, "normalize_unrecognized_update", update_id=update_id)
     return InboundMessage(
         update_id=update_id, message_id=None, chat_id=None, sender_id=None,
         message_type=MessageType.UNKNOWN, text=None, caption=None,
