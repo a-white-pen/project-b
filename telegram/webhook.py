@@ -20,7 +20,21 @@ import asyncio
 import hmac
 import json
 import logging
+import sys
 from json import JSONDecodeError
+
+# Configure root logger so all app loggers (domains.*, telegram.*, system.*) emit to stderr.
+# Without this, Python's default root logger has no handlers and all our logger.info/warning
+# calls are silently dropped. Must be called before any module imports that use logging.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s: %(message)s",
+    stream=sys.stderr,
+)
+# Suppress httpx and google_genai transport logs — they log full URLs including the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("google_genai").setLevel(logging.WARNING)
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 

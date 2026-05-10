@@ -12,3 +12,4 @@ cloud-sql-proxy
 HANDOFF.md
 .claude/settings.local.json
 schema/old_schema_snapshot_*_reference_only.json
+TODO.md

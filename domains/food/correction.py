@@ -22,6 +22,47 @@ _VALID_MEAL_TYPES = {
     "dinner", "supper", "pre_workout", "post_workout",
 }
 
+_REESTIMATE_PROMPT = """\
+You are re-estimating a food log entry after a user correction.
+
+About the user: Singaporean Chinese, based between Singapore and Bangkok. \
+Eats Singaporean, Thai, and Southern Chinese food on top of regular western fare. \
+Common meals include hawker dishes (chicken rice, char kway teow, laksa, wonton noodles), \
+Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chinese food \
+(dim sum, congee, braised meats). Use this context when estimating portion sizes and macros.
+
+Previously logged: {previously_logged}
+User correction: {correction_text}
+
+The user is correcting what was logged. Use both the original entry and their correction to \
+produce an accurate estimate. The user may be clarifying the item name, the quantity, or \
+providing extra context to fix a macro estimation error.
+
+Return a JSON object:
+{{
+  "food_item": "<corrected description>",
+  "kcal": <number or null>,
+  "protein_g": <number or null>,
+  "carbs_g": <number or null>,
+  "fat_g": <number or null>,
+  "fibre_g": <number or null>,
+  "sugar_g": <number or null>,
+  "sodium_mg": <number or null>,
+  "food_meta": {{
+    "qty": {{"amount": <number>, "unit": "<string>"}},
+    "prep": "<string>",
+    "brand": "<string>",
+    "notes": "<string>"
+  }}
+}}
+
+Rules:
+- food_meta keys are optional — omit if not meaningful for this item
+- If the user explicitly stated macro values in their correction, use those exactly
+- Otherwise estimate macros from all available context
+- Return valid JSON only. No explanation, no markdown, no code blocks.\
+"""
+
 _CORRECTION_PROMPT = """\
 You are correcting food log entries for a personal nutrition tracker.
 
@@ -117,6 +158,77 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     if not correction_items and new_meal_type == original_meal_type:
         return ("Got your message — nothing seemed to need changing. What did you want to correct?", None)
 
+    # Enrich correction items with re-estimated macros and accurate provenance.
+    #
+    # Two independent concerns handled here:
+    #
+    # 1. Re-estimation: when food_item changes, call the LLM with the original entry + correction
+    #    text so macros and food_meta reflect the new item, not the old one.
+    #
+    # 2. Provenance: macro_method/macro_input must reflect what actually happened.
+    #    - User explicitly stated values → "manual" (applies whether food_item changed or not)
+    #    - Food item renamed, macros all from re-estimation → "llm"
+    #    - No food_item change, no explicit macros → don't touch provenance columns at all
+    #
+    # user_stated is computed BEFORE re-estimation so it captures only what the correction LLM
+    # returned (i.e. what B explicitly said), not values filled in by re-estimation.
+    _MACRO_COLS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+
+    for item in correction_items:
+        if item.get("action") == "delete":
+            continue
+
+        # Snapshot explicit macro values before any re-estimation merge.
+        user_stated = [col for col in _MACRO_COLS if col in item]
+
+        if "food_item" in item:
+            # Food item name changed — re-estimate macros and food_meta for the new item.
+            fid = item.get("food_log_id")
+            original = next((r for r in current_items if r["food_log_id"] == fid), None)
+            if original is not None:
+                reestimated = _reestimate_item(original, correction_text, msg.update_id)
+                if reestimated is None:
+                    logger.warning("update_id=%s reestimate failed for food_log_id=%s — rename only", msg.update_id, fid)
+                else:
+                    # food_item: use re-estimation (has full context of original + correction text)
+                    item["food_item"] = reestimated.get("food_item") or item["food_item"]
+                    # macros: re-estimation as base; user-stated values (snapshotted above) take priority
+                    for col in _MACRO_COLS:
+                        if col not in item:
+                            item[col] = reestimated.get(col)
+                    # food_meta: only write if re-estimation returned something non-empty —
+                    # never wipe existing metadata just because the model omitted those keys.
+                    reestimated_food_meta = reestimated.get("food_meta") or {}
+                    if reestimated_food_meta:
+                        item["_food_meta"] = reestimated_food_meta
+                    item["_macro_meta"] = {
+                        "model": MODEL_FLASH,
+                        "corrected_from": original["food_item"],
+                        "correction_update_id": msg.update_id,
+                        **({"user_stated_fields": user_stated} if user_stated else {}),
+                    }
+
+        # Set macro provenance. Applies whether or not food_item changed.
+        # "manual" when B explicitly stated any value; "llm" when all macros came from re-estimation.
+        # If neither (e.g. only meal_type changed), leave provenance columns untouched.
+        if user_stated:
+            item["_macro_input"] = "manual"
+            item["_macro_method"] = "manual"
+            if "_macro_meta" not in item:
+                # No re-estimation (food_item didn't change) — build meta from scratch.
+                item["_macro_meta"] = {
+                    "user_stated_fields": user_stated,
+                    "correction_update_id": msg.update_id,
+                }
+            else:
+                # Re-estimation ran — user_stated already in macro_meta; update method fields.
+                item["_macro_input"] = "manual"
+                item["_macro_method"] = "manual"
+        elif "_macro_meta" in item:
+            # food_item changed, re-estimation ran, no explicit macros — all LLM.
+            item["_macro_input"] = "description"
+            item["_macro_method"] = "llm"
+
     # Apply changes to DB
     try:
         surviving_ids = _apply_corrections(
@@ -145,6 +257,42 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
     }
     return (reply, new_state)
+
+
+# Re-estimates a single food item using the original logged entry plus the user's correction text.
+# Called when food_item changes in a correction — ensures macros, food_meta, and metadata columns
+# are all refreshed for the new item rather than inheriting stale values from the original.
+# Returns a dict with food_item, macros, food_meta on success, or None on failure (caller falls back
+# to rename-only behaviour so the correction is never blocked by a re-estimation error).
+def _reestimate_item(original: dict, correction_text: str, update_id: int | None) -> dict | None:
+    parts = [original.get("food_item", "?")]
+    macros = []
+    if original.get("kcal") is not None:
+        macros.append(f"{original['kcal']:.0f} kcal")
+    if original.get("protein_g") is not None:
+        macros.append(f"{original['protein_g']:.0f}g protein")
+    if original.get("fat_g") is not None:
+        macros.append(f"{original['fat_g']:.0f}g fat")
+    if original.get("carbs_g") is not None:
+        macros.append(f"{original['carbs_g']:.0f}g carbs")
+    if macros:
+        parts.append(f"({', '.join(macros)})")
+    previously_logged = " ".join(parts)
+
+    try:
+        raw = generate_text(
+            _REESTIMATE_PROMPT.format(
+                previously_logged=previously_logged,
+                correction_text=correction_text,
+            ),
+            model=MODEL_FLASH,
+        )
+        result = _parse_json(raw)
+        logger.info("reestimate update_id=%s original=%r -> new=%r", update_id, original.get("food_item"), result.get("food_item"))
+        return result
+    except Exception as e:
+        logger.error("reestimate failed update_id=%s: %s", update_id, e)
+        return None
 
 
 # Fetches food_log rows for the given IDs. Returns list of row dicts.
@@ -235,11 +383,22 @@ def _apply_corrections(
                         # Build UPDATE only for explicitly provided, non-null fields.
                         # A missing key or null value means "keep existing" — never write null
                         # to the DB based on an absent or default LLM response.
+                        # _food_meta / _macro_* are injected by re-estimation (underscore prefix
+                        # distinguishes them from user-explicit macro values).
                         updates: dict[str, object] = {}
                         for col in ("food_item", "kcal", "protein_g", "carbs_g",
                                     "fat_g", "fibre_g", "sugar_g", "sodium_mg"):
                             if col in item and item[col] is not None:
                                 updates[col] = item[col]
+                        if "_food_meta" in item:
+                            fm = item["_food_meta"] or {}
+                            updates["food_meta"] = psycopg2.extras.Json(fm) if fm else None
+                        if "_macro_input" in item:
+                            updates["macro_input"] = item["_macro_input"]
+                        if "_macro_method" in item:
+                            updates["macro_method"] = item["_macro_method"]
+                        if "_macro_meta" in item:
+                            updates["macro_meta"] = psycopg2.extras.Json(item["_macro_meta"])
                         if updates:
                             set_clause = ", ".join(f"{col} = %s" for col in updates)
                             values = list(updates.values()) + [fid]

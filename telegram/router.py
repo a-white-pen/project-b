@@ -19,6 +19,7 @@ from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
 from domains.location.service import handle_location
 from domains.query.service import handle_query_data
+from domains.sleep.service import handle_sleep_log, handle_wake_log
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
 from system.llm import MODEL_LITE, generate_text, transcribe_audio
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 class Intent(str, Enum):
     LOG_FOOD = "log_food"           # logging food, meals, nutrition
     LOG_WEIGHT = "log_weight"       # logging body weight or measurements
+    LOG_SLEEP = "log_sleep"         # going to sleep
+    LOG_WAKE = "log_wake"           # just woke up
     LOG_EXPENSE = "log_expense"     # logging money spent
     LOG_ATTENTION = "log_attention" # logging what B is working on / paying attention to
     QUERY_DATA = "query_data"       # question about B's own stored data
@@ -46,6 +49,8 @@ class Intent(str, Enum):
 _COMMAND_MAP: dict[str, Intent] = {
     "/eat": Intent.LOG_FOOD,
     "/weight": Intent.LOG_WEIGHT,
+    "/sleep": Intent.LOG_SLEEP,
+    "/wake": Intent.LOG_WAKE,
     "/spend": Intent.LOG_EXPENSE,
     "/focus": Intent.LOG_ATTENTION,
     "/data": Intent.QUERY_DATA,
@@ -58,7 +63,9 @@ The user is one person tracking nutrition, body metrics, training, expenses, and
 
 Classify the message into exactly one of these intents:
 - log_food: logging food, meals, or nutrition (text description or photo of food/nutrition label)
-- log_weight: logging body weight or body measurements
+- log_weight: logging body weight or body measurements — a bare number like "57.1" or "57.1 kg" always means weight in this context
+- log_sleep: user is explicitly logging that they are going to sleep — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange.
+- log_wake: user is explicitly logging that they just woke up — strong signals: "just woke up", "woke up", "wakey wakey", "rise and shine", sunrise emoji alone (🌅). A standalone "good morning" or "morning" with no conversational context may qualify. Do NOT classify as log_wake if the message is clearly a conversational greeting opening a chat.
 - log_expense: logging money spent or a receipt (text or photo)
 - log_attention: logging what the user is currently working on, reading, watching, or spending time on
 - query_data: asking a question about their own stored data ("what did I eat today?", "am I hitting protein?")
@@ -161,8 +168,9 @@ def _transcribe_voice(msg: InboundMessage) -> InboundMessage:
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         audio = get_file_bytes(msg.file_id, token)
+        logger.info("update_id=%s voice downloaded bytes=%d", msg.update_id, len(audio))
         text = transcribe_audio(audio)
-        logger.info("update_id=%s voice transcribed length=%d", msg.update_id, len(text))
+        logger.info("update_id=%s voice transcribed text=%r", msg.update_id, text)
         return dataclasses.replace(msg, message_type=MessageType.TEXT, text=text)
     except Exception as e:
         # Log type only — not the message, which may contain the bot token via httpx URL.
@@ -212,6 +220,10 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> tuple[str, dict | None]:
         return handle_food_log(msg)
     if intent == Intent.LOG_WEIGHT:
         return handle_weight_log(msg)
+    if intent == Intent.LOG_SLEEP:
+        return handle_sleep_log(msg)
+    if intent == Intent.LOG_WAKE:
+        return handle_wake_log(msg)
     if intent == Intent.LOG_EXPENSE:
         return handle_expense_log(msg)
     if intent == Intent.LOG_ATTENTION:

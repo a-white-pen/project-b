@@ -35,7 +35,7 @@ def get_file_bytes(file_id: str, bot_token: str) -> bytes:
         raise RuntimeError(f"getFile API error for file_id={file_id}")
 
     file_path = data["result"]["file_path"]
-    logger.debug("file_id=%s file_path=%s", file_id, file_path)
+    logger.info("get_file_bytes file_id=%s file_path=%s", file_id, file_path)
 
     try:
         dl = httpx.get(
@@ -46,4 +46,5 @@ def get_file_bytes(file_id: str, bot_token: str) -> bytes:
     except httpx.HTTPStatusError as e:
         raise RuntimeError(f"file download HTTP {e.response.status_code} for file_id={file_id}") from None
 
+    logger.info("get_file_bytes downloaded file_id=%s bytes=%d", file_id, len(dl.content))
     return dl.content

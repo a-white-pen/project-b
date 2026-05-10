@@ -5,9 +5,13 @@ Functions:
   get_connection() — returns a live psycopg2 connection from DATABASE_URL
 """
 
+import logging
 import os
+
 import psycopg2
 import psycopg2.extensions
+
+logger = logging.getLogger(__name__)
 
 
 # Opens and returns a new psycopg2 connection. Caller is responsible for closing it.
@@ -16,4 +20,9 @@ def get_connection() -> psycopg2.extensions.connection:
     url = os.environ.get("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError("DATABASE_URL not set")
-    return psycopg2.connect(url)
+    try:
+        conn = psycopg2.connect(url)
+        return conn
+    except Exception as e:
+        logger.error("DB connection failed: %s", e)
+        raise

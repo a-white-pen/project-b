@@ -54,13 +54,13 @@ def generate_with_image(
             types.Part(text=prompt),
         ],
     )
-    logger.debug("generate_with_image model=%s bytes=%d", model, len(image_bytes))
+    logger.info("generate_with_image model=%s bytes=%d", model, len(image_bytes))
     return _extract_text(response)
 
 
 def generate_text(prompt: str, model: str = MODEL_LITE) -> str:
     response = _get_client().models.generate_content(model=model, contents=prompt)
-    logger.debug("llm model=%s", model)
+    logger.info("generate_text model=%s prompt_chars=%d", model, len(prompt))
     return _extract_text(response)
 
 
@@ -72,6 +72,7 @@ def transcribe_audio(
     mime_type: str = "audio/ogg",
     model: str = MODEL_FLASH,
 ) -> str:
+    logger.info("transcribe_audio model=%s bytes=%d mime_type=%s", model, len(audio_bytes), mime_type)
     response = _get_client().models.generate_content(
         model=model,
         contents=[
@@ -81,12 +82,18 @@ def transcribe_audio(
                 "The speaker is Singaporean and may speak in Singaporean English (Singlish), "
                 "or mix in Hokkien, Mandarin, Cantonese, Malay, or Thai words. "
                 "Preserve the words as spoken — do not translate or normalise to standard English. "
+                "Context: the speaker logs personal health data by voice. Common messages include "
+                "sleep/wake phrases (e.g. 'night night', 'good night', 'going to sleep', "
+                "'woke up', 'good morning', 'wakey wakey', 'rise and shine') and weight numbers "
+                "(e.g. '57.2', '63 kg'). Prefer sleep/wake phrase interpretations for greetings "
+                "and bedtime expressions over digit sequences. "
                 "Return only the transcription, nothing else."
             )),
         ],
     )
-    logger.debug("transcribe model=%s bytes=%d", model, len(audio_bytes))
-    return _extract_text(response)
+    result = _extract_text(response)
+    logger.info("transcribe_audio result=%r", result)
+    return result
 
 
 # Extracts the text from a GenerateContentResponse.
