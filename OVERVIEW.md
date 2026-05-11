@@ -2,10 +2,19 @@
 
 ## Status
 
-Slice 1 live: Telegram webhook receives messages and stores raw payloads to `system.telegram_inbound`.
-Slice 2 in progress: Normalizer + LLM intent classifier + router are wired. Food, weight, sleep/wake, location, and attention domains now persist to domain tables; expense/query/general remain stub or minimal.
+**Live domains:** food logging, weight, sleep/wake, location, attention.
 
-**Current attention slice:** Telegram text/voice can start or finish `b.attention_sessions`; starting a new session auto-closes the previous open one and quoted replies support corrections.
+- Food: text, voice, and photo (nutrition label + visual estimation). Quoted-reply corrections supported.
+- Weight: text and voice, regex extraction, range validation.
+- Sleep/wake: `/sleep`, `/wake`, voice phrases ("night night", "good morning", "orh orh"). Classifier tightened against greeting false positives.
+- Location: stores `b.location` updates; used to resolve timezone for all other domains.
+- Attention: starts/finishes `b.attention_sessions` via text or voice. Starting auto-closes the previous open session. Quoted-reply corrections supported. One-open-session invariant enforced in app code.
+
+**In progress:**
+- Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
+- Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
+
+**Stub/minimal:** expense (`/spend` command exists, no persistence), general ask, data query.
 
 ## Scope
 
@@ -19,8 +28,8 @@ Slice 2 in progress: Normalizer + LLM intent classifier + router are wired. Food
 |---|---|
 | OLTP | Cloud SQL Postgres 16, `asia-southeast1`, instance `projectb-db`, database `projectb` |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | Gemini via `google-genai` SDK (primary); other providers possible depending on task |
-| Async | Cloud Tasks (reminders, delayed work) |
+| LLM | Gemini via `google-genai` SDK; MODEL_LITE for routing, MODEL_FLASH for extraction and corrections |
+| Async | Cloud Tasks (reminders, delayed work — not yet wired) |
 | Secrets | GCP Secret Manager; `.env` for local dev only |
 
 ## Schemas
@@ -33,9 +42,9 @@ Analytics views go in a `marts` schema when there is something worth visualizing
 
 ```
 telegram/    Telegram protocol — receive, route, send
-domains/     Business logic per domain (nutrition, spend, etc.)
+domains/     Business logic per domain (food, weight, sleep, attention, etc.)
 pulls/       External data pulls we initiate (Strava, scrapers — future)
-outbound/    Effects to non-Telegram destinations (reminders, calendar, etc.)
+outbound/    Effects to non-Telegram destinations (reminders, calendar — future)
 system/      Shared plumbing: db, config, logging, LLM client
 schema/      Data dictionary (generated) and the dump script
 ```

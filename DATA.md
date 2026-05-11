@@ -28,12 +28,12 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 
 | Schema | Owns |
 |---|---|
-| `b` | B's personal measurements — weight, sleep, attention, body metrics |
+| `b` | B's personal measurements — weight, sleep/wake events, attention sessions, body metrics, location |
 | `nutrition` | Food logs and meal data |
 | `finances` | Spend and transactions |
 | `exercise` | Cardio and strength activities |
 | `external` | Raw reference data from external sources (menus, scraped data) |
-| `system` | Internal state — reminders, Telegram raw payloads, OAuth tokens |
+| `system` | Internal state — Telegram raw payloads, outbound log, conversation state, OAuth tokens |
 | `marts` | Read-only analytics views — never written by the app |
 
 If unsure which schema a new table belongs to, ask. Do not invent a new schema without approval.

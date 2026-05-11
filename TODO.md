@@ -4,7 +4,6 @@
 
 - **Correction support for sleep/wake** — quoting a wrong sleep/wake bot reply falls through to normal LLM routing instead of deleting the bad event. Observed: voice message misclassified as sleep; B quoted the reply to correct it; sleep event was NOT deleted, only a new attention log was created. Need delete + optional replacement flow.
 - **Prompt cleanup** — review all prompts for efficiency, accuracy, and token usage; affects cost and response speed
-  - Can we do something maybe in the logger to log everything I say, or the things we send to the LLMs for routing? To improve routing later? So we can learn / context. And then also for individual modules? 
 - **Polish sleep/wake replies** — currently terse ("🌙 Sleep time logged."); use LLM to make replies warmer and more varied
 - **Polish nutrition reply** — clearer macro summary, more useful at a glance
 - **Polish weight reply** — acknowledge trend, not just echo the number back
@@ -15,17 +14,11 @@
 
 ## 📋 Feature Work
 
-### Sunday, 10 May | Attention marts
-
-Derive durations, end reasons, and category/project breakdowns from `b.attention_sessions`
-
----
-
-### Monday, 11 May | Nutrition data quality
+### Monday, 11 May | Nutrition data quality *(in progress — feat/nutrition-improvements)*
 
 *Full plan in `PLAN_nutrition_data_quality.md` (gitignored, local only)*
 
-Keys to register before starting: USDA FoodData Central (fdc.nal.usda.gov) — already done. Open Food Facts needs no key. Nutritionix dropped (killed free public API access).
+Keys registered: USDA FoodData Central (done). Open Food Facts needs no key.
 
 Implementation order:
 1. Fix mixed photo + caption bug — photo logs label item only; caption items not on label are dropped
@@ -37,14 +30,20 @@ Implementation order:
 
 Fallback chain summary:
 - Whole food: USDA → Open Food Facts → LLM Flash → LLM Pro
-- Restaurant: USDA → LLM Flash → LLM Pro (no Nutritionix)
+- Restaurant: USDA → LLM Flash → LLM Pro
 - Packaged: Open Food Facts → USDA → LLM Flash → LLM Pro
-- Hawker/Asian: LLM Flash → LLM Pro (no structured API covers this)
+- Hawker/Asian: LLM Flash → LLM Pro
 - Unknown: USDA → Open Food Facts → LLM Flash → LLM Pro
 
-### Monday, 11 May | Expense logging
+### Monday, 11 May | Expense logging *(in progress — feat/expense-logging, Codex)*
 
 Log money spent via text description or receipt photo
+
+---
+
+### Sunday, 10 May | Attention marts
+
+Derive durations, end reasons, and category/project breakdowns from `b.attention_sessions`
 
 ---
 
@@ -111,6 +110,12 @@ Public API endpoint for friends to query the external meals table — look up ma
 ## ✅ Done
 
 *(latest first)*
+
+**11 May**
+- One-open attention session invariant — `_handle_start` now closes ALL open sessions atomically; correction reopen blocked if another session is already open; warning logged if multiple open sessions detected
+- Attention correction hardening — time interval validation before DB write, no-op detection (`rows_written` tracking), reopen guard in `_apply_corrections`
+- Telegram media group deduplication — webhook detects photo albums by `media_group_id`, processes only the first update per group, skips the rest with audit log
+- HTML parse mode auto-detection — `replies.py` auto-enables `parse_mode="HTML"` when formatted tags detected; contract requires `html.escape()` on all user/LLM content in HTML replies
 
 **10 May**
 - Attention logging domain — starts/finishes `b.attention_sessions`, auto-closes previous open session, supports voice and quoted corrections

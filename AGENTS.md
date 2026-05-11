@@ -66,8 +66,9 @@ The git history of `data_dictionary.md` is the schema change log.
 - Prefer minimal diffs over broad refactors.
 
 **Multi-agent (B, Claude Code, and Codex work concurrently)**
-- Inspect the working tree before editing. Others may have work in flight.
+- Inspect the working tree (`git status`, `git branch`) before editing. Others may have work in flight on other branches.
 - Preserve unrelated or in-progress changes. Do not blindly overwrite.
+- Conflict hotspot: `telegram/router.py` is touched by almost every new domain. Check it carefully before editing.
 
 **Tradeoffs and honesty**
 - Non-obvious downstream impact → surface it to B before picking.
@@ -109,6 +110,8 @@ Functions:
 """
 ```
 
+**HTML replies:** `telegram/replies.py` auto-detects `parse_mode="HTML"` when a reply contains HTML tags. Any domain that emits HTML-formatted replies **must** pass all user-provided or LLM-provided content through `html.escape()` before embedding it. Unescaped `<`, `>`, or `&` cause Telegram to return a 400 and silently drop the reply. See the contract comment in `telegram/replies.py`.
+
 **Logging:** all non-trivial runtime paths should log enough to trace what happened without leaking secrets or raw user content.
 - Use `system/logging.py` helpers: `configure_logging()` at app startup, `log_event(...)` for normal flow, `log_failure(...)` for caught exceptions, and `get_error_summary(...)` when a redacted error string is needed.
 - Log structured context only: `update_id`, `message_type`, row counts, IDs, model names, byte counts, timestamps, booleans, chosen intent, etc.
@@ -121,7 +124,7 @@ Functions:
 
 ## Stack gotchas
 
-- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model constants live in `system/llm.py` — pick by task complexity (`MODEL_LITE` / `MODEL_FLASH` / `MODEL_PRO`). Verify current model IDs by running `client.models.list()`. Non-Gemini providers may be added later; route all LLM calls through `system/llm.py`.
+- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model constants live in `system/llm.py` — use `MODEL_LITE` for high-volume simple calls (routing), `MODEL_FLASH` for extraction and corrections, `MODEL_PRO` reserved for hard cases. Verify current model IDs by running `client.models.list()`. Route all LLM calls through `system/llm.py`.
 - `GEMINI_API_KEY` is a required secret — Secret Manager for Cloud Run, `.env` for local dev.
 - Postgres folds unquoted identifiers to lowercase. Never use camelCase for table or column names.
 - Secret Manager values created via `gcloud` often have a trailing newline. Always `.strip()` at load time.
