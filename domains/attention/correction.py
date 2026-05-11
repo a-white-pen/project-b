@@ -17,7 +17,7 @@ Functions:
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 
 import psycopg2.extras
 
@@ -43,6 +43,8 @@ class _CorrectionValidationError(Exception):
 
 _CORRECTION_PROMPT = """\
 You are correcting attention session rows for B's personal attention tracker.
+
+Current local time: {current_local_time}
 
 Previously logged sessions:
 {logged_sessions}
@@ -104,8 +106,14 @@ def handle_attention_correction(msg: InboundMessage, state: dict) -> tuple[str, 
         return ("Nothing to correct — those attention sessions are already gone.", None)
 
     try:
+        # Resolve current local time using B's location — gives the LLM a concrete "now"
+        # so relative corrections ("just finished", "10 min ago") produce correct timestamps.
+        now_utc = datetime.now(tz=dt_timezone.utc)
+        tz = _get_timezone(now_utc)
+        current_local_time = now_utc.astimezone(tz).strftime("%Y-%m-%d %H:%M %Z")
         raw = generate_text(
             _CORRECTION_PROMPT.format(
+                current_local_time=current_local_time,
                 logged_sessions=_format_sessions_for_llm(current_sessions),
                 correction_text=correction_text,
             ),

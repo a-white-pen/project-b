@@ -337,8 +337,11 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
 # Queries b.location for the most recent row at or before `as_of` so timezone resolves
 # to wherever B actually was when the message was sent — not where she is right now.
 # This handles delayed messages, Telegram retries, and travel between meals correctly.
-# Falls back to b.latest_location (most recent row regardless of time) if as_of is None,
-# and to Asia/Singapore if the table is empty or unreachable.
+#
+# Fallback chain (in order):
+#   1. Most recent b.location row at or before as_of  (correct as-of lookup)
+#   2. Most recent b.location row regardless of time  (handles no prior-to-event row)
+#   3. Asia/Singapore hardcoded                       (no location ever shared)
 def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
     try:
         conn = get_connection()
@@ -350,11 +353,26 @@ def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
                         " WHERE created_at <= %s ORDER BY created_at DESC LIMIT 1",
                         (as_of,),
                     )
+                    row = cur.fetchone()
+                    if row:
+                        log_event(logger, logging.INFO, "food_timezone_resolved",
+                                  source="as_of", timezone=row[0], as_of=as_of.isoformat())
+                    else:
+                        # No location at-or-before this event — use the most recent one anyway.
+                        log_event(logger, logging.WARNING, "food_timezone_as_of_miss",
+                                  as_of=as_of.isoformat(), as_of_tzinfo=str(as_of.tzinfo))
+                        cur.execute("SELECT timezone FROM b.latest_location")
+                        row = cur.fetchone()
+                        if row:
+                            log_event(logger, logging.INFO, "food_timezone_resolved",
+                                      source="latest_location", timezone=row[0])
                 else:
                     cur.execute("SELECT timezone FROM b.latest_location")
-                row = cur.fetchone()
+                    row = cur.fetchone()
+                    if row:
+                        log_event(logger, logging.INFO, "food_timezone_resolved",
+                                  source="latest_location_no_as_of", timezone=row[0])
                 if row:
-                    log_event(logger, logging.INFO, "food_timezone_resolved", timezone=row[0], as_of=as_of.isoformat() if as_of else None)
                     return ZoneInfo(row[0])
         finally:
             conn.close()

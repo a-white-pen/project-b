@@ -564,6 +564,11 @@ def _clean_optional_text(value) -> str | None:
 # Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
 # Inputs: event timestamp or None.
 # Outputs: ZoneInfo instance.
+#
+# Fallback chain (in order):
+#   1. Most recent b.location row at or before as_of  (correct as-of lookup)
+#   2. Most recent b.location row regardless of time  (handles no prior-to-event row)
+#   3. Asia/Singapore hardcoded                       (no location ever shared)
 def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
     try:
         conn = get_connection()
@@ -576,9 +581,25 @@ def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
                             " WHERE created_at <= %s ORDER BY created_at DESC LIMIT 1",
                             (as_of,),
                         )
+                        row = cur.fetchone()
+                        if row:
+                            log_event(logger, logging.INFO, "attention_timezone_resolved",
+                                      source="as_of", timezone=row[0], as_of=as_of.isoformat())
+                        else:
+                            # No location at-or-before this event — use the most recent one anyway.
+                            log_event(logger, logging.WARNING, "attention_timezone_as_of_miss",
+                                      as_of=as_of.isoformat(), as_of_tzinfo=str(as_of.tzinfo))
+                            cur.execute("SELECT timezone FROM b.latest_location")
+                            row = cur.fetchone()
+                            if row:
+                                log_event(logger, logging.INFO, "attention_timezone_resolved",
+                                          source="latest_location", timezone=row[0])
                     else:
                         cur.execute("SELECT timezone FROM b.latest_location")
-                    row = cur.fetchone()
+                        row = cur.fetchone()
+                        if row:
+                            log_event(logger, logging.INFO, "attention_timezone_resolved",
+                                      source="latest_location_no_as_of", timezone=row[0])
                     if row:
                         return ZoneInfo(row[0])
         finally:
