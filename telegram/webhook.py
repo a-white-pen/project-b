@@ -5,6 +5,8 @@ Functions:
   create_app()        — builds and returns the FastAPI application instance
   receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
   check_health()      — GET /health; checks app and DB connectivity, returns status dict
+  _extract_media_group_id(payload) — extracts media_group_id from photo/video payloads
+  _get_prior_media_group_update_id(media_group_id, update_id) — returns an earlier album update_id
 
 Processing model:
   _store_inbound() is called first and returns True if the row was newly inserted, False for a
@@ -79,6 +81,29 @@ def create_app() -> FastAPI:
         if "edited_message" in payload or "edited_channel_post" in payload:
             log_event(logger, logging.INFO, "webhook_edited_message_skipped", update_id=update_id)
             return {"ok": True}
+
+        # Skip non-first photos in a Telegram media group (album).
+        # When B sends multiple photos at once, Telegram fires one update per photo — all sharing
+        # a media_group_id. We process only the first update stored for each group; the rest are
+        # stored for audit but silently skipped to avoid duplicate bot replies.
+        media_group_id = _extract_media_group_id(payload)
+        if media_group_id is not None:
+            prior_update_id = await asyncio.to_thread(_get_prior_media_group_update_id, media_group_id, update_id)
+            if prior_update_id is not None:
+                log_event(
+                    logger, logging.INFO, "webhook_media_group_duplicate_skipped",
+                    update_id=update_id,
+                    media_group_id=media_group_id,
+                    prior_update_id=prior_update_id,
+                )
+                return {"ok": True}
+            log_event(
+                logger,
+                logging.INFO,
+                "webhook_media_group_first_seen",
+                update_id=update_id,
+                media_group_id=media_group_id,
+            )
 
         # Process synchronously — work stays alive for the duration of this request.
         # Telegram retries are caught by the duplicate check above, so long LLM calls won't
@@ -225,6 +250,47 @@ def _store_outbound(message_id: int, update_id: int | None, payload: dict) -> No
                     " VALUES (%s, %s, %s)",
                     (message_id, update_id, json.dumps(payload)),
                 )
+    finally:
+        conn.close()
+
+
+# Extracts media_group_id from a Telegram photo or video message payload.
+# Returns None for single-photo sends and all non-photo/video update types.
+def _extract_media_group_id(payload: dict) -> str | None:
+    for key in ("message", "channel_post"):
+        msg = payload.get(key)
+        if msg and ("photo" in msg or "video" in msg):
+            return msg.get("media_group_id")
+    return None
+
+
+# Returns the earliest lower update_id already stored for the same media_group_id.
+# The caller skips routing when this returns a value, and logs the prior update_id so the
+# processed album item can be reconstructed from Cloud Run logs.
+#
+# This deliberately avoids a schema change. A tiny residual race remains if album updates arrive
+# out of order before the lower update_id commits; a dedicated media_group claim table would close it.
+# Inputs: media_group_id string, current update_id.
+def _get_prior_media_group_update_id(media_group_id: str, current_update_id: int) -> int | None:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT update_id FROM system.telegram_inbound
+                    WHERE (
+                        payload->'message'->>'media_group_id' = %s
+                        OR payload->'channel_post'->>'media_group_id' = %s
+                    )
+                    AND update_id < %s
+                    ORDER BY update_id
+                    LIMIT 1
+                    """,
+                    (media_group_id, media_group_id, current_update_id),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
     finally:
         conn.close()
 

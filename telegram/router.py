@@ -12,6 +12,7 @@ import logging
 import os
 from enum import Enum
 
+from domains.attention.correction import handle_attention_correction
 from domains.attention.service import handle_attention_log
 from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
@@ -63,12 +64,12 @@ You are an intent classifier for a personal data tracking system. \
 The user is one person tracking nutrition, body metrics, training, expenses, and attention.
 
 Classify the message into exactly one of these intents:
-- log_food: logging food, meals, or nutrition (text description or photo of food/nutrition label)
+- log_food: logging specific food items, meals consumed, or nutrition/macros (text description or photo of food/nutrition label)
 - log_weight: logging body weight or body measurements — a bare number like "57.1" or "57.1 kg" always means weight in this context
-- log_sleep: user is explicitly logging that they are going to sleep — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange.
+- log_sleep: user is explicitly logging that they are going to sleep — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", "orh orh", "orh orh kun", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange.
 - log_wake: user is explicitly logging that they just woke up — strong signals: "just woke up", "woke up", "wakey wakey", "rise and shine", sunrise emoji alone (🌅). A standalone "good morning" or "morning" with no conversational context may qualify. Do NOT classify as log_wake if the message is clearly a conversational greeting opening a chat.
 - log_expense: logging money spent or a receipt (text or photo)
-- log_attention: logging what the user is currently working on, reading, watching, or spending time on
+- log_attention: logging an attention/activity session start or finish — what the user is doing, working on, reading, watching, eating, cooking, commuting, resting, grooming/showering, or spending time on. Examples: "working on Project B", "I go cook dinner now", "finish lunch", "prep breakfast", "coffee break", "order food", "go poop", "go mum mum" (eat), "go pong pong" (shower/bathe), "done with attention module", "watching Succession"
 - query_data: asking a question about their own stored data ("what did I eat today?", "am I hitting protein?")
 - ask_general: a general question or request to use the assistant as an LLM — not about personal data
 - unknown: cannot determine intent
@@ -76,6 +77,11 @@ Classify the message into exactly one of these intents:
 Message type: {message_type}
 Text: {text}
 Caption: {caption}
+
+Disambiguation:
+- "ate chicken rice", "had eggs", a dish name, a food photo, or nutrition numbers = log_food.
+- "go cook dinner", "prep breakfast", "eat lunch", "finish lunch", "coffee break", "order food", "go mum mum", "finish mum mum", "cooking", or meal words used as time/activity boundaries without specific food items = log_attention.
+- Baby-talk terms may arrive literally from voice transcription: "orh orh" or "orh orh kun" = log_sleep; "mum mum" = eating activity; "pong pong" = shower/bathe activity.
 
 Respond with only the intent name. Nothing else."""
 
@@ -269,6 +275,8 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
     domain = state.get("domain")
     if domain == "food":
         return handle_food_correction(msg, state)
+    if domain == "attention":
+        return handle_attention_correction(msg, state)
     # Other domains: not implemented yet — fall through to normal routing
     log_event(
         logger,

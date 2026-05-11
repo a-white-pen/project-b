@@ -47,7 +47,7 @@ def handle_location(msg: InboundMessage) -> tuple[str, None]:
     timezone = _coords_to_timezone(lat, lon)
     if timezone is None:
         log_event(logger, logging.WARNING, "location_timezone_lookup_failed", update_id=msg.update_id)
-        timezone = "Asia/Bangkok"
+        timezone = "Asia/Singapore"
 
     # Insert immediately with location_name=None — timezone is the critical field.
     # created_at uses msg.timestamp (Telegram message time), not DB insert time,

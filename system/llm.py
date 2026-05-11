@@ -152,7 +152,11 @@ def transcribe_audio(
                     "sleep/wake phrases (e.g. 'night night', 'good night', 'going to sleep', "
                     "'woke up', 'good morning', 'wakey wakey', 'rise and shine') and weight numbers "
                     "(e.g. '57.2', '63 kg'). Prefer sleep/wake phrase interpretations for greetings "
-                    "and bedtime expressions over digit sequences. "
+                    "and bedtime expressions over digit sequences. They also log attention/activity "
+                    "phrases like 'I go cook dinner now', 'coffee break', and 'order food'. "
+                    "They may also use family/baby-talk "
+                    "terms like 'mum mum' for eat, 'pong pong' for shower/bathe, and "
+                    "'orh orh' or 'orh orh kun' for sleep; transcribe those literally. "
                     "Return only the transcription, nothing else."
                 )),
             ],

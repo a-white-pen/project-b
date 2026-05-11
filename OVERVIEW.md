@@ -3,9 +3,9 @@
 ## Status
 
 Slice 1 live: Telegram webhook receives messages and stores raw payloads to `system.telegram_inbound`.
-Slice 2 in progress: Normalizer + LLM intent classifier + router — fully wired but domain handlers are stubs. Bot classifies intent and replies; nothing is persisted to domain tables yet.
+Slice 2 in progress: Normalizer + LLM intent classifier + router are wired. Food, weight, sleep/wake, location, and attention domains now persist to domain tables; expense/query/general remain stub or minimal.
 
-**Next slice:** First domain handler — food logging (`nutrition.food_log`).
+**Current attention slice:** Telegram text/voice can start or finish `b.attention_sessions`; starting a new session auto-closes the previous open one and quoted replies support corrections.
 
 ## Scope
 

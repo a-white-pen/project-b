@@ -3,6 +3,22 @@ _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py
 
 ## Schema: `b`
 
+### Table: `b.attention_sessions`
+One row per continuous primary-attention interval for B. Grain: one activity session with a start time and optional end time.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `attention_session_id` | `integer` | no | nextval('b.attention_sessions_attention_session_id_seq'::regclass) | Surrogate primary key. |
+| `category` | `text` | no |  | Coarse activity category. Values: deep_work, shallow_work, planning, learning, exercise, cooking, eating, commute, life_admin, personal_care, social, entertainment, rest, meditation, other. Sleep is intentionally excluded; naps may be logged as rest. |
+| `description` | `text` | no |  | Human-readable description of what B was doing, preserving B's wording where useful. Examples: working on attention module, prep breakfast, watching Succession. |
+| `project` | `text` | yes |  | Optional project or context tag, e.g. project-b, work, Codex, a book title, or a show title. |
+| `started_at` | `timestamp with time zone` | no |  | When the attention session started. Primary start time dimension for attention analysis. For Telegram rows, usually the Telegram message timestamp. |
+| `ended_at` | `timestamp with time zone` | yes |  | When the attention session ended. NULL means this is the currently open session. Session duration is derived from started_at and ended_at in marts/views. |
+| `notes` | `text` | yes |  | Optional extra detail, outcome, or correction note. NULL if there is nothing useful to add. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance, lifecycle details, and classifier metadata. Expected shape: {"start":{"source":"telegram","self_reported":true,"telegram_update_id":123},"end":{"source":"telegram\|system\|calendar\|reminder","self_reported":true\|false,"reason":"explicit_finish\|superseded_by_new_start\|manual_correction\|source_reported","telegram_update_id":124},"classification":{"model":"gemini-2.5-flash","action":"start_session"}}. |
+| `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use started_at and ended_at for time-series and duration analysis. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp, set by application code when a session is ended or corrected. NULL for rows that have not been changed after insert. |
+
 ### View: `b.latest_location`
 Most recent location B has shared. Used by domain services to get the active timezone for local time-of-day inference. Falls back to Asia/Bangkok if no rows exist.
 
@@ -101,7 +117,7 @@ One row per bot reply that may participate in a quoted correction chain. Root ro
 | `parent_telegram_reply_message_id` | `integer` | yes |  | Bot reply B quoted when triggering this correction round. NULL for root rows (initial log reply). |
 | `triggering_telegram_update_id` | `bigint` | no |  | Inbound update_id that caused this bot reply. References system.telegram_inbound(update_id). Used to reconstruct user text from telegram_inbound.payload. |
 | `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
-| `context` | `jsonb` | no |  | Minimal structured payload. food: {food_log_ids:[int], meal_type:str}. weight/expense/attention: TBD. query/general: domain-specific prompt context. unknown: {original_text:str, original_message_type:str}. |
+| `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids": [int], "meal_type": str} attention: {"attention_session_ids": [int]} |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 
 ### Table: `system.telegram_inbound`

@@ -24,7 +24,7 @@ from telegram.files import get_file_bytes
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_TZ = ZoneInfo("Asia/Bangkok")  # used when b.latest_location has no rows
+_FALLBACK_TZ = ZoneInfo("Asia/Singapore")  # used when b.latest_location has no rows
 
 _VALID_MEAL_TYPES = {
     "breakfast", "brunch", "lunch", "snack",
