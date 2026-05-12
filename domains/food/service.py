@@ -90,35 +90,41 @@ Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chines
 Current local time: {local_time}
 Caption from user (may be empty): {caption}
 
-Examine the image and caption together.
+Examine the image and caption together. The caption may refer to the item in the image AND mention additional food items not visible in the image — extract all of them.
 
 Step 1 — determine photo type:
 - nutrition_label: photo shows a nutrition facts panel, packaging label, or nutrition information table
 - food_image: photo shows actual food, a plate, a dish, or a meal
 
-Step 2 — extract based on type:
+Step 2 — extract items from the image based on type:
 
 If nutrition_label:
 - Read macro values directly from the label per serving
 - Check the caption for quantity consumed (e.g. "150g", "2 servings", "half a bar")
 - If the caption does NOT specify how much was consumed, set needs_quantity=true and return immediately with empty items
 - If quantity is known, pro-rate the macros: (consumed / serving_size) × per_serving_macros
-- Set macro_input="nutrition_label", macro_method="nutrition_label"
+- Set macro_input="nutrition_label", macro_method="nutrition_label" for this item
 
 If food_image:
 - Identify each distinct food item visible
 - Use the caption for additional context (dish name, portion size, extras)
 - Estimate portion sizes from visual cues, plate size, and typical serving sizes for this cuisine
 - Estimate macros for each item
-- Set macro_input="image", macro_method="llm", needs_quantity=false
+- Set macro_input="image", macro_method="llm", needs_quantity=false for these items
+
+Step 3 — extract any additional items mentioned in the caption that are NOT visible in the image:
+- If the caption mentions food items beyond what is shown in the photo, extract those too
+- For caption-only items: estimate macros from the description, set macro_input="description", macro_method="llm"
+- Examples: caption says "broccoli bowl + a banana" but the image only shows the bowl → also log the banana
+- Do not double-count items already extracted from the image
 
 Return a JSON object with this exact structure:
 {{
   "photo_type": "<nutrition_label or food_image>",
   "needs_quantity": <true or false>,
   "meal_type": "<one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout>",
-  "macro_input": "<nutrition_label or image>",
-  "macro_method": "<nutrition_label or llm>",
+  "macro_input": "<nutrition_label or image — use the value for the primary image item>",
+  "macro_method": "<nutrition_label or llm — use the value for the primary image item>",
   "items": [
     {{
       "food_item": "<description>",
@@ -129,6 +135,8 @@ Return a JSON object with this exact structure:
       "fibre_g": <number or null>,
       "sugar_g": <number or null>,
       "sodium_mg": <number or null>,
+      "macro_input": "<nutrition_label, image, or description — per item>",
+      "macro_method": "<nutrition_label or llm — per item>",
       "food_meta": {{
         "qty": {{"amount": <number>, "unit": "<string>"}},
         "prep": "<string>",
@@ -142,6 +150,7 @@ Return a JSON object with this exact structure:
 Rules:
 - If needs_quantity=true, items should be empty
 - meal_type: infer from local time if not stated in caption
+- Each item carries its own macro_input and macro_method — these override the top-level fields when inserting
 - food_meta keys are optional — omit if not meaningful
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
@@ -299,11 +308,42 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         )
         meal_type = "snack"
 
-    macro_input = extracted.get("macro_input", "image")
-    macro_method = extracted.get("macro_method", "llm")
-    macro_meta: dict = {"model": MODEL_FLASH}
-    if macro_input == "nutrition_label" and msg.file_id:
-        macro_meta["file_id"] = msg.file_id
+    # Top-level macro_input/macro_method are the fallback for items that don't carry their own.
+    # Items extracted from the caption (not the image) carry macro_input="description" per-item.
+    top_macro_input = extracted.get("macro_input", "image")
+    top_macro_method = extracted.get("macro_method", "llm")
+
+    # Stamp each item with its own provenance, falling back to the top-level value.
+    # This ensures caption-only items are recorded as "description/llm", not "nutrition_label".
+    # macro_meta is also per-item: image items include the Telegram file_id when applicable,
+    # but caption-only items must NOT inherit that file_id (their macro_method is "llm", not
+    # "nutrition_label", so the schema contract for macro_meta is different).
+    image_macro_meta: dict = {"model": MODEL_FLASH}
+    if top_macro_input == "nutrition_label" and msg.file_id:
+        image_macro_meta["file_id"] = msg.file_id
+    caption_macro_meta: dict = {"model": MODEL_FLASH}
+
+    for item in items:
+        if "macro_input" not in item:
+            item["macro_input"] = top_macro_input
+        if "macro_method" not in item:
+            item["macro_method"] = top_macro_method
+        # Assign the correct macro_meta shape for this item's method.
+        if "macro_meta" not in item:
+            item["macro_meta"] = caption_macro_meta if item["macro_input"] == "description" else image_macro_meta
+
+    # Batch-level macro_meta is the image meta — used as the fallback in _insert_items
+    # for any item that somehow still lacks a per-item override (defensive only).
+    macro_meta = image_macro_meta
+
+    log_event(
+        logger,
+        logging.INFO,
+        "food_photo_provenance",
+        update_id=msg.update_id,
+        image_items=sum(1 for i in items if i.get("macro_input") in ("nutrition_label", "image")),
+        caption_items=sum(1 for i in items if i.get("macro_input") == "description"),
+    )
 
     try:
         food_log_ids = _insert_items(
@@ -311,8 +351,8 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
             meal_type=meal_type,
             update_id=msg.update_id,
             source="telegram",
-            macro_input=macro_input,
-            macro_method=macro_method,
+            macro_input=top_macro_input,
+            macro_method=top_macro_method,
             macro_meta=macro_meta,
         )
     except Exception as e:
@@ -326,9 +366,9 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         update_id=msg.update_id,
         item_count=len(food_log_ids),
         meal_type=meal_type,
-        macro_method=macro_method,
+        macro_method=top_macro_method,
     )
-    reply = _format_reply(meal_type, items, macro_method)
+    reply = _format_reply(meal_type, items, top_macro_method)
     state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
     return (reply, state)
 
@@ -439,6 +479,12 @@ def _insert_items(
             with conn.cursor() as cur:
                 for item in items:
                     food_meta = item.get("food_meta") or {}
+                    # Per-item overrides take priority over batch-level defaults.
+                    # _handle_photo stamps each item with its own macro_input, macro_method,
+                    # and macro_meta so caption-only items are stored with the correct shape.
+                    item_macro_input = item.get("macro_input") or macro_input
+                    item_macro_method = item.get("macro_method") or macro_method
+                    item_macro_meta = item.get("macro_meta") or macro_meta
                     cur.execute(sql, (
                         meal_type,
                         update_id,
@@ -452,9 +498,9 @@ def _insert_items(
                         _to_float(item.get("sugar_g")),
                         _to_float(item.get("sodium_mg")),
                         source,
-                        macro_input,
-                        macro_method,
-                        psycopg2.extras.Json(macro_meta),
+                        item_macro_input,
+                        item_macro_method,
+                        psycopg2.extras.Json(item_macro_meta),
                     ))
                     row = cur.fetchone()
                     if row:

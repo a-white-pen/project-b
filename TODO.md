@@ -3,6 +3,7 @@
 ## ⚡ Pick Up When Free
 
 - **Correction support for sleep/wake** — quoting a wrong sleep/wake bot reply falls through to normal LLM routing instead of deleting the bad event. Observed: voice message misclassified as sleep; B quoted the reply to correct it; sleep event was NOT deleted, only a new attention log was created. Need delete + optional replacement flow.
+- **"Wake up" routing when nap attention session is active** — if B says "wake up" / "B wake up" while a `category=rest` attention session is open, the intent classifier routes to sleep/wake instead of ending the attention session. Fix: router should check for an open rest session and redirect to attention end. Observed: "B wake up" logged a sleep/wake event instead of closing the nap session.
 - **Prompt cleanup** — review all prompts for efficiency, accuracy, and token usage; affects cost and response speed
 - **Polish sleep/wake replies** — currently terse ("🌙 Sleep time logged."); use LLM to make replies warmer and more varied
 - **Polish nutrition reply** — clearer macro summary, more useful at a glance
@@ -21,7 +22,14 @@
 Keys registered: USDA FoodData Central (done). Open Food Facts needs no key.
 
 Implementation order:
-1. Fix mixed photo + caption bug — photo logs label item only; caption items not on label are dropped
+1. Fix mixed photo + caption bug — photo logs label item only; caption items not on label are dropped *(in progress)*
+2. Fix photo correction bug — when B quotes a food reply and attaches a photo (e.g. clearer label), the correction handler ignores the image and only reads the caption text. Need to pass the photo to the vision model and re-extract macros when a photo is present in a correction message. *(in progress)*
+3. Multi-photo album food logging — when B sends multiple photos as a Telegram album (shared media_group_id), currently only the first photo is processed and the rest are dropped. Need: staging mechanism to collect all album photos before processing, multi-image Gemini call to group photos by product, and caption quantity matching to the right product group. E.g. 2 photos of product A + 3 photos of product B + caption "1 serving A, 2 bowls B" → 2 separate log entries with correct macros. Needs architecture discussion before coding.
+4. USDA integration — whole foods path
+5. Open Food Facts — packaged goods, no key
+6. Food type classifier — LLM Flash Lite per item: `whole_food | restaurant_chain | packaged_good | asian_hawker | unknown`
+7. Wire routing — `domains/food/nutrition_sources/router.py`, single entry point for all sources
+8. LLM model tiering — retry Flash → Pro on safety block or empty response
 2. USDA integration — whole foods path
 3. Open Food Facts — packaged goods, no key
 4. Food type classifier — LLM Flash Lite per item: `whole_food | restaurant_chain | packaged_good | asian_hawker | unknown`
