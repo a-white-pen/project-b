@@ -20,7 +20,9 @@ from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
 from domains.location.service import handle_location
 from domains.query.service import handle_query_data
+from domains.sleep.correction import handle_sleep_wake_correction
 from domains.sleep.service import handle_sleep_log, handle_wake_log
+from domains.weight.correction import handle_weight_correction
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
 from system.llm import MODEL_LITE, generate_text, transcribe_audio
@@ -277,6 +279,10 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
         return handle_food_correction(msg, state)
     if domain == "attention":
         return handle_attention_correction(msg, state)
+    if domain == "sleep_wake":
+        return handle_sleep_wake_correction(msg, state)
+    if domain == "weight":
+        return handle_weight_correction(msg, state)
     # Other domains: not implemented yet — fall through to normal routing
     log_event(
         logger,

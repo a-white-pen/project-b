@@ -84,6 +84,21 @@ WHERE scraped_at = (SELECT max(scraped_at) FROM ...)
 
 ---
 
+## `system.conversation_state` domain constraint
+
+The `domain` column in `system.conversation_state` is protected by a DB-level `CHECK` constraint. **Any domain that saves correction state must be added to this constraint before deploy.** Current allowed values: `food`, `attention`, `weight`, `sleep_wake`, `expense`, `query`.
+
+To add a new domain value, propose this SQL to B before writing code:
+```sql
+ALTER TABLE system.conversation_state DROP CONSTRAINT conversation_state_domain_check;
+ALTER TABLE system.conversation_state ADD CONSTRAINT conversation_state_domain_check
+  CHECK (domain IN ('food', 'attention', 'weight', 'sleep_wake', 'expense', 'query', '<new_domain>'));
+```
+
+Then update the allowed-values list above in this file.
+
+---
+
 ## COMMENT ON standard
 
 Every `CREATE TABLE` proposal must include:

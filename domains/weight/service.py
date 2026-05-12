@@ -5,6 +5,7 @@ Functions:
   handle_weight_log(msg) — extracts weight from message text, inserts into b.weight_measurements,
                            returns a formatted confirmation
   _extract_weight_kg(text) — parses the first numeric value from text, returns float or None
+  format_weight_kg(weight_kg) — formats kg values with useful decimal precision
 """
 
 import logging
@@ -19,7 +20,7 @@ from system.messages import InboundMessage
 
 logger = logging.getLogger(__name__)
 
-_WEIGHT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\b")
+_WEIGHT_RE = re.compile(r"\b(\d+(?:\.\d+)?)(?:\s*(?:kg|kgs|kilograms?)\b)?(?=\W|$)")
 
 _MIN_KG = 45.0
 _MAX_KG = 99.0
@@ -37,10 +38,20 @@ def _extract_weight_kg(text: str) -> float | None:
     return val
 
 
+# Formats a weight value without hiding useful precision.
+# Inputs: numeric kg value from parsing or DB.
+# Outputs: one or two decimal places, keeping at least one decimal.
+def format_weight_kg(weight_kg: float) -> str:
+    formatted = f"{weight_kg:.2f}".rstrip("0").rstrip(".")
+    if "." not in formatted:
+        formatted += ".0"
+    return formatted
+
+
 # Handles a weight logging request from B.
 # Inputs: InboundMessage with text containing a weight value in kg.
-# Outputs: (reply string, None). No pending_state — no correction flow for weight.
-def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
+# Outputs: (reply string, pending_state dict | None). pending_state enables quoted corrections.
+def handle_weight_log(msg: InboundMessage) -> tuple[str, dict | None]:
     if not msg.text:
         log_event(logger, logging.WARNING, "weight_log_missing_text", update_id=msg.update_id)
         return ("What weight would you like to log? Send a number in kg, e.g. 57.1", None)
@@ -71,6 +82,7 @@ def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
         "telegram_update_id": msg.update_id,
     }
 
+    weight_measurement_id: int | None = None
     try:
         conn = get_connection()
         try:
@@ -80,9 +92,12 @@ def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
                         """
                         INSERT INTO b.weight_measurements (measured_at, weight_kg, meta)
                         VALUES (%s, %s, %s)
+                        RETURNING weight_measurement_id
                         """,
                         (measured_at, weight_kg, psycopg2.extras.Json(meta)),
                     )
+                    row = cur.fetchone()
+                    weight_measurement_id = row[0] if row else None
         finally:
             conn.close()
     except Exception as e:
@@ -96,5 +111,10 @@ def handle_weight_log(msg: InboundMessage) -> tuple[str, None]:
         update_id=msg.update_id,
         weight_kg=weight_kg,
         measured_at=measured_at.isoformat(),
+        weight_measurement_id=weight_measurement_id,
     )
-    return (f"⚖️ {weight_kg:.1f} kg logged.", None)
+    state = {
+        "domain": "weight",
+        "context": {"weight_measurement_ids": [weight_measurement_id]},
+    }
+    return (f"⚖️ {format_weight_kg(weight_kg)} kg logged.", state)

@@ -37,6 +37,9 @@ When proposing a schema change:
 
 The git history of `data_dictionary.md` is the schema change log.
 
+**`system.conversation_state` domain constraint — update when adding new domains.**
+The `domain` column has a DB-level `CHECK` constraint listing every allowed value. Current values: `food`, `attention`, `weight`, `sleep_wake`, `expense`, `query`. **Any new domain that saves correction state must be added to this constraint before the code is deployed.** Propose the `ALTER TABLE` SQL to B and wait for confirmation before writing the handler. Failure to do this causes a constraint violation on the first save, not a startup error — it will be invisible until B actually logs something.
+
 ---
 
 ## Hard rules

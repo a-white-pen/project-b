@@ -6,9 +6,11 @@ Functions:
   _extract_attention_event(...)   — asks the LLM to classify the attention lifecycle action
   _handle_start(...)              — starts a session and auto-closes the previous open one
   _handle_finish(...)             — closes the current open attention session
+  _handle_completed(...)          — inserts a completed past session from one message
   _get_open_session(cur)          — fetches the current open attention session, if one exists
   _insert_session(...)            — inserts a new b.attention_sessions row
   _close_session(...)             — closes an open b.attention_sessions row
+  _get_overlapping_sessions(...)  — fetches sessions that overlap a proposed interval
   _row_to_session(row)            — converts a DB row into a session dict
   _format_log_reply(...)          — formats the attention acknowledgement sent back to B
   _format_session_summary(...)    — formats one attention session for replies
@@ -18,6 +20,7 @@ Functions:
   _format_optional_value(...)     — formats nullable values as text, using none when empty
   _format_open_session_for_llm(...) — formats the open session for extraction context
   _clean_optional_text(value)     — normalizes nullable model text fields
+  _parse_optional_datetime(value) — parses optional ISO timestamp values from the LLM
   _get_timezone(...)              — resolves B's timezone as of an event timestamp
   _local_time_str(...)            — returns B's local time for LLM context
   _parse_json(raw)                — parses JSON from an LLM response
@@ -59,7 +62,7 @@ _VALID_CATEGORIES = {
     "other",
 }
 
-_VALID_ACTIONS = {"start_session", "finish_session"}
+_VALID_ACTIONS = {"start_session", "finish_session", "log_completed"}
 
 _EXTRACT_PROMPT = """\
 You are extracting an attention log event for B's personal attention tracker.
@@ -67,6 +70,7 @@ You are extracting an attention log event for B's personal attention tracker.
 The tracker records one primary-attention session at a time. A message may either:
 - start_session: B is starting, doing, working on, eating, watching, reading, commuting, etc.
 - finish_session: B is done, finished, stopped, completed, or is ending the current thing.
+- log_completed: B says an activity is already finished and gives a past start time.
 
 Current local time: {local_time}
 Current open session, if any:
@@ -76,14 +80,17 @@ Message from B: {text}
 
 Return a JSON object with this exact structure:
 {{
-  "action": "<start_session or finish_session>",
+  "action": "<start_session, finish_session, or log_completed>",
   "category": "<one of: deep_work, shallow_work, planning, learning, exercise, cooking, eating, commute, life_admin, personal_care, social, entertainment, rest, meditation, other>",
   "description": "<short plain description of the activity>",
   "project": "<project/context tag or null>",
-  "notes": "<optional note or null>"
+  "notes": "<optional note or null>",
+  "started_at": "<ISO 8601 timestamp with timezone, only for log_completed; otherwise null>",
+  "ended_at": "<ISO 8601 timestamp with timezone, only for log_completed; otherwise null>"
 }}
 
 Rules:
+- Use log_completed when B says they finished/done/completed an activity and also gives a past start time in the same message, e.g. "Finish pooping, I started at around 7am". Set started_at to that past local time and ended_at to the message/current time.
 - Use finish_session for messages like "finish lunch", "finish mum mum", "done with Project B", "just finished and pushed to git", "stop watching", "finish poop", "finish pong pong".
 - Use start_session for messages like "working on Project B", "prep breakfast", "eat lunch", "go mum mum", "watching Succession", "scrolling TikTok", "learning about RAG", "go poop", "go pong pong".
 - Actual night sleep is not an attention session. If B says she is sleeping, still choose the closest action only if the router already sent it here, but use category "rest" and description "sleep mention routed to attention".
@@ -163,6 +170,8 @@ def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
 
     if action == "finish_session":
         return _handle_finish(msg, occurred_at, extracted)
+    if action == "log_completed":
+        return _handle_completed(msg, occurred_at, extracted)
     return _handle_start(msg, occurred_at, extracted)
 
 
@@ -337,6 +346,108 @@ def _handle_finish(msg: InboundMessage, ended_at: datetime, extracted: dict) -> 
     return (reply, state)
 
 
+# Inserts a completed attention session from one message.
+# Inputs: inbound message, fallback end timestamp, and parsed LLM extraction with started_at.
+# Outputs: (reply string, pending_state dict | None).
+def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) -> tuple[str, dict | None]:
+    description = (extracted.get("description") or "").strip()
+    if not description:
+        return ("I caught that it finished, not what finished. Annoying little blank.", None)
+
+    try:
+        started_at = _parse_optional_datetime(extracted.get("started_at"))
+        completed_at = _parse_optional_datetime(extracted.get("ended_at")) or ended_at
+    except (ValueError, TypeError) as e:
+        log_failure(logger, logging.WARNING, "attention_completed_timestamp_parse_failed", e, update_id=msg.update_id)
+        return ("Couldn't parse the timestamps — make sure you include when it started.", None)
+    if started_at is None:
+        return ("I can log the finished thing if you include when it started.", None)
+    if started_at >= completed_at:
+        return ("That completed session would end before it starts. Time did a little backflip.", None)
+
+    category = extracted.get("category") if extracted.get("category") in _VALID_CATEGORIES else "other"
+    project = _clean_optional_text(extracted.get("project"))
+    notes = _clean_optional_text(extracted.get("notes"))
+    meta = {
+        "start": {
+            "source": "telegram",
+            "self_reported": True,
+            "telegram_update_id": msg.update_id,
+        },
+        "end": {
+            "source": "telegram",
+            "self_reported": True,
+            "reason": "single_message_completed",
+            "telegram_update_id": msg.update_id,
+        },
+        "classification": {
+            "model": MODEL_FLASH,
+            "action": "log_completed",
+        },
+    }
+
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    overlapping_sessions = _get_overlapping_sessions(
+                        cur=cur,
+                        started_at=started_at,
+                        ended_at=completed_at,
+                        for_update=True,
+                    )
+                    if overlapping_sessions:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "attention_completed_overlap_found",
+                            update_id=msg.update_id,
+                            overlapping_session_ids=[
+                                s["attention_session_id"] for s in overlapping_sessions
+                            ],
+                            started_at=started_at.isoformat(),
+                            ended_at=completed_at.isoformat(),
+                        )
+                        return (
+                            "That overlaps an existing attention session. Fix the existing row first; "
+                            "time bookkeeping is already spicy enough.",
+                            None,
+                        )
+                    completed_session = _insert_session(
+                        cur=cur,
+                        category=category,
+                        description=description,
+                        project=project,
+                        started_at=started_at,
+                        ended_at=completed_at,
+                        notes=notes,
+                        meta=meta,
+                    )
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "attention_completed_save_failed", e, update_id=msg.update_id)
+        return ("Couldn't save that completed attention session — try again.", None)
+
+    log_event(
+        logger,
+        logging.INFO,
+        "attention_session_completed_logged",
+        update_id=msg.update_id,
+        session_id=completed_session["attention_session_id"],
+        category=category,
+        started_at=started_at.isoformat(),
+        ended_at=completed_at.isoformat(),
+    )
+    reply = _format_log_reply(closed_session=completed_session, opened_session=None)
+    state = {
+        "domain": "attention",
+        "context": {"attention_session_ids": [completed_session["attention_session_id"]]},
+    }
+    return (reply, state)
+
+
 # Fetches ALL open attention sessions (ended_at IS NULL).
 # Inputs: an open DB cursor and whether the rows should be locked for update.
 # Outputs: list of session dicts ordered by started_at DESC (most recent first).
@@ -372,6 +483,29 @@ def _get_open_session(cur, for_update: bool = False) -> dict | None:
     return rows[0] if rows else None
 
 
+# Fetches attention sessions that overlap a proposed closed interval.
+# Inputs: DB cursor, proposed started_at/ended_at, and whether rows should be locked.
+# Outputs: list of overlapping session dicts.
+def _get_overlapping_sessions(
+    cur,
+    started_at: datetime,
+    ended_at: datetime,
+    for_update: bool = False,
+) -> list[dict]:
+    sql = """
+        SELECT attention_session_id, category, description, project,
+               started_at, ended_at, notes, meta
+        FROM b.attention_sessions
+        WHERE started_at < %s
+          AND COALESCE(ended_at, 'infinity'::timestamptz) > %s
+        ORDER BY started_at, attention_session_id
+    """
+    if for_update:
+        sql += " FOR UPDATE"
+    cur.execute(sql, (ended_at, started_at))
+    return [_row_to_session(row) for row in cur.fetchall()]
+
+
 # Inserts a new b.attention_sessions row.
 # Inputs: DB cursor plus normalized session fields.
 # Outputs: inserted session dict.
@@ -383,12 +517,13 @@ def _insert_session(
     started_at: datetime,
     notes: str | None,
     meta: dict,
+    ended_at: datetime | None = None,
 ) -> dict:
     cur.execute(
         """
         INSERT INTO b.attention_sessions
-            (category, description, project, started_at, notes, meta)
-        VALUES (%s, %s, %s, %s, %s, %s)
+            (category, description, project, started_at, ended_at, notes, meta)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING attention_session_id, category, description, project,
                   started_at, ended_at, notes, meta
         """,
@@ -397,6 +532,7 @@ def _insert_session(
             description,
             project,
             started_at,
+            ended_at,
             notes,
             psycopg2.extras.Json(meta),
         ),
@@ -561,6 +697,25 @@ def _clean_optional_text(value) -> str | None:
     return cleaned
 
 
+# Parses an optional ISO timestamp emitted by the LLM.
+# Inputs: ISO string with timezone, None, or an empty-ish string.
+# Outputs: timezone-aware datetime or None.
+def _parse_optional_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError("timestamp must include timezone")
+        return value
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() in {"null", "none", "open"}:
+        return None
+    parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include timezone")
+    return parsed
+
+
 # Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
 # Inputs: event timestamp or None.
 # Outputs: ZoneInfo instance.
@@ -624,7 +779,7 @@ def _local_time_str(as_of: datetime | None = None) -> str:
         local_now = as_of.astimezone(tz)
     else:
         local_now = datetime.now(tz=tz)
-    return local_now.strftime("%H:%M on %A")
+    return local_now.strftime("%Y-%m-%d %H:%M %Z")
 
 
 # Strips markdown code fences if the LLM wraps its response, then parses JSON.
