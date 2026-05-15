@@ -34,7 +34,7 @@ Telegram servers
   → 200 OK back to Telegram
 ```
 
-**Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food` and `attention`.
+**Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food`, `attention`, `sleep_wake`, and `weight`.
 
 ### Flow 2 — A reminder fires *(not yet implemented)*
 

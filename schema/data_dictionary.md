@@ -81,6 +81,113 @@ One row per body-weight reading for B. Grain: one measurement. No telegram_updat
 | `meta` | `jsonb` | no | '{}'::jsonb | Source provenance. telegram_update_id lives here, not as a column. Telegram: {"source":"telegram","self_reported":true,"telegram_update_id":N}. Withings: {"source":"withings","self_reported":false,"device":"Withings Body+"}. Garmin: {"source":"garmin","self_reported":false,"device":"Garmin Index S2"}. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use measured_at for all time-series queries. |
 
+## Schema: `exercise`
+
+### View: `exercise.activities`
+Unified read model across all exercise tables. Currently covers cardio only. Weight training rows will be unioned in when exercise.weight_training_sessions is created in Phase 3.
+
+**View definition:**
+```sql
+SELECT 'cardio_activities'::text AS activity_source_table,
+    cardio_activity_id AS activity_source_id,
+    activity_category,
+    sport_type,
+    activity_name,
+    is_treadmill,
+    started_at,
+    duration_seconds,
+    moving_seconds,
+    distance_m,
+    elevation_gain_m,
+    calories_kcal,
+    average_heartrate,
+    max_heartrate,
+    average_cadence,
+    gear_name,
+    strava_activity_id AS source_reference,
+    created_at
+   FROM exercise.cardio_activities;
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `activity_source_table` | `text` | yes |  |  |
+| `activity_source_id` | `integer` | yes |  |  |
+| `activity_category` | `text` | yes |  |  |
+| `sport_type` | `text` | yes |  |  |
+| `activity_name` | `text` | yes |  |  |
+| `is_treadmill` | `boolean` | yes |  |  |
+| `started_at` | `timestamp with time zone` | yes |  |  |
+| `duration_seconds` | `integer` | yes |  |  |
+| `moving_seconds` | `integer` | yes |  |  |
+| `distance_m` | `numeric(10,2)` | yes |  |  |
+| `elevation_gain_m` | `numeric(8,2)` | yes |  |  |
+| `calories_kcal` | `integer` | yes |  |  |
+| `average_heartrate` | `numeric(5,1)` | yes |  |  |
+| `max_heartrate` | `numeric(5,1)` | yes |  |  |
+| `average_cadence` | `numeric(5,1)` | yes |  |  |
+| `gear_name` | `text` | yes |  |  |
+| `source_reference` | `bigint` | yes |  |  |
+| `created_at` | `timestamp with time zone` | yes |  |  |
+
+### Table: `exercise.cardio_activities`
+One row per completed cardio activity synced from Strava. Covers runs, walks, hikes, rides, and other cardio. Grain: one activity. Source payload is in system.strava_inbound.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `cardio_activity_id` | `integer` | no | nextval('exercise.cardio_activities_cardio_activity_id_seq'::regclass) |  |
+| `strava_inbound_id` | `integer` | no |  | FK to system.strava_inbound row that triggered this activity save. |
+| `strava_activity_id` | `bigint` | no |  | Strava activity ID. Unique — update events overwrite via application upsert logic, not new rows. |
+| `activity_name` | `text` | no |  |  |
+| `sport_type` | `text` | no |  | Raw Strava sport_type string, e.g. Run, Walk, Ride, TrailRun, VirtualRun, Hike. |
+| `activity_category` | `text` | no |  | Normalised Project B category. Values: run, walk, ride, swim, other_cardio. |
+| `is_treadmill` | `boolean` | no | false | True when Strava trainer=true, indicating a treadmill or indoor trainer session. No GPS data. |
+| `started_at` | `timestamp with time zone` | no |  |  |
+| `timezone` | `text` | no |  |  |
+| `duration_seconds` | `integer` | no |  | Total elapsed time in seconds including pauses. From Strava elapsed_time. |
+| `moving_seconds` | `integer` | no |  | Active moving time in seconds excluding stops. From Strava moving_time. Equals duration_seconds for treadmill runs. |
+| `distance_m` | `numeric(10,2)` | yes |  | Total distance in metres. Null for activities with no distance tracking. |
+| `elevation_gain_m` | `numeric(8,2)` | yes |  | Total elevation gain in metres. Zero for treadmill. From Strava total_elevation_gain. |
+| `elev_high_m` | `numeric(8,2)` | yes |  | Highest elevation point in metres. Null for treadmill. |
+| `elev_low_m` | `numeric(8,2)` | yes |  | Lowest elevation point in metres. Null for treadmill. |
+| `average_speed_mps` | `numeric(6,3)` | yes |  | Average speed in metres per second. Divide into 1000 for pace in sec/km. |
+| `max_speed_mps` | `numeric(6,3)` | yes |  |  |
+| `average_cadence` | `numeric(5,1)` | yes |  | Average step cadence in steps per minute (one-foot count from Garmin). |
+| `average_heartrate` | `numeric(5,1)` | yes |  | Average heart rate in bpm for the full activity. |
+| `max_heartrate` | `numeric(5,1)` | yes |  | Peak heart rate in bpm recorded during the activity. |
+| `calories_kcal` | `integer` | yes |  | Estimated calories burned. From Strava calories field. |
+| `perceived_exertion` | `integer` | yes |  | 1–10 RPE scale. Populated when B sets it in Strava. Null otherwise. |
+| `gear_name` | `text` | yes |  | Gear name from Strava, e.g. ASICS Nimbus 27. Useful for shoe mileage tracking. |
+| `device_name` | `text` | yes |  |  |
+| `polyline` | `text` | yes |  | Google-encoded polyline of the GPS route. Null for treadmill and indoor activities. Decode with any polyline library for map visualisation. |
+| `start_lat` | `numeric(9,6)` | yes |  | Latitude of activity start point. Null for treadmill. |
+| `start_lng` | `numeric(9,6)` | yes |  | Longitude of activity start point. Null for treadmill. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance and fields not promoted to columns. Shape: {"strava_workout_type": ..., "splits_metric": [...], "external_id": "garmin_ping_..."}. |
+| `created_at` | `timestamp with time zone` | no | now() |  |
+| `updated_at` | `timestamp with time zone` | yes |  |  |
+
+### Table: `exercise.cardio_splits`
+Per-km lap data for each cardio activity. One row per Garmin auto-lap (typically 1 km). Combines fields from Strava laps (cadence, max HR, elevation gain) and splits_metric (moving time, elevation difference, grade-adjusted speed). Used for per-km training analysis and AI planning.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `cardio_split_id` | `integer` | no | nextval('exercise.cardio_splits_cardio_split_id_seq'::regclass) |  |
+| `cardio_activity_id` | `integer` | no |  |  |
+| `lap_index` | `integer` | no |  | Lap number within the activity, 1-based. From Strava laps.lap_index. |
+| `distance_m` | `numeric(8,2)` | no |  | Distance covered in this lap in metres. Typically ~1000 m for auto-lap. |
+| `elapsed_seconds` | `integer` | no |  | Total time for this lap including pauses. From Strava laps.elapsed_time. |
+| `moving_seconds` | `integer` | yes |  | Active moving time for this lap. From splits_metric.moving_time. Equals elapsed_seconds for treadmill. |
+| `average_speed_mps` | `numeric(6,3)` | yes |  |  |
+| `max_speed_mps` | `numeric(6,3)` | yes |  |  |
+| `average_cadence` | `numeric(5,1)` | yes |  | Average step cadence in spm for this lap. From Strava laps. Null if not recorded. |
+| `average_heartrate` | `numeric(5,1)` | yes |  | Average heart rate in bpm for this lap. |
+| `max_heartrate` | `numeric(5,1)` | yes |  | Peak heart rate in bpm within this lap. From Strava laps. |
+| `elevation_gain_m` | `numeric(7,2)` | yes |  | Total elevation gain in metres for this lap. From Strava laps.total_elevation_gain. |
+| `elevation_difference_m` | `numeric(7,2)` | yes |  | Net elevation change (gain minus loss) for this lap. From splits_metric.elevation_difference. |
+| `grade_adjusted_speed_mps` | `numeric(6,3)` | yes |  | Speed adjusted for gradient — normalises uphill effort to flat equivalent. From splits_metric.average_grade_adjusted_speed. |
+| `pace_zone` | `integer` | yes |  | Strava pace zone (1–5) for this lap. Null for walks and some outdoor activities. |
+| `created_at` | `timestamp with time zone` | no | now() |  |
+
 ## Schema: `nutrition`
 
 ### Table: `nutrition.food_log`
