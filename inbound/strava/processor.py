@@ -5,6 +5,7 @@ and sends proactive Telegram notifications.
 Functions:
   process_activity_event(strava_inbound_id, activity_id, aspect_type) — fetches Strava activity,
       saves to exercise.cardio_activities + cardio_splits, sends Telegram notification
+  process_delete_event(strava_inbound_id, activity_id) — deletes a cardio activity row and notifies B
   _exchange_token()                                      — exchanges refresh token for access token
   _fetch_activity(access_token, activity_id)             — fetches full activity detail from Strava API
   _activity_label(sport_type, category, is_treadmill)          — maps sport_type to readable label
@@ -20,7 +21,7 @@ import re
 
 import httpx
 
-from domains.exercise.service import save_cardio_activity
+from domains.exercise.service import delete_cardio_activity, save_cardio_activity
 from system.config import get_strava_config
 from system.db import get_connection
 from system.logging import log_event, log_failure
@@ -65,6 +66,37 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
 
     except Exception as e:
         log_failure(logger, logging.ERROR, "strava_process_failed", e,
+                    strava_inbound_id=strava_inbound_id, activity_id=activity_id)
+
+
+# Handles a Strava delete event — removes the activity row and notifies B.
+# Inputs: strava_inbound_id from the stored event row, activity_id from the Strava webhook.
+# Outputs: none — result logged; notification sent if a row was deleted.
+def process_delete_event(strava_inbound_id: int, activity_id: int) -> None:
+    log_event(logger, logging.INFO, "strava_delete_started",
+              strava_inbound_id=strava_inbound_id, activity_id=activity_id)
+    try:
+        deleted = delete_cardio_activity(activity_id)
+
+        chat_id = _get_latest_chat_id()
+        if chat_id is None:
+            log_event(logger, logging.WARNING, "strava_no_chat_id",
+                      strava_inbound_id=strava_inbound_id)
+            return
+
+        if deleted:
+            text = "<i>Activity deleted from Strava — removed from log.</i>"
+        else:
+            text = "<i>Activity deleted from Strava (was not saved).</i>"
+
+        message_id, sent_payload = send_reply(chat_id, text)
+        if message_id is not None:
+            _store_outbound(message_id, sent_payload)
+        log_event(logger, logging.INFO, "strava_delete_notification_sent",
+                  strava_inbound_id=strava_inbound_id, activity_id=activity_id, deleted=deleted)
+
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "strava_delete_failed", e,
                     strava_inbound_id=strava_inbound_id, activity_id=activity_id)
 
 
@@ -132,14 +164,14 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
     is_treadmill = bool(activity.get("trainer"))
     elapsed_seconds = activity.get("elapsed_time") or activity.get("moving_time") or 0
     duration_str = _format_duration(elapsed_seconds)
-    distance_m = activity.get("distance") or 0
+    distance_m = activity.get("distance")  # keep None vs 0 distinct: 0.0 = treadmill/GPS failure
     avg_hr = activity.get("average_heartrate")
     max_hr = activity.get("max_heartrate")
     cadence = activity.get("average_cadence")
     update_prefix = "Updated: " if aspect_type == "update" else ""
 
     label = _activity_label(sport_type, activity_category, is_treadmill)
-    has_distance = bool(distance_m) and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
+    has_distance = distance_m is not None and distance_m > 0 and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
     stats = f"{distance_m / 1000:.1f} km in {duration_str}" if has_distance else duration_str
     line1 = f"{update_prefix}<b>{label}</b> — {stats}"
 

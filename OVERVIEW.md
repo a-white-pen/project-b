@@ -2,16 +2,16 @@
 
 ## Status
 
-**Live domains:** food logging, weight, sleep/wake, location, attention.
+**Live domains:** food logging, weight, sleep/wake, location, attention, exercise (Strava cardio).
 
 - Food: text, voice, and photo (nutrition label + visual estimation). Quoted-reply corrections supported.
 - Weight: text and voice, regex extraction, range validation.
 - Sleep/wake: `/sleep`, `/wake`, voice phrases ("night night", "good morning", "orh orh"). Classifier tightened against greeting false positives.
 - Location: stores `b.location` updates; used to resolve timezone for all other domains.
 - Attention: starts/finishes `b.attention_sessions` via text or voice. Starting auto-closes the previous open session. Quoted-reply corrections supported. One-open-session invariant enforced in app code.
+- Exercise (Strava cardio): webhook receiver; proactive Telegram notifications on create/update/delete; saves to `exercise.cardio_activities` + `exercise.cardio_splits`. Strength/non-cardio types logged but not saved (Phase 3).
 
 **In progress:**
-- Strava inbound — webhook receiver live; proactive Telegram notifications on activity create/update. Saving to `exercise` schema is Phase 2.
 - Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
 - Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
 

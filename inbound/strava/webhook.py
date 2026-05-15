@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from system.config import get_strava_config
 from system.db import get_connection
 from system.logging import log_event, log_failure
-from inbound.strava.processor import process_activity_event
+from inbound.strava.processor import process_activity_event, process_delete_event
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,8 @@ def register_routes(app: FastAPI) -> None:
 
         if object_type == "activity" and aspect_type in ("create", "update"):
             background_tasks.add_task(process_activity_event, strava_inbound_id, object_id, aspect_type)
+        elif object_type == "activity" and aspect_type == "delete":
+            background_tasks.add_task(process_delete_event, strava_inbound_id, object_id)
         else:
             log_event(logger, logging.INFO, "strava_event_ignored",
                       strava_inbound_id=strava_inbound_id,

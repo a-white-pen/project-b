@@ -5,6 +5,7 @@ and exercise.cardio_splits.
 Functions:
   save_cardio_activity(strava_inbound_id, activity) — classifies, upserts activity row,
       replaces splits; returns (saved, activity_category) tuple
+  delete_cardio_activity(strava_activity_id)        — deletes one activity row (and its splits via CASCADE)
   _classify_activity(sport_type)  — maps Strava sport_type to activity_category or None
   _extract_timezone(tz_str)       — extracts IANA timezone from Strava timezone string
   _build_splits(activity)         — merges laps + splits_metric into per-km split rows
@@ -47,22 +48,35 @@ def _classify_activity(sport_type: str) -> str | None:
 def _extract_timezone(tz_str: str) -> str:
     if tz_str and ") " in tz_str:
         return tz_str.split(") ", 1)[1]
+    if tz_str:
+        log_event(logger, logging.WARNING, "exercise_timezone_format_unexpected", tz_str_len=len(tz_str))
     return tz_str or "UTC"
 
 
 # Merges Strava laps (has cadence, max HR, elevation gain) with splits_metric
 # (has moving_time, elevation_difference, grade_adjusted_speed) by split index.
+# Assumption: Strava lap_index and splits_metric split key are 1-based and aligned — same position
+# in each array maps to the same km split. If Strava ever changes this, splits will silently mismatch.
+# Laps missing lap_index, distance, or elapsed_time are skipped — those columns are NOT NULL in the schema.
 # Returns a list of dicts ready for bulk insert into exercise.cardio_splits.
 def _build_splits(activity: dict) -> list[dict]:
-    splits_by_idx = {s["split"]: s for s in activity.get("splits_metric", [])}
+    # Use .get("split") to avoid KeyError if Strava omits the split key on any entry.
+    splits_by_idx = {s["split"]: s for s in activity.get("splits_metric", []) if s.get("split") is not None}
     rows = []
     for lap in activity.get("laps", []):
         idx = lap.get("lap_index")
+        distance = lap.get("distance")
+        elapsed = lap.get("elapsed_time")
+        # lap_index, distance_m, elapsed_seconds are NOT NULL in the schema — skip incomplete laps.
+        if idx is None or distance is None or elapsed is None:
+            log_event(logger, logging.WARNING, "exercise_split_incomplete_lap_skipped",
+                      lap_index=idx, has_distance=distance is not None, has_elapsed=elapsed is not None)
+            continue
         sm = splits_by_idx.get(idx, {})
         rows.append({
             "lap_index": idx,
-            "distance_m": lap.get("distance"),
-            "elapsed_seconds": lap.get("elapsed_time"),
+            "distance_m": distance,
+            "elapsed_seconds": elapsed,
             "moving_seconds": sm.get("moving_time") or lap.get("moving_time"),
             "average_speed_mps": lap.get("average_speed"),
             "max_speed_mps": lap.get("max_speed"),
@@ -124,6 +138,11 @@ def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, 
                     ON CONFLICT (strava_activity_id) DO UPDATE SET
                         strava_inbound_id    = EXCLUDED.strava_inbound_id,
                         activity_name        = EXCLUDED.activity_name,
+                        sport_type           = EXCLUDED.sport_type,
+                        activity_category    = EXCLUDED.activity_category,
+                        is_treadmill         = EXCLUDED.is_treadmill,
+                        started_at           = EXCLUDED.started_at,
+                        timezone             = EXCLUDED.timezone,
                         duration_seconds     = EXCLUDED.duration_seconds,
                         moving_seconds       = EXCLUDED.moving_seconds,
                         distance_m           = EXCLUDED.distance_m,
@@ -222,5 +241,26 @@ def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, 
                     strava_activity_id=strava_activity_id,
                     strava_inbound_id=strava_inbound_id)
         return False, None
+    finally:
+        conn.close()
+
+
+# Deletes one cardio activity row and its splits (via CASCADE) by Strava activity ID.
+# Called when Strava sends a delete event for an activity B has removed in the Strava app.
+# Inputs: strava_activity_id from the Strava webhook event.
+# Outputs: True if a row was deleted, False if no matching row existed. Raises on DB error.
+def delete_cardio_activity(strava_activity_id: int) -> bool:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM exercise.cardio_activities WHERE strava_activity_id = %s",
+                    (strava_activity_id,),
+                )
+                deleted = cur.rowcount > 0
+        log_event(logger, logging.INFO, "exercise_cardio_deleted",
+                  strava_activity_id=strava_activity_id, deleted=deleted)
+        return deleted
     finally:
         conn.close()

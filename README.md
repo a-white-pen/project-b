@@ -21,6 +21,7 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 | Sleep/wake | Logs sleep and wake events. Slash commands and voice phrases ("night night", "good morning"). |
 | Location | Stores location updates. Used to resolve timezone for all other domains. |
 | Attention | Starts and finishes attention sessions. Auto-closes previous open session on new start. Quoted-reply corrections supported. |
+| Exercise | Strava webhook: receives activity events, saves cardio runs/rides/swims/walks to `exercise` schema, sends proactive Telegram notifications. Handles create, update, and delete. |
 
 **In progress:** nutrition data quality (USDA + Open Food Facts integration), expense logging.
 

@@ -7,17 +7,19 @@ Functions:
   _handle_awaiting_clearer_photo(msg, context)   — re-runs extraction with a new photo when the original label was unreadable
   _handle_awaiting_quantity(msg, context)         — re-downloads saved label photo and runs extraction with B's quantity reply
   _handle_photo_correction(msg, current_items)    — re-reads macros from a correction photo via vision model, applies changes
+  _reestimate_item(original, correction_text, ...) — re-estimates macros for a renamed food item via LLM
+  _fetch_items(food_log_ids)                      — fetches food_log rows by ID list
+  _format_items_for_llm(items)                    — formats items as readable text for correction LLM prompts
+  _apply_corrections(correction_items, ...)       — applies parsed corrections to DB; returns surviving food_log_ids
 """
 
 import dataclasses
-import json
 import logging
 import os
-import re
 
 import psycopg2.extras
 
-from domains.food.service import _build_item_results, _format_item_reply, handle_food_log
+from domains.food.service import _build_item_results, _format_item_reply, _parse_json, handle_food_log
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
@@ -220,7 +222,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
     # Use meal_food_log_ids (the full batch) so the LLM sees the whole meal for context —
     # e.g. "that was dinner" should inform the model that there are 3 items moving to dinner,
     # not just the one item B quoted. The quoted food_log_ids are highlighted in the prompt.
-    ids_to_fetch = meal_food_log_ids if len(meal_food_log_ids) > len(food_log_ids) else food_log_ids
+    ids_to_fetch = meal_food_log_ids or food_log_ids
     try:
         current_items = _fetch_items(ids_to_fetch)
     except Exception as e:
@@ -364,13 +366,17 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
             item["_macro_input"] = "description"
             item["_macro_method"] = "llm"
 
-    # Apply changes to DB
+    # Apply changes to DB.
+    # all_ids uses meal_food_log_ids (the full batch) so the LLM can act on any meal item —
+    # e.g. "remove the iced coffee too" while quoting the chicken row is correctly applied.
+    # The quoted food_log_ids are already marked as [quoted target] in the LLM prompt, so the
+    # model knows which item triggered the correction without an allowlist filter here.
     try:
         surviving_ids = _apply_corrections(
             correction_items=correction_items,
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
-            all_ids=food_log_ids,
+            all_ids=meal_food_log_ids,
             meal_ids=meal_food_log_ids,
         )
     except Exception as e:
@@ -379,7 +385,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
 
     new_history = (correction_history + [correction_text])[-_MAX_HISTORY:] if correction_text else correction_history
     deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
-    deleted_from_batch = set(food_log_ids) - set(surviving_ids)
+    deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
     # Build updated item list for the reply.
@@ -455,6 +461,7 @@ def _format_history_section(history: list[str]) -> str:
 def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> list[tuple[str, dict | None]]:
     quantity_text = msg.text or msg.caption
     file_ids = context.get("file_ids") or []
+    original_caption = context.get("original_caption") or ""
 
     log_event(
         logger,
@@ -462,6 +469,7 @@ def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> list[tuple[
         "food_awaiting_quantity_received",
         update_id=msg.update_id,
         has_quantity=bool(quantity_text),
+        has_original_caption=bool(original_caption),
         file_id_count=len(file_ids),
     )
 
@@ -471,13 +479,18 @@ def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> list[tuple[
         log_event(logger, logging.WARNING, "food_awaiting_quantity_no_file_ids", update_id=msg.update_id)
         return [("Can't find the original photo — please resend it with the quantity in the caption.", None)]
 
-    # Reconstruct a PHOTO message: file_id from saved state, quantity text as caption.
-    # handle_food_log routes this through _handle_photo, which now has the quantity it needs.
+    # Merge original caption (food context) with quantity reply so neither is lost.
+    # Example: original "protein bar plus banana" + quantity "150g" → "protein bar plus banana 150g".
+    # Same join-with-space pattern as _handle_awaiting_clearer_photo.
+    effective_caption = " ".join(filter(None, [original_caption, quantity_text])).strip()
+
+    # Reconstruct a PHOTO message: file_id from saved state, merged caption.
+    # handle_food_log routes this through _handle_photo, which now has both the food context and quantity.
     photo_msg = dataclasses.replace(
         msg,
         message_type=MessageType.PHOTO,
         file_id=file_ids[0],
-        caption=quantity_text,
+        caption=effective_caption,
         text=None,
     )
     return handle_food_log(photo_msg)
@@ -526,7 +539,8 @@ def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> list[t
     return handle_food_log(photo_msg)
 
 
-# Maps photo_type returned by the vision model to (macro_input, macro_method) for DB provenance.
+# Maps photo_type → (macro_input, macro_method) for DB provenance columns.
+# Tuple positions: index 0 = macro_input, index 1 = macro_method.
 # "nutrition_label" — government-mandated panel: both input and method are "nutrition_label"
 # "macro_screenshot" — restaurant menu, meal service card, simplified macro display: "restaurant_reported"
 # "food_image" — food photo, no numbers: "image" input, "llm" method
@@ -639,7 +653,7 @@ def _handle_photo_correction(
             correction_items=correction_items,
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
-            all_ids=food_log_ids,
+            all_ids=meal_food_log_ids,
             meal_ids=meal_food_log_ids,
         )
     except Exception as e:
@@ -649,7 +663,7 @@ def _handle_photo_correction(
     photo_note = f"[photo correction: {caption}]" if caption else "[photo correction]"
     new_history = (correction_history + [photo_note])[-_MAX_HISTORY:]
     deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
-    deleted_from_batch = set(food_log_ids) - set(surviving_ids)
+    deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
     try:
@@ -689,6 +703,8 @@ def _handle_photo_correction(
 # Re-estimates a single food item using the original logged entry plus the user's correction text.
 # Called when food_item changes in a correction — ensures macros, food_meta, and metadata columns
 # are all refreshed for the new item rather than inheriting stale values from the original.
+# Inputs: original — the current food_log row dict; correction_text — what B said;
+#         update_id — for logging; correction_history — prior corrections forwarded to the LLM for context.
 # Returns a dict with food_item, macros, food_meta on success, or None on failure (caller falls back
 # to rename-only behaviour so the correction is never blocked by a re-estimation error).
 def _reestimate_item(original: dict, correction_text: str, update_id: int | None, correction_history: list[str] | None = None) -> dict | None:
@@ -894,10 +910,3 @@ def _apply_corrections(
                 return surviving
     finally:
         conn.close()
-
-
-
-# Strips markdown code fences if the LLM wraps its response, then parses JSON.
-def _parse_json(raw: str) -> dict:
-    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-    return json.loads(cleaned)

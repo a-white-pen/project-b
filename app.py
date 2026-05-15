@@ -5,6 +5,7 @@ To add a new inbound source: import its register_routes and add one call inside 
 
 Functions:
   create_app() — builds the FastAPI app and registers all active inbound route modules
+  app          — module-level FastAPI instance; used as the uvicorn entry point (app:app)
 """
 
 from fastapi import FastAPI

@@ -81,6 +81,26 @@ One row per body-weight reading for B. Grain: one measurement. No telegram_updat
 | `meta` | `jsonb` | no | '{}'::jsonb | Source provenance. telegram_update_id lives here, not as a column. Telegram: {"source":"telegram","self_reported":true,"telegram_update_id":N}. Withings: {"source":"withings","self_reported":false,"device":"Withings Body+"}. Garmin: {"source":"garmin","self_reported":false,"device":"Garmin Index S2"}. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use measured_at for all time-series queries. |
 
+## Schema: `data_visualisation`
+
+### Table: `data_visualisation.nutrition_visualisation`
+Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud Scheduler. Fully overwritten on each refresh (TRUNCATE + INSERT). Grain: one row per food_log_id from nutrition.food_log. Consumed by GET /api/food/recent.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `food_log_id` | `integer` | no |  | Primary key sourced from nutrition.food_log.food_log_id. Stable within a refresh cycle. |
+| `meal_type` | `text` | yes |  | Meal slot. Values: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout. |
+| `food_item` | `text` | yes |  |  |
+| `kcal` | `numeric(7,2)` | yes |  |  |
+| `protein_g` | `numeric(6,2)` | yes |  |  |
+| `carbs_g` | `numeric(6,2)` | yes |  |  |
+| `fat_g` | `numeric(6,2)` | yes |  |  |
+| `fibre_g` | `numeric(6,2)` | yes |  |  |
+| `sugar_g` | `numeric(6,2)` | yes |  |  |
+| `sodium_mg` | `numeric(7,2)` | yes |  |  |
+| `logged_at` | `timestamp with time zone` | no |  | created_at from the source food_log row — when B actually ate the item. |
+| `refreshed_at` | `timestamp with time zone` | no |  | Timestamp when this refresh batch ran. Identical across all rows after each TRUNCATE + INSERT. Use this to show "data as of X" in the dashboard. |
+
 ## Schema: `exercise`
 
 ### View: `exercise.activities`

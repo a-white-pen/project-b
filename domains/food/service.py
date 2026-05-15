@@ -654,9 +654,17 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[s
         return [("Can't read the label clearly — could you send a clearer photo, or type the values?", pending_state)]
     if status == "needs_quantity":
         log_event(logger, logging.INFO, "food_photo_needs_quantity", update_id=msg.update_id)
+        # Save original_caption alongside file_ids so the handler can merge it with the quantity reply.
+        # Without this, "protein bar plus banana — 150g" would lose the food context when re-running extraction.
+        pending_state: dict = {
+            "domain": "food",
+            "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]},
+        }
+        if msg.caption:
+            pending_state["context"]["original_caption"] = msg.caption
         return [(
             "I can see the label — how much did you have? (e.g. '150g', '1 serving', 'half a bar')",
-            {"domain": "food", "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]}},
+            pending_state,
         )]
 
     items = extracted.get("items", [])
