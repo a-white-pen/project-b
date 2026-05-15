@@ -1,22 +1,26 @@
 """
-Strava activity processor — fetches activity details and sends proactive Telegram notifications.
+Strava activity processor — fetches activity details, persists to exercise schema,
+and sends proactive Telegram notifications.
 
 Functions:
   process_activity_event(strava_inbound_id, activity_id, aspect_type) — fetches Strava activity,
-      sends Telegram notification, logs to system.telegram_outbound
-  _exchange_token()                          — exchanges refresh token for a short-lived access token
-  _fetch_activity(access_token, activity_id) — fetches full activity detail from Strava API
-  _format_notification(activity, aspect_type) — builds the proactive Telegram message text
-  _get_latest_chat_id()                      — reads the most recent chat_id from system.telegram_outbound
-  _store_outbound(message_id, payload)       — inserts a proactive outbound row with telegram_update_id=NULL
+      saves to exercise.cardio_activities + cardio_splits, sends Telegram notification
+  _exchange_token()                                      — exchanges refresh token for access token
+  _fetch_activity(access_token, activity_id)             — fetches full activity detail from Strava API
+  _activity_label(sport_type, category, is_treadmill)          — maps sport_type to readable label
+  _format_notification(activity, aspect_type, saved, category) — builds HTML-formatted Telegram message
+  _get_latest_chat_id()                                  — reads chat_id from system.telegram_outbound
+  _store_outbound(message_id, payload)                   — logs proactive outbound with telegram_update_id=NULL
 """
 
 import html
 import json
 import logging
+import re
 
 import httpx
 
+from domains.exercise.service import save_cardio_activity
 from system.config import get_strava_config
 from system.db import get_connection
 from system.logging import log_event, log_failure
@@ -42,13 +46,15 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
                   activity_id=activity_id,
                   sport_type=activity.get("sport_type"))
 
+        saved, activity_category = save_cardio_activity(strava_inbound_id, activity)
+
         chat_id = _get_latest_chat_id()
         if chat_id is None:
             log_event(logger, logging.WARNING, "strava_no_chat_id",
                       strava_inbound_id=strava_inbound_id)
             return
 
-        text = _format_notification(activity, aspect_type)
+        text = _format_notification(activity, aspect_type, saved, activity_category)
         message_id, sent_payload = send_reply(chat_id, text)
         if message_id is not None:
             _store_outbound(message_id, sent_payload)
@@ -95,16 +101,63 @@ def _fetch_activity(access_token: str, activity_id: int) -> dict:
     return response.json()
 
 
+# Maps Strava sport_type + category to a human-readable activity label.
+def _activity_label(sport_type: str, activity_category: str | None, is_treadmill: bool) -> str:
+    if activity_category == "run":
+        if is_treadmill:
+            return "Treadmill Run"
+        return {"TrailRun": "Trail Run", "VirtualRun": "Virtual Run"}.get(sport_type, "Run")
+    if activity_category == "walk":
+        return "Hike" if sport_type == "Hike" else "Walk"
+    if activity_category == "ride":
+        return {
+            "VirtualRide": "Virtual Ride",
+            "MountainBikeRide": "Mountain Bike Ride",
+            "GravelRide": "Gravel Ride",
+            "EBikeRide": "E-Bike Ride",
+        }.get(sport_type, "Ride")
+    if activity_category == "swim":
+        return "Open Water Swim" if sport_type == "OpenWaterSwim" else "Swim"
+    if sport_type in ("WeightTraining", "Workout"):
+        return "Strength Session"
+    # Convert CamelCase sport_type to readable words for everything else
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", sport_type) or "Activity"
+
+
 # Builds the proactive Telegram notification text for an activity.
-# Inputs: full Strava activity dict, aspect_type ("create" or "update").
-# Outputs: two-line string — line 1: activity name + duration; line 2: status.
-def _format_notification(activity: dict, aspect_type: str) -> str:
-    name = html.escape(activity.get("name") or "Activity")
+# Uses HTML formatting — bold label, HR pair, cadence, italic not-saved status.
+# Inputs: full Strava activity dict, aspect_type, whether it was saved, and its category.
+def _format_notification(activity: dict, aspect_type: str, saved: bool, activity_category: str | None) -> str:
+    sport_type = activity.get("sport_type", "")
+    is_treadmill = bool(activity.get("trainer"))
     elapsed_seconds = activity.get("elapsed_time") or activity.get("moving_time") or 0
     duration_str = _format_duration(elapsed_seconds)
+    distance_m = activity.get("distance") or 0
+    avg_hr = activity.get("average_heartrate")
+    max_hr = activity.get("max_heartrate")
+    cadence = activity.get("average_cadence")
+    update_prefix = "Updated: " if aspect_type == "update" else ""
 
-    status = "Updated on Strava. Not yet saved." if aspect_type == "update" else "Strava received. Not yet saved."
-    return f"{name}: {duration_str}\n{status}"
+    label = _activity_label(sport_type, activity_category, is_treadmill)
+    has_distance = bool(distance_m) and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
+    stats = f"{distance_m / 1000:.1f} km in {duration_str}" if has_distance else duration_str
+    line1 = f"{update_prefix}<b>{label}</b> — {stats}"
+
+    line2_parts = []
+    if avg_hr and max_hr:
+        line2_parts.append(f"❤️ {int(avg_hr)} avg · {int(max_hr)} max")
+    elif avg_hr:
+        line2_parts.append(f"❤️ {int(avg_hr)} avg")
+    if cadence and activity_category in ("run", "walk", "ride", "swim", "other_cardio"):
+        line2_parts.append(f"👟 {int(cadence)} spm")
+
+    lines = [line1]
+    if line2_parts:
+        lines.append("  |  ".join(line2_parts))
+    if not saved:
+        lines.append("<i>Not yet saved.</i>")
+
+    return "\n".join(lines)
 
 
 # Formats a duration in seconds as mm:ss or h:mm:ss.
