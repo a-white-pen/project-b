@@ -17,7 +17,7 @@ import re
 
 import psycopg2.extras
 
-from domains.food.service import handle_food_log
+from domains.food.service import _build_item_results, _format_item_reply, handle_food_log
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
@@ -113,7 +113,10 @@ Rules:
 - Only include items that need to change (action=update) or be removed (action=delete)
 - For items not mentioned by the user, omit them from the list entirely
 - For fields not explicitly changed, OMIT the key entirely — do NOT include null
+- meal_type must be one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout
 - meal_type: only change if the user explicitly mentions it
+- "pre workout", "pre-workout", "post workout", "post-workout" always refer to meal_type changes — \
+they are meal timing labels, NOT food item names; never rename food_item based on these words
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
@@ -175,8 +178,8 @@ service card, app screenshot, simplified macro display without sodium); "food_im
 # Inputs:
 #   msg   — the inbound correction message (msg.text is the correction text or quantity)
 #   state — conversation_state row dict from load_state()
-# Outputs: (reply_text, pending_state) where pending_state has the new state for saving.
-def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict | None]:
+# Outputs: list of (reply_text, pending_state) — one per surviving food item.
+def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, dict | None]]:
     context = state.get("context") or {}
 
     # awaiting_clearer_photo path: bot couldn't read a label and B is sending a clearer photo.
@@ -188,6 +191,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         return _handle_awaiting_quantity(msg, context)
 
     food_log_ids = context.get("food_log_ids") or []
+    meal_food_log_ids = context.get("meal_food_log_ids") or food_log_ids
     original_meal_type = context.get("meal_type", "snack")
     log_event(
         logger,
@@ -201,7 +205,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
 
     if not food_log_ids:
         log_event(logger, logging.WARNING, "food_correction_missing_food_log_ids", update_id=msg.update_id)
-        return ("Nothing to correct — couldn't find the original log entries.", None)
+        return [("Nothing to correct — couldn't find the original log entries.", None)]
 
     # Validate that the message carries actionable content before touching the DB.
     # Photo path needs only file_id (no text required); text path needs text or caption.
@@ -210,25 +214,29 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     correction_text = msg.text or msg.caption
     if not is_photo and not correction_text:
         log_event(logger, logging.WARNING, "food_correction_missing_text", update_id=msg.update_id)
-        return ("What would you like to change? Send me a text description of the correction.", None)
+        return [("What would you like to change? Send me a text description of the correction.", None)]
 
-    # Fetch current state of the logged items from the DB
+    # Fetch current state of the logged items from the DB.
+    # Use meal_food_log_ids (the full batch) so the LLM sees the whole meal for context —
+    # e.g. "that was dinner" should inform the model that there are 3 items moving to dinner,
+    # not just the one item B quoted. The quoted food_log_ids are highlighted in the prompt.
+    ids_to_fetch = meal_food_log_ids if len(meal_food_log_ids) > len(food_log_ids) else food_log_ids
     try:
-        current_items = _fetch_items(food_log_ids)
+        current_items = _fetch_items(ids_to_fetch)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_correction_fetch_failed", e, update_id=msg.update_id)
-        return ("Couldn't load the original log — please try again.", None)
+        return [("Couldn't load the original log — please try again.", None)]
 
     if not current_items:
         log_event(logger, logging.WARNING, "food_correction_original_items_missing", update_id=msg.update_id)
-        return ("Nothing to correct — the original items may have been deleted already.", None)
+        return [("Nothing to correct — the original items may have been deleted already.", None)]
 
     # Route to photo correction path if B attached a photo to the correction message.
     if is_photo:
         return _handle_photo_correction(msg, current_items, original_meal_type, state)
 
-    # Format items for LLM context
-    logged_items_text = _format_items_for_llm(current_items)
+    # Format items for LLM context, marking the quoted item(s) as correction targets.
+    logged_items_text = _format_items_for_llm(current_items, quoted_ids=set(food_log_ids))
 
     # Build correction history section — carries prior correction texts forward so the LLM
     # has full context when B makes sequential corrections to the same meal.
@@ -248,7 +256,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         parsed = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_correction_parse_failed", e, update_id=msg.update_id)
-        return ("Couldn't understand the correction — can you rephrase?", None)
+        return [("Couldn't understand the correction — can you rephrase?", None)]
 
     new_meal_type = parsed.get("meal_type", original_meal_type)
     if new_meal_type not in _VALID_MEAL_TYPES:
@@ -265,7 +273,19 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     )
     if not correction_items and new_meal_type == original_meal_type:
         log_event(logger, logging.WARNING, "food_correction_no_changes", update_id=msg.update_id)
-        return ("Got your message — nothing seemed to need changing. What did you want to correct?", None)
+        # Preserve state so B can quote again and try a different correction.
+        noop_state: dict = {
+            "domain": "food",
+            "context": {
+                "food_log_ids": food_log_ids,
+                "meal_food_log_ids": meal_food_log_ids,
+                "meal_type": original_meal_type,
+            },
+            "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
+        }
+        if correction_history:
+            noop_state["context"]["correction_history"] = correction_history
+        return [("Got your message — nothing seemed to need changing. What did you want to correct?", noop_state)]
 
     # Enrich correction items with re-estimated macros and accurate provenance.
     #
@@ -351,10 +371,16 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
             all_ids=food_log_ids,
+            meal_ids=meal_food_log_ids,
         )
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_correction_apply_failed", e, update_id=msg.update_id)
-        return ("Correction parsed but failed to save — please try again.", None)
+        return [("Correction parsed but failed to save — please try again.", None)]
+
+    new_history = (correction_history + [correction_text])[-_MAX_HISTORY:] if correction_text else correction_history
+    deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
+    deleted_from_batch = set(food_log_ids) - set(surviving_ids)
+    updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
     # Build updated item list for the reply.
     # _apply_corrections already committed — guard this re-fetch so a DB hiccup here
@@ -363,6 +389,18 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         updated_items = _fetch_items(surviving_ids) if surviving_ids else []
     except Exception as e:
         log_failure(logger, logging.WARNING, "food_correction_refetch_failed", e, update_id=msg.update_id)
+        if surviving_ids:
+            fallback_state: dict = {
+                "domain": "food",
+                "context": {
+                    "food_log_ids": surviving_ids,
+                    "meal_food_log_ids": updated_meal_ids,
+                    "meal_type": new_meal_type,
+                    "correction_history": new_history,
+                },
+                "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
+            }
+            return [("Correction saved — quote this message to correct further.", fallback_state)]
         updated_items = []
     log_event(
         logger,
@@ -372,21 +410,19 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
         surviving_item_count=len(surviving_ids),
         meal_type=new_meal_type,
     )
-    reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
 
-    # Append the current correction text to history (capped at _MAX_HISTORY) so the next
-    # correction in this thread has full context about what B has already said.
-    new_history = (correction_history + [correction_text])[-_MAX_HISTORY:] if correction_text else correction_history
-    new_state = {
-        "domain": "food",
-        "context": {
-            "food_log_ids": surviving_ids,
-            "meal_type": new_meal_type,
-            "correction_history": new_history,
-        },
-        "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
-    }
-    return (reply, new_state)
+    if not updated_items:
+        return [(f"Done — all items removed from the {new_meal_type.replace('_', ' ')} log.", None)]
+
+    return _build_item_results(
+        updated_items,
+        [item["food_log_id"] for item in updated_items],
+        new_meal_type,
+        updated_meal_ids,
+        correction_history=new_history,
+        parent_reply_id=state["telegram_reply_message_id"],
+        deleted_count=deleted_count,
+    )
 
 
 # Formats the correction history list into a prompt section string.
@@ -416,7 +452,7 @@ def _format_history_section(history: list[str]) -> str:
 #   msg     — B's quantity reply (msg.text e.g. "150g", "2 servings")
 #   context — context dict from conversation_state (must contain file_ids list)
 # Outputs: (reply_text, pending_state) — same contract as handle_food_correction.
-def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> tuple[str, dict | None]:
+def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> list[tuple[str, dict | None]]:
     quantity_text = msg.text or msg.caption
     file_ids = context.get("file_ids") or []
 
@@ -430,10 +466,10 @@ def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> tuple[str, 
     )
 
     if not quantity_text:
-        return ("What quantity did you have? (e.g. '150g', '1 serving', 'half a bar')", None)
+        return [("What quantity did you have? (e.g. '150g', '1 serving', 'half a bar')", None)]
     if not file_ids:
         log_event(logger, logging.WARNING, "food_awaiting_quantity_no_file_ids", update_id=msg.update_id)
-        return ("Can't find the original photo — please resend it with the quantity in the caption.", None)
+        return [("Can't find the original photo — please resend it with the quantity in the caption.", None)]
 
     # Reconstruct a PHOTO message: file_id from saved state, quantity text as caption.
     # handle_food_log routes this through _handle_photo, which now has the quantity it needs.
@@ -461,7 +497,7 @@ def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> tuple[str, 
 #   msg     — B's reply (should be a PHOTO message with the clearer label)
 #   context — context dict from conversation_state (may contain original_caption)
 # Outputs: (reply_text, pending_state) — same contract as handle_food_correction.
-def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> tuple[str, dict | None]:
+def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> list[tuple[str, dict | None]]:
     original_caption = context.get("original_caption") or ""
     log_event(
         logger,
@@ -473,10 +509,10 @@ def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> tuple[
     )
 
     if msg.message_type != MessageType.PHOTO or not msg.file_id:
-        return (
+        return [(
             "Please send a clearer photo of the label — or type the nutrition values instead.",
             None,
-        )
+        )]
 
     # Combine original caption (food info B sent first) with new caption (may correct or add info).
     # Gemini resolves conflicts — e.g. "1 serving actually 2 servings" → 2 servings.
@@ -511,10 +547,11 @@ def _handle_photo_correction(
     current_items: list[dict],
     original_meal_type: str,
     state: dict,
-) -> tuple[str, dict | None]:
+) -> list[tuple[str, dict | None]]:
     food_log_ids = [item["food_log_id"] for item in current_items]
     log_event(logger, logging.INFO, "food_photo_correction_started", update_id=msg.update_id)
     context = state.get("context") or {}
+    meal_food_log_ids: list[int] = context.get("meal_food_log_ids") or food_log_ids
     correction_history: list[str] = context.get("correction_history") or []
     history_section = _format_history_section(correction_history)
 
@@ -523,7 +560,7 @@ def _handle_photo_correction(
         image_bytes = get_file_bytes(msg.file_id, token)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_correction_download_failed", e, update_id=msg.update_id)
-        return ("Couldn't download the photo — please try again.", None)
+        return [("Couldn't download the photo — please try again.", None)]
 
     logged_items_text = _format_items_for_llm(current_items)
     caption = msg.caption or msg.text or ""
@@ -541,7 +578,7 @@ def _handle_photo_correction(
         parsed = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_correction_parse_failed", e, update_id=msg.update_id)
-        return ("Couldn't read the photo — can you try again or type the correction instead?", None)
+        return [("Couldn't read the photo — can you try again or type the correction instead?", None)]
 
     new_meal_type = parsed.get("meal_type", original_meal_type)
     if new_meal_type not in _VALID_MEAL_TYPES:
@@ -556,7 +593,7 @@ def _handle_photo_correction(
         item_count=len(correction_items),
     )
     if not correction_items and new_meal_type == original_meal_type:
-        return ("Looked at the photo but couldn't see what needed changing — can you describe it in text?", None)
+        return [("Looked at the photo but couldn't see what needed changing — can you describe it in text?", None)]
 
     # Mark all photo-corrected macros as coming from a label/image re-read.
     # photo_type is returned by the vision model and is the authoritative signal —
@@ -603,32 +640,50 @@ def _handle_photo_correction(
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
             all_ids=food_log_ids,
+            meal_ids=meal_food_log_ids,
         )
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_correction_apply_failed", e, update_id=msg.update_id)
-        return ("Photo read but failed to save the correction — please try again.", None)
+        return [("Photo read but failed to save the correction — please try again.", None)]
+
+    photo_note = f"[photo correction: {caption}]" if caption else "[photo correction]"
+    new_history = (correction_history + [photo_note])[-_MAX_HISTORY:]
+    deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
+    deleted_from_batch = set(food_log_ids) - set(surviving_ids)
+    updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
     try:
         updated_items = _fetch_items(surviving_ids) if surviving_ids else []
     except Exception as e:
         log_failure(logger, logging.WARNING, "food_photo_correction_refetch_failed", e, update_id=msg.update_id)
+        if surviving_ids:
+            fallback_state: dict = {
+                "domain": "food",
+                "context": {
+                    "food_log_ids": surviving_ids,
+                    "meal_food_log_ids": updated_meal_ids,
+                    "meal_type": new_meal_type,
+                    "correction_history": new_history,
+                },
+                "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
+            }
+            return [("Correction saved — quote this message to correct further.", fallback_state)]
         updated_items = []
 
     log_event(logger, logging.INFO, "food_photo_correction_completed", update_id=msg.update_id, surviving_item_count=len(surviving_ids))
-    reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
-    # Append a note about the photo correction to history so the next correction has context.
-    photo_note = f"[photo correction: {caption}]" if caption else "[photo correction]"
-    new_history = (correction_history + [photo_note])[-_MAX_HISTORY:]
-    new_state = {
-        "domain": "food",
-        "context": {
-            "food_log_ids": surviving_ids,
-            "meal_type": new_meal_type,
-            "correction_history": new_history,
-        },
-        "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
-    }
-    return (reply, new_state)
+
+    if not updated_items:
+        return [(f"Done — all items removed from the {new_meal_type.replace('_', ' ')} log.", None)]
+
+    return _build_item_results(
+        updated_items,
+        [item["food_log_id"] for item in updated_items],
+        new_meal_type,
+        updated_meal_ids,
+        correction_history=new_history,
+        parent_reply_id=state["telegram_reply_message_id"],
+        deleted_count=deleted_count,
+    )
 
 
 # Re-estimates a single food item using the original logged entry plus the user's correction text.
@@ -683,7 +738,7 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
     sql = """
         SELECT food_log_id, food_item, meal_type,
                kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg,
-               food_meta
+               food_meta, macro_method, macro_meta
         FROM nutrition.food_log
         WHERE food_log_id = ANY(%s)
         ORDER BY food_log_id
@@ -714,6 +769,8 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
                         "sugar_g": r[8],
                         "sodium_mg": r[9],
                         "food_meta": r[10] or {},
+                        "macro_method": r[11] or "llm",
+                        "macro_meta": r[12] or {},
                     }
                     for r in rows
                 ]
@@ -724,10 +781,17 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
 # Formats current food_log rows as readable text for the correction LLM prompt.
 # Includes logged quantity from food_meta so the model can pro-rate label macros correctly
 # without needing B to repeat the quantity in the correction message.
-def _format_items_for_llm(items: list[dict]) -> str:
+def _format_items_for_llm(items: list[dict], quoted_ids: set[int] | None = None) -> str:
+    # When quoted_ids is provided (per-item correction flow), items may include the full meal
+    # for context. The quoted items are flagged so the LLM knows which items B is targeting.
     lines = []
+    if quoted_ids:
+        quoted_sorted = sorted(quoted_ids)
+        lines.append(f"Quoted target food_log_ids: {', '.join(str(i) for i in quoted_sorted)}")
     for item in items:
-        parts = [f"[id={item['food_log_id']}] {item['food_item']}"]
+        fid = item["food_log_id"]
+        target_tag = " [quoted target]" if (quoted_ids and fid in quoted_ids) else ""
+        parts = [f"[id={fid}] {item['food_item']}{target_tag}"]
         macros = []
         if item["kcal"] is not None:
             macros.append(f"{item['kcal']:.0f} kcal")
@@ -754,6 +818,7 @@ def _apply_corrections(
     new_meal_type: str,
     original_meal_type: str,
     all_ids: list[int],
+    meal_ids: list[int] | None = None,
 ) -> list[int]:
     deleted_ids: set[int] = set()
     updated_ids: set[int] = set()
@@ -805,15 +870,17 @@ def _apply_corrections(
                             )
                         updated_ids.add(fid)
 
-                # Pass 2: if meal_type changed, apply it to ALL surviving rows in one shot.
-                # This must happen even when specific items were also edited — a correction
-                # like "that was dinner, and the iced coffee was 0 sugar" must move every
-                # item in the meal to dinner, not just the one that was data-edited.
+                # Pass 2: if meal_type changed, apply it to ALL surviving meal rows in one shot.
+                # Uses meal_ids (the full batch) so "that was dinner" moves every item logged
+                # together, not just the single quoted item. Falls back to all_ids when meal_ids
+                # is not provided (e.g. old state without meal_food_log_ids).
                 surviving = [i for i in all_ids if i not in deleted_ids]
-                if new_meal_type != original_meal_type and surviving:
+                meal_scope = meal_ids if meal_ids is not None else all_ids
+                surviving_meal = [i for i in meal_scope if i not in deleted_ids]
+                if new_meal_type != original_meal_type and surviving_meal:
                     cur.execute(
                         "UPDATE nutrition.food_log SET meal_type = %s WHERE food_log_id = ANY(%s)",
-                        (new_meal_type, surviving),
+                        (new_meal_type, surviving_meal),
                     )
                 log_event(
                     logger,
@@ -828,35 +895,6 @@ def _apply_corrections(
     finally:
         conn.close()
 
-
-# Formats the correction confirmation reply.
-def _format_correction_reply(meal_type: str, items: list[dict], changes: list[dict]) -> str:
-    deleted_count = sum(1 for c in changes if c.get("action") == "delete")
-
-    if not items:
-        return f"Done — all items removed from the {meal_type.replace('_', ' ')} log."
-
-    lines = [f"Updated {meal_type.replace('_', ' ')}:"]
-    for item in items:
-        line = f"• {item.get('food_item', '?')}"
-        macros = []
-        if item.get("kcal") is not None:
-            macros.append(f"{float(item['kcal']):.0f} kcal")
-        if item.get("protein_g") is not None:
-            macros.append(f"{float(item['protein_g']):.0f}g protein")
-        if item.get("fat_g") is not None:
-            macros.append(f"{float(item['fat_g']):.0f}g fat")
-        if item.get("carbs_g") is not None:
-            macros.append(f"{float(item['carbs_g']):.0f}g carbs")
-        if macros:
-            line += " — " + ", ".join(macros)
-        lines.append(line)
-
-    if deleted_count:
-        lines.append(f"\n({deleted_count} item{'s' if deleted_count > 1 else ''} removed.)")
-
-    lines.append("\nAnything else to change?")
-    return "\n".join(lines)
 
 
 # Strips markdown code fences if the LLM wraps its response, then parses JSON.

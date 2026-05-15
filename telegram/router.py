@@ -4,7 +4,7 @@ Callback query updates are routed deterministically from callback_data, not via 
 Slash commands are routed deterministically and the command token is stripped before dispatch.
 
 Functions:
-  route(msg) — classifies intent (or resolves callback/command) and returns a reply string
+  route(msg) — classifies intent (or resolves callback/command) and returns list of (reply, state)
 """
 
 import dataclasses
@@ -93,9 +93,9 @@ Respond with only the intent name. Nothing else."""
 # Voice is transcribed before the correction check so that a quoted voice note works as a
 # correction — handle_food_correction reads msg.text, which would be None for an untranscribed voice.
 # Inputs: InboundMessage from normalizer.
-# Outputs: (reply_text, pending_state) where pending_state is non-None for loggable actions.
+# Outputs: list of (reply_text, pending_state) — one per food item for food intents, one otherwise.
 #   pending_state keys: domain, context, [parent_telegram_reply_message_id].
-def route(msg: InboundMessage) -> tuple[str, dict | None]:
+def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     log_event(
         logger,
         logging.INFO,
@@ -107,12 +107,12 @@ def route(msg: InboundMessage) -> tuple[str, dict | None]:
         quoted_message_id=msg.quoted_message_id,
     )
     if msg.message_type == MessageType.CALLBACK_QUERY:
-        return _route_callback(msg)
+        return [_route_callback(msg)]
     # Location is always deterministic — no LLM needed.
     if msg.message_type == MessageType.LOCATION:
         if msg.location:
             log_event(logger, logging.INFO, "route_location_received", update_id=msg.update_id)
-        return handle_location(msg)
+        return [handle_location(msg)]
     command_intent = _extract_command(msg)
     if command_intent is not None:
         log_event(
@@ -259,7 +259,8 @@ def _parse_intent(raw: str) -> Intent:
 
 # Checks whether a quoted bot reply has loggable conversation_state. Returns correction result or None.
 # Returning None means the quoted message has no state — fall through to normal LLM routing.
-def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
+# Food corrections return a list (one reply per item); all other domains return a single-item list.
+def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None:
     try:
         state = load_state(msg.quoted_message_id)
     except Exception as e:
@@ -276,13 +277,13 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
         return None
     domain = state.get("domain")
     if domain == "food":
-        return handle_food_correction(msg, state)
+        return handle_food_correction(msg, state)  # already returns list
     if domain == "attention":
-        return handle_attention_correction(msg, state)
+        return [handle_attention_correction(msg, state)]
     if domain == "sleep_wake":
-        return handle_sleep_wake_correction(msg, state)
+        return [handle_sleep_wake_correction(msg, state)]
     if domain == "weight":
-        return handle_weight_correction(msg, state)
+        return [handle_weight_correction(msg, state)]
     # Other domains: not implemented yet — fall through to normal routing
     log_event(
         logger,
@@ -295,22 +296,23 @@ def _try_correction(msg: InboundMessage) -> tuple[str, dict | None] | None:
 
 
 # Dispatches to the right domain handler.
-# Inputs: Intent, InboundMessage. Outputs: (reply, pending_state) from the domain handler.
-def _dispatch(intent: Intent, msg: InboundMessage) -> tuple[str, dict | None]:
+# Food logging returns a list of (reply, state) — one per item.
+# All other handlers return a single (reply, state) wrapped in a list.
+def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | None]]:
     if intent == Intent.LOG_FOOD:
-        return handle_food_log(msg)
+        return handle_food_log(msg)  # already returns list
     if intent == Intent.LOG_WEIGHT:
-        return handle_weight_log(msg)
+        return [handle_weight_log(msg)]
     if intent == Intent.LOG_SLEEP:
-        return handle_sleep_log(msg)
+        return [handle_sleep_log(msg)]
     if intent == Intent.LOG_WAKE:
-        return handle_wake_log(msg)
+        return [handle_wake_log(msg)]
     if intent == Intent.LOG_EXPENSE:
-        return handle_expense_log(msg)
+        return [handle_expense_log(msg)]
     if intent == Intent.LOG_ATTENTION:
-        return handle_attention_log(msg)
+        return [handle_attention_log(msg)]
     if intent == Intent.QUERY_DATA:
-        return handle_query_data(msg)
+        return [handle_query_data(msg)]
     if intent == Intent.ASK_GENERAL:
-        return handle_general_ask(msg)
-    return ("not sure what to do with that yet", None)
+        return [handle_general_ask(msg)]
+    return [("not sure what to do with that yet", None)]

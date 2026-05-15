@@ -9,9 +9,13 @@ Three-way macro source routing (A3) — two LLM calls per photo:
   Path 2 — macro_screenshot: macros from printed non-label source. Source provenance + gap-fill.
   Path 3 — food_image: macros estimated by LLM. USDA/OFF routing added in A4.
 
+All public handlers return list[tuple[str, dict | None]] — one (reply, state) pair per food item.
+Each item gets its own Telegram message so B can quote exactly the item she wants to correct.
+
 Functions:
-  handle_food_log(msg)                      — dispatches photo vs text
-  _handle_text_items(msg, items, extracted) — processes text items (Path 2 manual + Path 3 description)
+  handle_food_log(msg)                      — dispatches photo vs text; returns list of (reply, state)
+  _format_item_reply(meal_type, item)       — formats one item as an HTML Telegram message
+  _handle_text_items(msg, items, extracted) — processes text items; returns list of (reply, state)
   _handle_photo(msg)                        — downloads image, classifies, dispatches
   _classify_photo(image_bytes, update_id)   — Call 1: photo type classifier
   _resolve_meal_type(extracted, update_id)  — validates and defaults meal_type
@@ -27,9 +31,9 @@ Functions:
   _parse_json(raw)                          — strips code fences and parses JSON
   _to_float(val)                            — safely coerces a macro value to float
   _insert_items(items, ...)                 — inserts food_log rows, returns food_log_ids
-  _format_reply(meal_type, items, macro_method) — formats the logged reply
 """
 
+import html
 import json
 import logging
 import os
@@ -53,6 +57,17 @@ _FALLBACK_TZ = ZoneInfo("Asia/Singapore")  # used when b.latest_location has no 
 _VALID_MEAL_TYPES = {
     "breakfast", "brunch", "lunch", "snack",
     "dinner", "supper", "pre_workout", "post_workout",
+}
+
+_MEAL_LABELS: dict[str, str] = {
+    "breakfast": "Breakfast",
+    "brunch": "Brunch",
+    "lunch": "Lunch",
+    "snack": "Snack",
+    "dinner": "Dinner",
+    "supper": "Supper",
+    "pre_workout": "Pre-workout",
+    "post_workout": "Post-workout",
 }
 
 _EXTRACT_PROMPT = """\
@@ -235,10 +250,169 @@ Rules:
 """
 
 
+# Formats one logged food item as an HTML Telegram message.
+# One message per item — keeps correction quoting unambiguous (B quotes exactly the item to fix).
+# All user/LLM strings are passed through html.escape() — required for Telegram HTML parse_mode.
+#
+# Source attribution per field is read from macro_meta.field_sources when present;
+# falls back to row-level macro_method for older rows or paths that don't set field_sources.
+#
+# field_sources status → display label:
+#   zero_from_label                          → (assumed 0)
+#   from_source + source=nutrition_label     → (nutrition label)
+#   from_source + source=macro_screenshot    → (meal service label)
+#   stated_by_user                           → (you stated)
+#   gap_filled / llm_estimated               → (LLM estimate)
+#   fallback macro_method=nutrition_label    → (nutrition label)
+#   fallback macro_method=restaurant_reported → (meal service label)
+#   fallback macro_method=manual             → (you stated)
+#   fallback anything else                   → (LLM estimate)
+#
+# Null secondary macros (fibre/sugar/sodium) show "—" rather than being omitted.
+# Null sodium specifically means genuinely unknown; non-null sodium=0 means confirmed zero.
+#
+# Inputs: meal_type string, item dict with food_item, macro fields, food_meta, macro_meta.
+# Outputs: HTML-formatted string ready for Telegram parse_mode="HTML".
+def _format_item_reply(meal_type: str, item: dict) -> str:
+    meal_label = _MEAL_LABELS.get(meal_type, meal_type.replace("_", " ").title())
+    food_name = html.escape(str(item.get("food_item") or "?"))
+    lines: list[str] = [f"<b>{meal_label} · {food_name}</b>"]
+
+    # Optional subheader: brand and/or quantity from food_meta.
+    food_meta = item.get("food_meta") or {}
+    brand = food_meta.get("brand")
+    qty = food_meta.get("qty") or {}
+    subparts: list[str] = []
+    if brand:
+        subparts.append(html.escape(str(brand)))
+    if qty.get("amount") is not None:
+        unit = qty.get("unit") or ""
+        qty_str = str(qty["amount"])
+        if unit:
+            qty_str += " " + unit
+        subparts.append(html.escape(qty_str))
+    if subparts:
+        lines.append(f"<i>{' · '.join(subparts)}</i>")
+
+    lines.append("")
+
+    # Per-field source attribution.
+    macro_meta = item.get("macro_meta") or {}
+    field_sources: dict = macro_meta.get("field_sources") or {}
+    macro_method: str = item.get("macro_method") or "llm"
+
+    def _source_label(field: str) -> str:
+        fs = field_sources.get(field)
+        if fs:
+            status = fs.get("status", "")
+            source = fs.get("source", "")
+            if status == "zero_from_label":
+                return "(assumed 0)"
+            if status == "from_source":
+                if source == "nutrition_label":
+                    return "(nutrition label)"
+                if source == "macro_screenshot":
+                    return "(meal service label)"
+                return "(LLM estimate)"  # food_image and unrecognised sources
+            if status == "stated_by_user":
+                return "(you stated)"
+            if status in ("gap_filled", "llm_estimated"):
+                return "(LLM estimate)"
+        if macro_method == "nutrition_label":
+            return "(nutrition label)"
+        if macro_method == "restaurant_reported":
+            return "(meal service label)"
+        if macro_method == "manual":
+            return "(you stated)"
+        return "(LLM estimate)"
+
+    def _fmt(val) -> str | None:
+        f = _to_float(val)
+        return None if f is None else f"{f:.0f}"
+
+    # Core macros.
+    kcal = _fmt(item.get("kcal"))
+    protein = _fmt(item.get("protein_g"))
+    carbs = _fmt(item.get("carbs_g"))
+    fat = _fmt(item.get("fat_g"))
+    if kcal is not None:
+        lines.append(f"{kcal} kcal  <i>{_source_label('kcal')}</i>")
+    if protein is not None:
+        lines.append(f"{protein}g protein  <i>{_source_label('protein_g')}</i>")
+    if carbs is not None:
+        lines.append(f"{carbs}g carbs  <i>{_source_label('carbs_g')}</i>")
+    if fat is not None:
+        lines.append(f"{fat}g fat  <i>{_source_label('fat_g')}</i>")
+
+    lines.append("")
+
+    # Secondary macros — always shown; null renders as "—".
+    fibre = _fmt(item.get("fibre_g"))
+    sugar = _fmt(item.get("sugar_g"))
+    sodium_val = _to_float(item.get("sodium_mg"))
+    lines.append(
+        f"fibre: {fibre}g  <i>{_source_label('fibre_g')}</i>" if fibre is not None else "fibre: —"
+    )
+    lines.append(
+        f"sugar: {sugar}g  <i>{_source_label('sugar_g')}</i>" if sugar is not None else "sugar: —"
+    )
+    lines.append(
+        f"sodium: {_fmt(sodium_val)}mg  <i>{_source_label('sodium_mg')}</i>"
+        if sodium_val is not None else "sodium: —"
+    )
+
+    lines.append("")
+    lines.append("<i>Quote to correct.</i>")
+    return "\n".join(lines)
+
+
+# Builds the list of (reply, state) pairs from a completed insert or correction.
+# Centralises the repeated pattern shared across all four logging paths and two correction paths.
+#
+# Parameters:
+#   items              — food items (dicts) in order; must align 1-to-1 with food_log_ids.
+#   food_log_ids       — DB-assigned IDs for each item.
+#   meal_type          — meal type string stored in per-item state.
+#   meal_food_log_ids  — all IDs belonging to the meal batch (defaults to food_log_ids when None).
+#                        Stored as meal_food_log_ids in context so meal-type corrections can
+#                        move the whole batch, not just the single quoted item.
+#   correction_history — prior correction texts to carry forward in state (corrections only).
+#   parent_reply_id    — telegram_reply_message_id of the message being corrected (corrections only).
+#   deleted_count      — number of items just deleted; footnote appended to last surviving item.
+def _build_item_results(
+    items: list[dict],
+    food_log_ids: list[int],
+    meal_type: str,
+    meal_food_log_ids: list[int] | None = None,
+    *,
+    correction_history: list[str] | None = None,
+    parent_reply_id: int | None = None,
+    deleted_count: int = 0,
+) -> list[tuple[str, dict | None]]:
+    all_meal_ids = meal_food_log_ids if meal_food_log_ids is not None else list(food_log_ids)
+    results: list[tuple[str, dict | None]] = []
+    for i, (item, fid) in enumerate(zip(items, food_log_ids)):
+        reply = _format_item_reply(meal_type, item)
+        if deleted_count and i == len(items) - 1:
+            reply += f"\n\n<i>({deleted_count} item{'s' if deleted_count > 1 else ''} removed.)</i>"
+        context: dict = {
+            "food_log_ids": [fid],
+            "meal_food_log_ids": all_meal_ids,
+            "meal_type": meal_type,
+        }
+        if correction_history is not None:
+            context["correction_history"] = correction_history
+        state: dict = {"domain": "food", "context": context}
+        if parent_reply_id is not None:
+            state["parent_telegram_reply_message_id"] = parent_reply_id
+        results.append((reply, state))
+    return results
+
+
 # Dispatches a food logging request to the text or photo path.
 # Inputs: InboundMessage with text or photo.
-# Outputs: (reply string, pending_state dict | None). pending_state is non-None when items were logged.
-def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) — one per food item found.
+def handle_food_log(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     log_event(
         logger,
         logging.INFO,
@@ -254,7 +428,7 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
     text = msg.text or msg.caption
     if not text:
         log_event(logger, logging.WARNING, "food_log_missing_text", update_id=msg.update_id)
-        return ("I didn't catch what you ate — can you describe it in text?", None)
+        return [("I didn't catch what you ate — can you describe it in text?", None)]
 
     local_time = _local_time_str(msg.timestamp)
 
@@ -266,7 +440,7 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
         extracted = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_extraction_failed", e, update_id=msg.update_id)
-        return ("Couldn't parse what you ate — can you rephrase?", None)
+        return [("Couldn't parse what you ate — can you rephrase?", None)]
 
     items = extracted.get("items", [])
     log_event(
@@ -278,7 +452,7 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
     )
     if not items:
         log_event(logger, logging.WARNING, "food_extraction_empty", update_id=msg.update_id)
-        return ("Couldn't identify any food items — can you rephrase?", None)
+        return [("Couldn't identify any food items — can you rephrase?", None)]
 
     return _handle_text_items(msg, items, extracted)
 
@@ -287,12 +461,12 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
 # Items may be mixed — stated_fields is handled per-item so both paths can coexist in one message.
 # stated_fields is removed from each item before DB insert (it is not a DB column).
 # Inputs: msg, list of extracted items, full extracted dict (for meal_type and top-level provenance).
-# Outputs: (reply, state).
+# Outputs: list of (reply, state) — one per food item.
 def _handle_text_items(
     msg: InboundMessage,
     items: list[dict],
     extracted: dict,
-) -> tuple[str, dict | None]:
+) -> list[tuple[str, dict | None]]:
     _MACRO_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
 
     # Path 2: stamp stated_fields as authoritative for downstream evidence-first logic (A7).
@@ -339,7 +513,7 @@ def _handle_text_items(
         )
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_insert_failed", e, update_id=msg.update_id)
-        return ("Logged the intent but failed to save — please try again.", None)
+        return [("Logged the intent but failed to save — please try again.", None)]
 
     log_event(
         logger,
@@ -348,28 +522,25 @@ def _handle_text_items(
         update_id=msg.update_id,
         item_count=len(food_log_ids),
         meal_type=meal_type,
-        macro_method=macro_method,
     )
-    reply = _format_reply(meal_type, items, macro_method)
-    state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
-    return (reply, state)
+    return _build_item_results(items, food_log_ids, meal_type)
 
 
 # Downloads the photo, classifies it, then dispatches to the appropriate path.
 # Two LLM calls: _classify_photo (fast, one word), then path-specific extraction.
 # Inputs: InboundMessage with file_id set.
-# Outputs: (reply, state). state is None if nothing was logged.
-def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) — one per food item found.
+def _handle_photo(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     if not msg.file_id:
         log_event(logger, logging.WARNING, "food_photo_missing_file_id", update_id=msg.update_id)
-        return ("Couldn't access the photo — please try again.", None)
+        return [("Couldn't access the photo — please try again.", None)]
 
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         image_bytes = get_file_bytes(msg.file_id, token)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_download_failed", e, update_id=msg.update_id)
-        return ("Couldn't download the photo — please try again.", None)
+        return [("Couldn't download the photo — please try again.", None)]
 
     log_event(logger, logging.INFO, "food_photo_downloaded",
               update_id=msg.update_id, image_byte_count=len(image_bytes))
@@ -451,8 +622,8 @@ def _stamp_photo_provenance(items: list[dict], primary_input: str, image_macro_m
 # Path 1 — nutrition label.
 # Calls _LABEL_PROMPT, handles status responses, applies backstops and zero-from-label, inserts.
 # Inputs: msg, raw image bytes.
-# Outputs: (reply, state).
-def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) — one per item found.
+def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[str, dict | None]]:
     caption = msg.caption or ""
     local_time = _local_time_str(msg.timestamp)
 
@@ -465,7 +636,7 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, d
         extracted = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_label_extraction_failed", e, update_id=msg.update_id)
-        return ("Couldn't read the label — can you try again or type the values?", None)
+        return [("Couldn't read the label — can you try again or type the values?", None)]
 
     status = extracted.get("status")
     if status == "unreadable_label":
@@ -480,20 +651,20 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, d
                     "file_ids": [msg.file_id],
                 },
             }
-        return ("Can't read the label clearly — could you send a clearer photo, or type the values?", pending_state)
+        return [("Can't read the label clearly — could you send a clearer photo, or type the values?", pending_state)]
     if status == "needs_quantity":
         log_event(logger, logging.INFO, "food_photo_needs_quantity", update_id=msg.update_id)
-        return (
+        return [(
             "I can see the label — how much did you have? (e.g. '150g', '1 serving', 'half a bar')",
             {"domain": "food", "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]}},
-        )
+        )]
 
     items = extracted.get("items", [])
     log_event(logger, logging.INFO, "food_label_extraction_completed",
               update_id=msg.update_id, item_count=len(items))
     if not items:
         log_event(logger, logging.WARNING, "food_label_extraction_empty", update_id=msg.update_id)
-        return ("Couldn't read any values from the label — can you try again or type them?", None)
+        return [("Couldn't read any values from the label — can you try again or type them?", None)]
 
     meal_type = _resolve_meal_type(extracted, msg.update_id)
     image_macro_meta: dict = {"model": MODEL_FLASH}
@@ -508,7 +679,7 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, d
                 log_event(logger, logging.WARNING, "food_photo_label_backstop_failed",
                           update_id=msg.update_id, reason=reason,
                           food_item_chars=len(item.get("food_item") or ""))
-                return (reason, None)
+                return [(reason, None)]
 
     for item in items:
         if item.get("macro_input") == "nutrition_label":
@@ -520,19 +691,18 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, d
                                      macro_method="nutrition_label", macro_meta=image_macro_meta)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
-        return ("Logged the intent but failed to save — please try again.", None)
+        return [("Logged the intent but failed to save — please try again.", None)]
 
     log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
               item_count=len(food_log_ids), meal_type=meal_type, macro_method="nutrition_label")
-    return (_format_reply(meal_type, items, "nutrition_label"),
-            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
+    return _build_item_results(items, food_log_ids, meal_type)
 
 
 # Path 2 — macro screenshot (restaurant menu, meal plan, food app, etc.).
 # Calls _SCREENSHOT_PROMPT, records source provenance, gap-fills null fields, inserts.
 # Inputs: msg, raw image bytes.
-# Outputs: (reply, state).
-def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) — one per item found.
+def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[str, dict | None]]:
     caption = msg.caption or ""
     local_time = _local_time_str(msg.timestamp)
 
@@ -545,14 +715,14 @@ def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> t
         extracted = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_screenshot_extraction_failed", e, update_id=msg.update_id)
-        return ("Couldn't read the numbers — can you try again or type them?", None)
+        return [("Couldn't read the numbers — can you try again or type them?", None)]
 
     items = extracted.get("items", [])
     log_event(logger, logging.INFO, "food_screenshot_extraction_completed",
               update_id=msg.update_id, item_count=len(items))
     if not items:
         log_event(logger, logging.WARNING, "food_screenshot_extraction_empty", update_id=msg.update_id)
-        return ("Couldn't read any items — can you describe them in text?", None)
+        return [("Couldn't read any items — can you describe them in text?", None)]
 
     meal_type = _resolve_meal_type(extracted, msg.update_id)
     image_macro_meta: dict = {"model": MODEL_FLASH}
@@ -575,20 +745,19 @@ def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> t
                                      macro_method="restaurant_reported", macro_meta=image_macro_meta)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
-        return ("Logged the intent but failed to save — please try again.", None)
+        return [("Logged the intent but failed to save — please try again.", None)]
 
     log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
               item_count=len(food_log_ids), meal_type=meal_type, macro_method="restaurant_reported")
-    return (_format_reply(meal_type, items, "restaurant_reported"),
-            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
+    return _build_item_results(items, food_log_ids, meal_type)
 
 
 # Path 3 — food image (actual food photo, no printed macro numbers).
 # Calls _FOOD_IMAGE_PROMPT for LLM macro estimation, inserts.
 # USDA/OFF structured source routing will be added here in A4.
 # Inputs: msg, raw image bytes.
-# Outputs: (reply, state).
-def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) — one per item found.
+def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[str, dict | None]]:
     caption = msg.caption or ""
     local_time = _local_time_str(msg.timestamp)
 
@@ -601,14 +770,14 @@ def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[s
         extracted = _parse_json(raw)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_image_extraction_failed", e, update_id=msg.update_id)
-        return ("Couldn't read the photo — can you try again or describe it in text?", None)
+        return [("Couldn't read the photo — can you try again or describe it in text?", None)]
 
     items = extracted.get("items", [])
     log_event(logger, logging.INFO, "food_image_extraction_completed",
               update_id=msg.update_id, item_count=len(items))
     if not items:
         log_event(logger, logging.WARNING, "food_image_extraction_empty", update_id=msg.update_id)
-        return ("Couldn't identify any food in the photo — can you describe it in text?", None)
+        return [("Couldn't identify any food in the photo — can you describe it in text?", None)]
 
     meal_type = _resolve_meal_type(extracted, msg.update_id)
     image_macro_meta: dict = {"model": MODEL_FLASH}
@@ -620,12 +789,11 @@ def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[s
                                      macro_method="llm", macro_meta=image_macro_meta)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
-        return ("Logged the intent but failed to save — please try again.", None)
+        return [("Logged the intent but failed to save — please try again.", None)]
 
     log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
               item_count=len(food_log_ids), meal_type=meal_type, macro_method="llm")
-    return (_format_reply(meal_type, items, "llm"),
-            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
+    return _build_item_results(items, food_log_ids, meal_type)
 
 
 # Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
@@ -904,30 +1072,3 @@ def _apply_zero_from_label(item: dict) -> None:
         sources[field] = {"source": "nutrition_label", "status": "zero_from_label"}
 
 
-# Formats the reply shown to B after logging.
-def _format_reply(meal_type: str, items: list[dict], macro_method: str) -> str:
-    lines = [f"Logged for {meal_type.replace('_', ' ')}:"]
-    for item in items:
-        line = f"• {item.get('food_item', '?')}"
-        macros = []
-        if _to_float(item.get("kcal")) is not None:
-            macros.append(f"{_to_float(item['kcal']):.0f} kcal")
-        if _to_float(item.get("protein_g")) is not None:
-            macros.append(f"{_to_float(item['protein_g']):.0f}g protein")
-        if _to_float(item.get("fat_g")) is not None:
-            macros.append(f"{_to_float(item['fat_g']):.0f}g fat")
-        if _to_float(item.get("carbs_g")) is not None:
-            macros.append(f"{_to_float(item['carbs_g']):.0f}g carbs")
-        if macros:
-            line += " — " + ", ".join(macros)
-        lines.append(line)
-
-    lines.append("")
-    if macro_method == "llm":
-        lines.append("Macros estimated by LLM. Anything to change?")
-    elif macro_method in ("manual", "restaurant_reported", "nutrition_label"):
-        lines.append("Macros from source. Anything to change?")
-    else:
-        lines.append("Anything to change?")
-
-    return "\n".join(lines)
