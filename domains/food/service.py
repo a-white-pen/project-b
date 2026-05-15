@@ -1,13 +1,33 @@
 """
 Food logging domain — handles log_food intent.
 
+Three-way macro source routing (A3) — two LLM calls per photo:
+  Call 1: _classify_photo — fast one-word classifier (nutrition_label / macro_screenshot / food_image)
+  Call 2: path-specific extraction prompt (_LABEL_PROMPT / _SCREENSHOT_PROMPT / _FOOD_IMAGE_PROMPT)
+
+  Path 1 — nutrition_label: macros read from packaged food label. Backstops + zero-from-label applied.
+  Path 2 — macro_screenshot: macros from printed non-label source. Source provenance + gap-fill.
+  Path 3 — food_image: macros estimated by LLM. USDA/OFF routing added in A4.
+
 Functions:
-  handle_food_log(msg)            — extracts food items from B's message, inserts into nutrition.food_log,
-                                    returns a formatted summary of what was logged
-  _handle_photo(msg)              — handles PHOTO messages: downloads image, calls vision model,
-                                    applies label backstops and zero-from-label rule
-  _check_label_backstops(item)    — validates a nutrition_label item: rejects partial reads and row-shift mismatches
-  _apply_zero_from_label(item)    — zeros missing secondary fields when all core label fields are present
+  handle_food_log(msg)                      — dispatches photo vs text
+  _handle_text_items(msg, items, extracted) — processes text items (Path 2 manual + Path 3 description)
+  _handle_photo(msg)                        — downloads image, classifies, dispatches
+  _classify_photo(image_bytes, update_id)   — Call 1: photo type classifier
+  _resolve_meal_type(extracted, update_id)  — validates and defaults meal_type
+  _stamp_photo_provenance(items, ...)       — stamps macro_input/method/meta on extracted items
+  _handle_label_photo(msg, image_bytes)         — Path 1: label extraction + backstops + insert
+  _handle_macro_screenshot_photo(msg, image_bytes) — Path 2: screenshot extraction + gap-fill + insert
+  _handle_food_image_photo(msg, image_bytes)    — Path 3: food image extraction + insert
+  _gap_fill_macros(item, update_id)         — fills null macro fields anchored to known values
+  _check_label_backstops(item)              — validates nutrition_label item: partial read + row-shift
+  _apply_zero_from_label(item)              — zeros missing secondary fields when all core fields present
+  _get_timezone(as_of)                      — looks up B's timezone as-of a given timestamp
+  _local_time_str(as_of)                    — formats B's local time for LLM prompts
+  _parse_json(raw)                          — strips code fences and parses JSON
+  _to_float(val)                            — safely coerces a macro value to float
+  _insert_items(items, ...)                 — inserts food_log rows, returns food_log_ids
+  _format_reply(meal_type, items, macro_method) — formats the logged reply
 """
 
 import json
@@ -62,6 +82,7 @@ Extract each distinct food item mentioned. Return a JSON object with this exact 
       "fibre_g": <number or null>,
       "sugar_g": <number or null>,
       "sodium_mg": <number or null>,
+      "stated_fields": ["<field_name>", ...],
       "food_meta": {{
         "qty": {{"amount": <number>, "unit": "<string>"}},
         "prep": "<string>",
@@ -77,126 +98,144 @@ Rules:
 - macro_input: use "description" for text descriptions. Use "nutrition_label" only if user mentions a label.
 - macro_method: use "llm" since you are estimating from description.
 - Estimate macros as accurately as you can from nutritional knowledge. Only use null if truly unknowable.
+- stated_fields: list only the macro field names (from: kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg) where B explicitly gave a numeric value in the message. Empty list if B gave no explicit values. Never list estimated or inferred fields.
 - food_meta keys are optional — omit any key that is not meaningful for this item.
 - A named dish is ONE item even if it contains multiple components. "Chicken rice" = 1 item (not chicken + rice separately). "Laksa" = 1 item. Only split into multiple items when B explicitly lists separate things (e.g. "2 eggs, yoghurt, blueberries").
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
-_PHOTO_EXTRACT_PROMPT = """\
-You are extracting food log entries from a photo for a personal nutrition tracker.
+# Call 1 — single-word photo classifier. Anchored to first token.
+# Distinguishes the standardised packaged-food label format from other macro sources and food photos.
+_CLASSIFY_PROMPT = """\
+Classify this photo. Return exactly one word — nothing else.
 
-About the user: Singaporean Chinese, based between Singapore and Bangkok. \
-Eats Singaporean, Thai, and Southern Chinese food on top of regular western fare. \
-Common meals include hawker dishes (chicken rice, char kway teow, laksa, wonton noodles), \
-Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chinese food \
-(dim sum, congee, braised meats). Use this context when estimating portion sizes and macros.
+nutrition_label — the standardised nutrition facts panel printed ON packaged food \
+(government-mandated table format with rows for energy, protein, fat, carbohydrates). \
+Must include a sodium row — sodium declaration is required by law on all government-mandated panels. \
+A simplified macro display showing only 4 values (kcal/carbs/protein/fat) without sodium is \
+macro_screenshot, even if printed on the packaging.
+macro_screenshot — any other image with printed nutrition numbers: \
+restaurant menu, meal plan, app screenshot, printed flyer, or simplified meal-service macro card
+food_image — food, a meal, or anything without explicit nutrition numbers\
+"""
 
-Current local time: {local_time}
-Caption from user (may be empty): {caption}
+# Call 2a — label extraction. Only sent when classifier returns nutrition_label.
+_LABEL_PROMPT = """\
+Extract nutrition values from this packaged food label.
 
-IMPORTANT: Return ALL text fields (food_item, prep, brand, notes) in English, \
-regardless of the language in the photo or caption.
+Caption: {caption}
+Time: {local_time}
 
-Step 1 — determine photo type:
-- nutrition_label: photo shows a nutrition facts panel, packaging label, or nutrition information table
-- food_image: photo shows actual food, a plate, a dish, or a meal
-
-============================================================
-If photo_type is nutrition_label, follow Steps 2A → 2B → 2C:
-============================================================
-
-Step 2A — legibility check (do this FIRST):
-Can you clearly read the nutrition values on this label? If the label is blurry, angled,
-partially cut off, or any key values are illegible, return immediately — do not attempt extraction:
+A — Legibility: if the label is blurry, angled, or key values are illegible, return:
 {{"status": "unreadable_label"}}
 
-Step 2B — quantity check:
-Is there a clear, unambiguous quantity in the caption?
-Clear quantities: "150g", "30g", "2 servings", "half a bar", "1 cup", "200ml", "3 pieces".
-If the quantity is missing, unclear, or you are in ANY doubt — return immediately:
+B — Quantity: if no clear quantity is in the caption, return:
 {{"status": "needs_quantity"}}
-When in doubt, ask — do not guess.
+Clear quantities: "150g", "2 servings", "1 cup", "200ml". When in doubt, ask — do not guess.
 
-Step 2C — read and scale the values:
-Nutrition labels may be in English, Thai, Simplified Chinese, or Traditional Chinese.
-Return all numeric values in standard units (kcal, grams, milligrams).
+C — Read and scale.
+Supported languages: English, Thai, Simplified Chinese, Traditional Chinese.
+Thai row order (top→bottom): energy → fat → sat.fat → cholesterol → sodium → carbs → fibre → sugars → protein. PROTEIN IS NEAR THE BOTTOM.
+Simplified Chinese: 能量 (kJ — divide by 4.184 for kcal), 蛋白质, 脂肪, 碳水化合物, 钠
+Traditional Chinese: 蛋白質, 脂肪, 碳水化合物, 鈉
 
-Thai labels list rows TOP-TO-BOTTOM in this order:
-  พลังงาน (energy/kcal), ไขมันทั้งหมด (total fat), ไขมันอิ่มตัว (saturated fat),
-  คอเลสเตอรอล (cholesterol), โซเดียม (sodium), คาร์โบไฮเดรต (carbohydrates),
-  ใยอาหาร (dietary fibre), น้ำตาล (sugars), โปรตีน (protein).
-  PROTEIN IS NEAR THE BOTTOM — do not confuse it with rows near the top.
+Read: kcal, protein_g, carbs_g, fat_g, and if shown: fibre_g, sugar_g, sodium_mg.
+Scale by quantity: (qty consumed ÷ serving size) × per-serving values.
+If caption mentions food not visible in the label photo, include as separate items \
+with macro_input="description", macro_method="llm".
 
-Simplified Chinese labels (mainland China):
-  能量 (energy), 蛋白质 (protein), 脂肪 (fat), 碳水化合物 (carbohydrates), 钠 (sodium).
-  Often use kJ — convert to kcal: divide by 4.184.
-
-Traditional Chinese labels (Hong Kong / Taiwan):
-  蛋白質 (protein), 脂肪 (fat), 碳水化合物 (carbohydrates), 鈉 (sodium).
-  Taiwan labels often show values per 100g. HK labels follow UK/EU format.
-
-Read: energy (kcal), protein (g), total carbohydrates (g), total fat (g),
-and if present: dietary fibre (g), sugars (g), sodium (mg).
-Scale the values by the quantity: (quantity consumed / serving size) × per-serving values.
-Set macro_input="nutrition_label", macro_method="nutrition_label" for this item.
-
-========================================
-If photo_type is food_image, follow Step 3:
-========================================
-
-Step 3 — food image extraction:
-- Identify each distinct food item visible in the image
-- Use the caption for additional context (dish name, portion size, extras)
-- Estimate portion sizes from visual cues, plate size, and typical serving sizes for this cuisine
-- Estimate macros for each item
-- Set macro_input="image", macro_method="llm" for these items
-
-============================================================
-For all photo types — Step 4 — caption-only items:
-============================================================
-
-If the caption mentions food items NOT visible in the image, extract those too.
-Set macro_input="description", macro_method="llm" for caption-only items.
-Do not double-count items already extracted from the image.
-
-Return a JSON object with this exact structure:
+Return JSON:
 {{
-  "photo_type": "<nutrition_label or food_image>",
-  "meal_type": "<one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout>",
-  "macro_input": "<nutrition_label or image — top-level fallback for items missing their own>",
-  "macro_method": "<nutrition_label or llm — top-level fallback>",
-  "items": [
-    {{
-      "food_item": "<description in English>",
-      "kcal": <number or null>,
-      "protein_g": <number or null>,
-      "carbs_g": <number or null>,
-      "fat_g": <number or null>,
-      "fibre_g": <number or null>,
-      "sugar_g": <number or null>,
-      "sodium_mg": <number or null>,
-      "macro_input": "<nutrition_label, image, or description — per item>",
-      "macro_method": "<nutrition_label or llm — per item>",
-      "food_meta": {{
-        "qty": {{"amount": <number>, "unit": "<string>"}},
-        "prep": "<string in English>",
-        "brand": "<string in English>",
-        "notes": "<string in English>"
-      }}
-    }}
-  ]
+  "meal_type": "<breakfast|brunch|lunch|snack|dinner|supper|pre_workout|post_workout>",
+  "items": [{{
+    "food_item": "<name in English>",
+    "kcal": <number or null>, "protein_g": <number or null>, "carbs_g": <number or null>,
+    "fat_g": <number or null>, "fibre_g": <number or null>, "sugar_g": <number or null>,
+    "sodium_mg": <number or null>,
+    "macro_input": "nutrition_label", "macro_method": "nutrition_label",
+    "food_meta": {{"qty": {{"amount": <number>, "unit": "<string>"}}, "brand": "<string>"}}
+  }}]
 }}
+All text in English. Valid JSON only. No markdown.\
+"""
+
+# Call 2b — macro screenshot extraction. Only sent when classifier returns macro_screenshot.
+_SCREENSHOT_PROMPT = """\
+Read the printed nutrition numbers from this image.
+
+Caption: {caption}
+Time: {local_time}
+
+Read only values explicitly printed. Return null for anything not shown — do not estimate.
+If multiple food items are shown, extract each separately.
+If caption mentions food not visible in the image, include as separate items \
+with macro_input="description", macro_method="llm".
+
+Return JSON:
+{{
+  "meal_type": "<breakfast|brunch|lunch|snack|dinner|supper|pre_workout|post_workout>",
+  "items": [{{
+    "food_item": "<name in English>",
+    "kcal": <number or null>, "protein_g": <number or null>, "carbs_g": <number or null>,
+    "fat_g": <number or null>, "fibre_g": <number or null>, "sugar_g": <number or null>,
+    "sodium_mg": <number or null>,
+    "macro_input": "macro_screenshot", "macro_method": "restaurant_reported",
+    "food_meta": {{"qty": {{"amount": <number>, "unit": "<string>"}}, "brand": "<string>"}}
+  }}]
+}}
+All text in English. Valid JSON only. No markdown.\
+"""
+
+# Call 2c — food image extraction. Only sent when classifier returns food_image.
+_FOOD_IMAGE_PROMPT = """\
+Identify food and estimate macros from this photo.
+
+Caption: {caption}
+Time: {local_time}
+User: Singaporean Chinese, based between Singapore and Bangkok. \
+Common meals: chicken rice, char kway teow, laksa, pad kra pao, moo ping, khao soi, \
+dim sum, congee, braised meats.
+
+Identify each distinct food item visible. Use caption for dish name, portion, and extras. \
+Estimate portion sizes and macros.
+If caption mentions food not visible in the image, include as separate items \
+with macro_input="description", macro_method="llm".
+
+Return JSON:
+{{
+  "meal_type": "<breakfast|brunch|lunch|snack|dinner|supper|pre_workout|post_workout>",
+  "items": [{{
+    "food_item": "<name in English>",
+    "kcal": <number or null>, "protein_g": <number or null>, "carbs_g": <number or null>,
+    "fat_g": <number or null>, "fibre_g": <number or null>, "sugar_g": <number or null>,
+    "sodium_mg": <number or null>,
+    "macro_input": "image", "macro_method": "llm",
+    "food_meta": {{"qty": {{"amount": <number>, "unit": "<string>"}}, "prep": "<string>", "notes": "<string>"}}
+  }}]
+}}
+All text in English. Valid JSON only. No markdown.\
+"""
+
+_GAP_FILL_PROMPT = """\
+You are filling in missing nutrition fields for a food log entry.
+
+Food item: {food_item}
+
+Known values — these are exact and authoritative. Do not change them:
+{known_lines}
+
+Estimate ONLY these missing fields: {missing_list}
 
 Rules:
-- meal_type: infer from local time if not stated in caption
-- Each item carries its own macro_input and macro_method — these override the top-level fields
-- food_meta keys are optional — omit if not meaningful for this item
-- All text fields must be in English
-- Return valid JSON only. No explanation, no markdown, no code blocks.\
+- If kcal is known, your estimates for protein, carbs, and fat must be consistent with it: \
+4 kcal/g protein, 4 kcal/g carbs, 9 kcal/g fat.
+- Use nutritional knowledge anchored to the known values — not free estimation.
+- Return only the missing fields as a JSON object. Do not include the known fields.
+- All values as numbers. No null values. No explanation. No markdown.\
 """
 
 
-# Handles a food logging request from B.
+# Dispatches a food logging request to the text or photo path.
 # Inputs: InboundMessage with text or photo.
 # Outputs: (reply string, pending_state dict | None). pending_state is non-None when items were logged.
 def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
@@ -241,6 +280,39 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
         log_event(logger, logging.WARNING, "food_extraction_empty", update_id=msg.update_id)
         return ("Couldn't identify any food items — can you rephrase?", None)
 
+    return _handle_text_items(msg, items, extracted)
+
+
+# Processes extracted text items for both Path 2 (manual/stated macros) and Path 3 (LLM description).
+# Items may be mixed — stated_fields is handled per-item so both paths can coexist in one message.
+# stated_fields is removed from each item before DB insert (it is not a DB column).
+# Inputs: msg, list of extracted items, full extracted dict (for meal_type and top-level provenance).
+# Outputs: (reply, state).
+def _handle_text_items(
+    msg: InboundMessage,
+    items: list[dict],
+    extracted: dict,
+) -> tuple[str, dict | None]:
+    _MACRO_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+
+    # Path 2: stamp stated_fields as authoritative for downstream evidence-first logic (A7).
+    # Items with no stated_fields are Path 3 — LLM estimation, no change needed here.
+    for item in items:
+        stated = item.pop("stated_fields", None) or []
+        if stated:
+            item["macro_input"] = "manual"
+            item["macro_method"] = "manual"
+            item.setdefault("macro_meta", {"model": MODEL_FLASH})
+            field_sources = item["macro_meta"].setdefault("field_sources", {})
+            for field in _MACRO_FIELDS:
+                if item.get(field) is not None:
+                    if field in stated:
+                        field_sources[field] = {"status": "stated_by_user"}
+                    else:
+                        # Field was estimated by the extraction LLM (not stated by B).
+                        # Record provenance so analytics can distinguish stated vs estimated fields.
+                        field_sources[field] = {"status": "llm_estimated", "model": MODEL_FLASH}
+
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
         log_event(
@@ -283,9 +355,10 @@ def handle_food_log(msg: InboundMessage) -> tuple[str, dict | None]:
     return (reply, state)
 
 
-# Handles a food photo — nutrition label or food image.
-# Downloads the image, sends to Gemini vision with caption for full context.
-# Returns (reply, state). state is None if nothing was logged (needs_quantity, errors).
+# Downloads the photo, classifies it, then dispatches to the appropriate path.
+# Two LLM calls: _classify_photo (fast, one word), then path-specific extraction.
+# Inputs: InboundMessage with file_id set.
+# Outputs: (reply, state). state is None if nothing was logged.
 def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
     if not msg.file_id:
         log_event(logger, logging.WARNING, "food_photo_missing_file_id", update_id=msg.update_id)
@@ -298,34 +371,105 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         log_failure(logger, logging.ERROR, "food_photo_download_failed", e, update_id=msg.update_id)
         return ("Couldn't download the photo — please try again.", None)
 
-    log_event(
-        logger,
-        logging.INFO,
-        "food_photo_downloaded",
-        update_id=msg.update_id,
-        image_byte_count=len(image_bytes),
-    )
+    log_event(logger, logging.INFO, "food_photo_downloaded",
+              update_id=msg.update_id, image_byte_count=len(image_bytes))
 
+    photo_type = _classify_photo(image_bytes, msg.update_id)
+
+    if photo_type == "nutrition_label":
+        return _handle_label_photo(msg, image_bytes)
+    elif photo_type == "macro_screenshot":
+        return _handle_macro_screenshot_photo(msg, image_bytes)
+    else:
+        return _handle_food_image_photo(msg, image_bytes)
+
+
+# Classifies a photo as nutrition_label, macro_screenshot, or food_image.
+# Fast vision call — model returns one word. Anchored to first token for robustness.
+# Falls back to food_image on error or unrecognised response.
+# Inputs: image bytes, update_id for logging.
+# Outputs: "nutrition_label", "macro_screenshot", or "food_image".
+def _classify_photo(image_bytes: bytes, update_id: int | None) -> str:
+    _VALID = {"nutrition_label", "macro_screenshot", "food_image"}
+    try:
+        raw = generate_with_image(
+            image_bytes=image_bytes,
+            prompt=_CLASSIFY_PROMPT,
+            model=MODEL_FLASH,
+        ).strip().lower()
+        _ALIASES: dict[str, str] = {"restaurant_reported": "macro_screenshot"}
+        first_word = raw.split()[0].strip(".,;:!?\"'") if raw.split() else ""
+        first_word = _ALIASES.get(first_word, first_word)
+        photo_type = first_word if first_word in _VALID else "food_image"
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "food_photo_classify_failed", e, update_id=update_id)
+        photo_type = "food_image"
+    log_event(logger, logging.INFO, "food_photo_classified",
+              update_id=update_id, photo_type=photo_type)
+    return photo_type
+
+
+# Resolves and validates meal_type from extracted JSON, defaulting to "snack".
+# Inputs: extracted dict (must have "meal_type" key), update_id for logging.
+# Outputs: validated meal_type string (always a member of _VALID_MEAL_TYPES).
+def _resolve_meal_type(extracted: dict, update_id: int | None) -> str:
+    meal_type = extracted.get("meal_type", "snack")
+    if meal_type not in _VALID_MEAL_TYPES:
+        log_event(logger, logging.WARNING, "food_photo_invalid_meal_type",
+                  update_id=update_id, meal_type=meal_type)
+        meal_type = "snack"
+    return meal_type
+
+
+# Stamps macro_input, macro_method, and macro_meta on each item in a photo batch.
+# Items that already have these keys are left unchanged — per-item values take priority.
+# primary_input is the expected macro_input for image-sourced items in this path.
+# caption-only items (macro_input="description") get a plain macro_meta without file_id.
+# Inputs: items list (modified in-place), primary_input string, image_macro_meta dict.
+# Outputs: None (modifies items in-place).
+def _stamp_photo_provenance(items: list[dict], primary_input: str, image_macro_meta: dict) -> None:
+    # Map each macro_input value to its correct macro_method default.
+    # Used as fallback when the LLM omits macro_method from an item — prevents label and
+    # screenshot items from being silently stored as macro_method="llm".
+    _METHOD_FOR_INPUT: dict[str, str] = {
+        "nutrition_label": "nutrition_label",
+        "macro_screenshot": "restaurant_reported",
+        "image": "llm",
+        "description": "llm",
+    }
+    caption_macro_meta: dict = {"model": image_macro_meta.get("model", MODEL_FLASH)}
+    for item in items:
+        if "macro_input" not in item:
+            item["macro_input"] = primary_input
+        if "macro_method" not in item:
+            item["macro_method"] = _METHOD_FOR_INPUT.get(item["macro_input"], "llm")
+        if "macro_meta" not in item:
+            base = caption_macro_meta if item["macro_input"] == "description" else image_macro_meta
+            item["macro_meta"] = dict(base)
+
+
+# Path 1 — nutrition label.
+# Calls _LABEL_PROMPT, handles status responses, applies backstops and zero-from-label, inserts.
+# Inputs: msg, raw image bytes.
+# Outputs: (reply, state).
+def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
     caption = msg.caption or ""
     local_time = _local_time_str(msg.timestamp)
 
     try:
         raw = generate_with_image(
             image_bytes=image_bytes,
-            prompt=_PHOTO_EXTRACT_PROMPT.format(local_time=local_time, caption=caption),
+            prompt=_LABEL_PROMPT.format(caption=caption, local_time=local_time),
             model=MODEL_FLASH,
         )
         extracted = _parse_json(raw)
     except Exception as e:
-        log_failure(logger, logging.ERROR, "food_photo_extraction_failed", e, update_id=msg.update_id)
-        return ("Couldn't read the photo — can you try again or describe it in text?", None)
+        log_failure(logger, logging.ERROR, "food_label_extraction_failed", e, update_id=msg.update_id)
+        return ("Couldn't read the label — can you try again or type the values?", None)
 
-    # Handle early-return status responses from the label flow (Steps 2A and 2B).
     status = extracted.get("status")
     if status == "unreadable_label":
         log_event(logger, logging.INFO, "food_photo_label_unreadable", update_id=msg.update_id)
-        # Save state only when there is a caption worth preserving — so B does not have to retype
-        # the quantity or food name when resending a clearer photo.
         pending_state = None
         if msg.caption:
             pending_state = {
@@ -339,126 +483,149 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         return ("Can't read the label clearly — could you send a clearer photo, or type the values?", pending_state)
     if status == "needs_quantity":
         log_event(logger, logging.INFO, "food_photo_needs_quantity", update_id=msg.update_id)
-        # Save state so B can reply with just the quantity — correction handler re-downloads
-        # the photo and re-runs extraction without B needing to resend.
-        pending_state = {
-            "domain": "food",
-            "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]},
-        }
         return (
             "I can see the label — how much did you have? (e.g. '150g', '1 serving', 'half a bar')",
-            pending_state,
+            {"domain": "food", "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]}},
         )
 
     items = extracted.get("items", [])
-    log_event(
-        logger,
-        logging.INFO,
-        "food_photo_extraction_completed",
-        update_id=msg.update_id,
-        photo_type=extracted.get("photo_type"),
-        item_count=len(items),
-    )
+    log_event(logger, logging.INFO, "food_label_extraction_completed",
+              update_id=msg.update_id, item_count=len(items))
     if not items:
-        log_event(logger, logging.WARNING, "food_photo_extraction_empty", update_id=msg.update_id)
-        return ("Couldn't identify any food in the photo — can you describe it in text?", None)
+        log_event(logger, logging.WARNING, "food_label_extraction_empty", update_id=msg.update_id)
+        return ("Couldn't read any values from the label — can you try again or type them?", None)
 
-    meal_type = extracted.get("meal_type", "snack")
-    if meal_type not in _VALID_MEAL_TYPES:
-        log_event(
-            logger,
-            logging.WARNING,
-            "food_photo_invalid_meal_type",
-            update_id=msg.update_id,
-            meal_type=meal_type,
-        )
-        meal_type = "snack"
-
-    # Top-level macro_input/macro_method are the fallback for items that don't carry their own.
-    # Items extracted from the caption (not the image) carry macro_input="description" per-item.
-    top_macro_input = extracted.get("macro_input", "image")
-    top_macro_method = extracted.get("macro_method", "llm")
-
-    # Stamp each item with its own provenance, falling back to the top-level value.
-    # This ensures caption-only items are recorded as "description/llm", not "nutrition_label".
-    # macro_meta is also per-item: image items include the Telegram file_id when applicable,
-    # but caption-only items must NOT inherit that file_id (their macro_method is "llm", not
-    # "nutrition_label", so the schema contract for macro_meta is different).
+    meal_type = _resolve_meal_type(extracted, msg.update_id)
     image_macro_meta: dict = {"model": MODEL_FLASH}
-    if top_macro_input == "nutrition_label" and msg.file_id:
+    if msg.file_id:
         image_macro_meta["file_id"] = msg.file_id
-    caption_macro_meta: dict = {"model": MODEL_FLASH}
+    _stamp_photo_provenance(items, "nutrition_label", image_macro_meta)
 
-    for item in items:
-        if "macro_input" not in item:
-            item["macro_input"] = top_macro_input
-        if "macro_method" not in item:
-            item["macro_method"] = top_macro_method
-        # Each item gets its own copy of the macro_meta dict so backstops and zero-from-label
-        # can write per-item field_sources without mutating the shared template.
-        if "macro_meta" not in item:
-            base = caption_macro_meta if item["macro_input"] == "description" else image_macro_meta
-            item["macro_meta"] = dict(base)
-
-    # Apply label backstops to every nutrition_label item before touching the DB.
-    # If any item fails, return an error — do not log partial results.
     for item in items:
         if item.get("macro_input") == "nutrition_label":
             ok, reason = _check_label_backstops(item)
             if not ok:
-                log_event(
-                    logger, logging.WARNING, "food_photo_label_backstop_failed",
-                    update_id=msg.update_id, reason=reason,
-                    food_item_chars=len(item.get("food_item") or ""),
-                )
+                log_event(logger, logging.WARNING, "food_photo_label_backstop_failed",
+                          update_id=msg.update_id, reason=reason,
+                          food_item_chars=len(item.get("food_item") or ""))
                 return (reason, None)
 
-    # Apply zero-from-label rule: if all four core fields are present on a label item,
-    # zero-fill any missing secondary fields (fibre_g, sugar_g, sodium_mg) and record
-    # which fields were zeroed in macro_meta["field_sources"] for provenance.
     for item in items:
         if item.get("macro_input") == "nutrition_label":
             _apply_zero_from_label(item)
 
-    # Batch-level macro_meta is the image meta — used as the fallback in _insert_items
-    # for any item that somehow still lacks a per-item override (defensive only).
-    macro_meta = image_macro_meta
-
-    log_event(
-        logger,
-        logging.INFO,
-        "food_photo_provenance",
-        update_id=msg.update_id,
-        image_items=sum(1 for i in items if i.get("macro_input") in ("nutrition_label", "image")),
-        caption_items=sum(1 for i in items if i.get("macro_input") == "description"),
-    )
-
     try:
-        food_log_ids = _insert_items(
-            items=items,
-            meal_type=meal_type,
-            update_id=msg.update_id,
-            source="telegram",
-            macro_input=top_macro_input,
-            macro_method=top_macro_method,
-            macro_meta=macro_meta,
-        )
+        food_log_ids = _insert_items(items=items, meal_type=meal_type, update_id=msg.update_id,
+                                     source="telegram", macro_input="nutrition_label",
+                                     macro_method="nutrition_label", macro_meta=image_macro_meta)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
         return ("Logged the intent but failed to save — please try again.", None)
 
-    log_event(
-        logger,
-        logging.INFO,
-        "food_photo_inserted",
-        update_id=msg.update_id,
-        item_count=len(food_log_ids),
-        meal_type=meal_type,
-        macro_method=top_macro_method,
-    )
-    reply = _format_reply(meal_type, items, top_macro_method)
-    state = {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}}
-    return (reply, state)
+    log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
+              item_count=len(food_log_ids), meal_type=meal_type, macro_method="nutrition_label")
+    return (_format_reply(meal_type, items, "nutrition_label"),
+            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
+
+
+# Path 2 — macro screenshot (restaurant menu, meal plan, food app, etc.).
+# Calls _SCREENSHOT_PROMPT, records source provenance, gap-fills null fields, inserts.
+# Inputs: msg, raw image bytes.
+# Outputs: (reply, state).
+def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
+    caption = msg.caption or ""
+    local_time = _local_time_str(msg.timestamp)
+
+    try:
+        raw = generate_with_image(
+            image_bytes=image_bytes,
+            prompt=_SCREENSHOT_PROMPT.format(caption=caption, local_time=local_time),
+            model=MODEL_FLASH,
+        )
+        extracted = _parse_json(raw)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "food_screenshot_extraction_failed", e, update_id=msg.update_id)
+        return ("Couldn't read the numbers — can you try again or type them?", None)
+
+    items = extracted.get("items", [])
+    log_event(logger, logging.INFO, "food_screenshot_extraction_completed",
+              update_id=msg.update_id, item_count=len(items))
+    if not items:
+        log_event(logger, logging.WARNING, "food_screenshot_extraction_empty", update_id=msg.update_id)
+        return ("Couldn't read any items — can you describe them in text?", None)
+
+    meal_type = _resolve_meal_type(extracted, msg.update_id)
+    image_macro_meta: dict = {"model": MODEL_FLASH}
+    if msg.file_id:
+        image_macro_meta["file_id"] = msg.file_id
+    _stamp_photo_provenance(items, "macro_screenshot", image_macro_meta)
+
+    _MACRO_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+    for item in items:
+        if item.get("macro_input") == "macro_screenshot":
+            field_sources = item["macro_meta"].setdefault("field_sources", {})
+            for field in _MACRO_FIELDS:
+                if item.get(field) is not None:
+                    field_sources[field] = {"status": "from_source", "source": "macro_screenshot"}
+            _gap_fill_macros(item, msg.update_id)
+
+    try:
+        food_log_ids = _insert_items(items=items, meal_type=meal_type, update_id=msg.update_id,
+                                     source="telegram", macro_input="macro_screenshot",
+                                     macro_method="restaurant_reported", macro_meta=image_macro_meta)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
+        return ("Logged the intent but failed to save — please try again.", None)
+
+    log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
+              item_count=len(food_log_ids), meal_type=meal_type, macro_method="restaurant_reported")
+    return (_format_reply(meal_type, items, "restaurant_reported"),
+            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
+
+
+# Path 3 — food image (actual food photo, no printed macro numbers).
+# Calls _FOOD_IMAGE_PROMPT for LLM macro estimation, inserts.
+# USDA/OFF structured source routing will be added here in A4.
+# Inputs: msg, raw image bytes.
+# Outputs: (reply, state).
+def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> tuple[str, dict | None]:
+    caption = msg.caption or ""
+    local_time = _local_time_str(msg.timestamp)
+
+    try:
+        raw = generate_with_image(
+            image_bytes=image_bytes,
+            prompt=_FOOD_IMAGE_PROMPT.format(caption=caption, local_time=local_time),
+            model=MODEL_FLASH,
+        )
+        extracted = _parse_json(raw)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "food_image_extraction_failed", e, update_id=msg.update_id)
+        return ("Couldn't read the photo — can you try again or describe it in text?", None)
+
+    items = extracted.get("items", [])
+    log_event(logger, logging.INFO, "food_image_extraction_completed",
+              update_id=msg.update_id, item_count=len(items))
+    if not items:
+        log_event(logger, logging.WARNING, "food_image_extraction_empty", update_id=msg.update_id)
+        return ("Couldn't identify any food in the photo — can you describe it in text?", None)
+
+    meal_type = _resolve_meal_type(extracted, msg.update_id)
+    image_macro_meta: dict = {"model": MODEL_FLASH}
+    _stamp_photo_provenance(items, "image", image_macro_meta)
+
+    try:
+        food_log_ids = _insert_items(items=items, meal_type=meal_type, update_id=msg.update_id,
+                                     source="telegram", macro_input="image",
+                                     macro_method="llm", macro_meta=image_macro_meta)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "food_photo_insert_failed", e, update_id=msg.update_id)
+        return ("Logged the intent but failed to save — please try again.", None)
+
+    log_event(logger, logging.INFO, "food_photo_inserted", update_id=msg.update_id,
+              item_count=len(food_log_ids), meal_type=meal_type, macro_method="llm")
+    return (_format_reply(meal_type, items, "llm"),
+            {"domain": "food", "context": {"food_log_ids": food_log_ids, "meal_type": meal_type}})
 
 
 # Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
@@ -608,6 +775,67 @@ def _insert_items(
     return ids
 
 
+# Fills null macro fields for a macro_screenshot item using a constrained LLM call.
+# Known non-null fields (read from the printed source) are passed to the LLM as fixed
+# constraints; only null fields are estimated. Never overwrites non-null values.
+# Text items with stated_fields do not call this — the extraction LLM already estimated
+# all fields in the same pass, so a second call would be redundant.
+# Records each gap-filled field in item["macro_meta"]["field_sources"] for provenance.
+# Inputs: item dict (modified in-place), update_id for logging.
+# Outputs: None (modifies item in-place).
+def _gap_fill_macros(item: dict, update_id: int | None) -> None:
+    _ALL_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+
+    known = {f: _to_float(item.get(f)) for f in _ALL_FIELDS if item.get(f) is not None}
+    missing = [f for f in _ALL_FIELDS if item.get(f) is None]
+
+    if not missing:
+        return  # nothing to fill
+    if not known:
+        # No anchors — cannot do constrained estimation. Leave nulls as-is.
+        log_event(logger, logging.WARNING, "food_gap_fill_no_anchors", update_id=update_id)
+        return
+
+    known_lines = "\n".join(f"  {f}: {v}" for f, v in known.items())
+    missing_list = ", ".join(missing)
+
+    try:
+        raw = generate_text(
+            _GAP_FILL_PROMPT.format(
+                food_item=item.get("food_item", "unknown food"),
+                known_lines=known_lines,
+                missing_list=missing_list,
+            ),
+            model=MODEL_FLASH,
+        )
+        filled = _parse_json(raw)
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "food_gap_fill_failed", e, update_id=update_id)
+        return
+
+    # Apply only the fields that were requested and returned as valid numbers.
+    # Never overwrite non-null values — the known fields are authoritative.
+    meta = item.setdefault("macro_meta", {"model": MODEL_FLASH})
+    field_sources = meta.setdefault("field_sources", {})
+    filled_count = 0
+    for field in missing:
+        val = _to_float(filled.get(field))
+        if val is not None and item.get(field) is None:
+            item[field] = val
+            field_sources[field] = {"status": "gap_filled", "model": MODEL_FLASH}
+            filled_count += 1
+
+    log_event(
+        logger,
+        logging.INFO,
+        "food_gap_fill_completed",
+        update_id=update_id,
+        known_count=len(known),
+        requested_count=len(missing),
+        filled_count=filled_count,
+    )
+
+
 # Validates extracted nutrition label values before DB insert.
 # Returns (True, "") if valid, or (False, user-facing error message) if validation fails.
 #
@@ -697,6 +925,8 @@ def _format_reply(meal_type: str, items: list[dict], macro_method: str) -> str:
     lines.append("")
     if macro_method == "llm":
         lines.append("Macros estimated by LLM. Anything to change?")
+    elif macro_method in ("manual", "restaurant_reported", "nutrition_label"):
+        lines.append("Macros from source. Anything to change?")
     else:
         lines.append("Anything to change?")
 

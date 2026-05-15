@@ -136,7 +136,7 @@ If the photo is unrelated to a logged item, omit that item.
 
 Return a JSON object with this exact structure:
 {{
-  "photo_type": "<nutrition_label or food_image>",
+  "photo_type": "<nutrition_label or macro_screenshot or food_image>",
   "meal_type": "<meal type — use original if unchanged>",
   "items": [
     {{
@@ -155,7 +155,9 @@ Return a JSON object with this exact structure:
 }}
 
 Rules:
-- photo_type: "nutrition_label" if the image shows a nutrition facts panel or packaging label; "food_image" otherwise
+- photo_type: "nutrition_label" if government-mandated nutrition facts panel with a sodium row; \
+"macro_screenshot" if printed nutrition numbers from a non-panel source (restaurant menu, meal \
+service card, app screenshot, simplified macro display without sodium); "food_image" otherwise
 - For fields not changed, OMIT the key entirely — do NOT include null
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
@@ -488,6 +490,17 @@ def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> tuple[
     return handle_food_log(photo_msg)
 
 
+# Maps photo_type returned by the vision model to (macro_input, macro_method) for DB provenance.
+# "nutrition_label" — government-mandated panel: both input and method are "nutrition_label"
+# "macro_screenshot" — restaurant menu, meal service card, simplified macro display: "restaurant_reported"
+# "food_image" — food photo, no numbers: "image" input, "llm" method
+_PHOTO_TYPE_PROVENANCE: dict[str, tuple[str, str]] = {
+    "nutrition_label": ("nutrition_label", "nutrition_label"),
+    "macro_screenshot": ("macro_screenshot", "restaurant_reported"),
+    "food_image": ("image", "llm"),
+}
+
+
 # Handles a photo-based correction — re-reads macros from an image B attached to the correction.
 # Called when the correction message has a photo (e.g. a clearer label photo or food image).
 # Downloads the image, asks the vision model to correct the logged items, then applies changes.
@@ -550,20 +563,39 @@ def _handle_photo_correction(
     # do NOT infer from caption presence (a label photo can arrive with or without a caption).
     # macro_meta shape follows the schema contract: nutrition_label rows must include file_id.
     photo_type = parsed.get("photo_type", "food_image")
-    is_label = photo_type == "nutrition_label"
+    macro_input, macro_method = _PHOTO_TYPE_PROVENANCE.get(photo_type, ("image", "llm"))
     correction_meta: dict = {
         "model": MODEL_FLASH,
         "correction_source": "photo",
         "photo_type": photo_type,
         "correction_update_id": msg.update_id,
     }
-    if is_label and msg.file_id:
+    if photo_type in ("nutrition_label", "macro_screenshot") and msg.file_id:
         correction_meta["file_id"] = msg.file_id
+
+    # P1a fix: only change row-level macro_input/macro_method if all four core macros are
+    # present in the correction. A partial photo read (e.g. only kcal + protein returned)
+    # should not re-stamp the row as nutrition_label/restaurant_reported — that would claim
+    # the old LLM-estimated carbs/fat came from the photo source, which is false.
+    # When partial, provenance is tracked at field level via field_sources only.
+    _CORE_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g")
+    _MACRO_FIELDS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
     for item in correction_items:
         if item.get("action") != "delete":
-            item["_macro_input"] = "nutrition_label" if is_label else "image"
-            item["_macro_method"] = "nutrition_label" if is_label else "llm"
-            item["_macro_meta"] = correction_meta
+            all_core_present = all(
+                field in item and item[field] is not None for field in _CORE_FIELDS
+            )
+            if all_core_present:
+                item["_macro_input"] = macro_input
+                item["_macro_method"] = macro_method
+            # Always record field-level provenance for every field returned by the model.
+            fields_from_photo = [f for f in _MACRO_FIELDS if f in item and item[f] is not None]
+            item_meta = dict(correction_meta)
+            if fields_from_photo:
+                item_meta["field_sources"] = {
+                    f: {"status": "from_source", "source": photo_type} for f in fields_from_photo
+                }
+            item["_macro_meta"] = item_meta
 
     try:
         surviving_ids = _apply_corrections(

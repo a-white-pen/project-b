@@ -101,9 +101,9 @@ One row per distinct food item. A single message from B may produce one or multi
 | `sugar_g` | `numeric(6,2)` | yes |  | Total sugar in grams. NULL if unknown. |
 | `sodium_mg` | `numeric(7,2)` | yes |  | Sodium in milligrams. NULL if unknown. |
 | `source` | `text` | no | 'telegram'::text | How the row was created. Values: telegram, system. |
-| `macro_input` | `text` | no |  | Nature of the input used to derive macros. Values: nutrition_label (label photo, may need pro-rating for serving size), restaurant_reported (restaurant or meal plan published numbers), description (B described food via text or voice), image (food photo sent for visual estimation), manual (B provided numbers directly). |
-| `macro_method` | `text` | no |  | Tool or source used to derive the macro values. Values: nutrition_label (read directly from label), restaurant_reported (brand published data), usda (USDA FoodData Central), open_foods (Open Food Facts), edamam (Edamam API), llm (model estimated), manual (B provided numbers directly). |
-| `macro_meta` | `jsonb` | yes |  | Method-specific provenance detail. Shape varies by macro_method — llm: {"model": "gemini-2.5-flash-lite"}; nutrition_label: {"file_id": "<telegram file_id>"}; restaurant_reported: {"source": "Fit Kitchen Bangkok", "url": "..."}; usda: {"fdc_id": "...", "description": "..."}; open_foods: {"barcode": "...", "product_name": "..."}; edamam: {"food_id": "...", "label": "..."}. NULL for manual. |
+| `macro_input` | `text` | no |  | Nature of the input used to derive macros. Values: nutrition_label (packaged food label panel with full government-mandated rows incl. sodium, may need pro-rating), macro_screenshot (printed macro display without full nutrition panel — meal service card, restaurant menu, app screenshot), restaurant_reported (restaurant or meal plan published numbers), description (B described food via text or voice), image (food photo sent for visual estimation), manual (B provided numbers directly). |
+| `macro_method` | `text` | no |  | Tool or source used to derive the macro values. Values: nutrition_label (read directly from packaged food label panel), restaurant_reported (numbers published or printed by a brand or meal service — includes macro_screenshot photos of meal cards, restaurant menus, and app screenshots), usda (USDA FoodData Central), open_foods (Open Food Facts), edamam (Edamam API), llm (model estimated), manual (B provided numbers directly via text). |
+| `macro_meta` | `jsonb` | yes |  | Method-specific provenance detail. Shape varies by macro_method — llm: {"model": "gemini-2.5-flash"}; nutrition_label: {"model": "...", "file_id": "<telegram file_id>", "field_sources": {"fibre_g": {"source": "nutrition_label", "status": "zero_from_label"}}}; restaurant_reported (macro_screenshot): {"model": "...", "file_id": "...", "field_sources": {"kcal": {"status": "from_source", "source": "macro_screenshot"}, "fibre_g": {"status": "gap_filled", "model": "gemini-2.5-flash"}}}; usda: {"fdc_id": "...", "description": "..."}; open_foods: {"barcode": "...", "product_name": "..."}; edamam: {"food_id": "...", "label": "..."}; manual: null or {"user_stated_fields": [...], "correction_update_id": N}. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Set automatically; not edited after insert. |
 
 ## Schema: `system`
@@ -119,6 +119,16 @@ One row per bot reply that may participate in a quoted correction chain. Root ro
 | `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
 | `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids": [int], "meal_type": str} attention: {"attention_session_ids": [int]} |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+
+### Table: `system.strava_inbound`
+Every inbound Strava webhook event received by the app, stored as raw JSON. One row per event delivery. Written before any processing so nothing is lost even if processing fails. Mirrors the pattern of system.telegram_inbound. aspect_type in payload distinguishes create, update, and delete events for the same object_id.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `strava_inbound_id` | `integer` | no | nextval('system.strava_inbound_strava_inbound_id_seq'::regclass) | Surrogate primary key. |
+| `object_id` | `bigint` | no |  | Strava activity or object ID from the webhook payload. Multiple rows may share the same object_id when Strava sends create, update, and delete events for the same activity. Joins to exercise tables via strava_activity_id when those tables exist. |
+| `payload` | `jsonb` | no |  | Full raw Strava webhook event JSON as received. Contains object_type (e.g. activity), object_id, aspect_type (create, update, delete), owner_id, subscription_id, and event_time. |
+| `received_at` | `timestamp with time zone` | no | now() | Time the event was received by the webhook. |
 
 ### Table: `system.telegram_inbound`
 Every inbound Telegram update received by the webhook, stored as raw JSON. One row per update_id. Written before any processing so nothing is lost even if routing fails. Counterpart to system.telegram_outbound.

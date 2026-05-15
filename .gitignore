@@ -11,6 +11,6 @@ cloud-sql-proxy
 ~$*.docx
 HANDOFF.md
 HANDOVER_NEW_AGENT.md
-.claude/settings.local.json
+.claude/
 schema/old_schema_snapshot_*_reference_only.json
 PLAN_*.md
