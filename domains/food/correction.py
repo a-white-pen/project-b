@@ -2,10 +2,14 @@
 Food correction handler — applies B's quoted correction to previously logged food_log rows.
 
 Functions:
-  handle_food_correction(msg, state)           — parse correction, update food_log rows, return (reply, state)
-  _handle_photo_correction(msg, current_items) — re-reads macros from a correction photo via vision model, applies changes
+  handle_food_correction(msg, state)              — route correction: awaiting_clearer_photo, awaiting_quantity, or normal edit
+  _format_history_section(history)               — formats prior correction texts into a prompt section string
+  _handle_awaiting_clearer_photo(msg, context)   — re-runs extraction with a new photo when the original label was unreadable
+  _handle_awaiting_quantity(msg, context)         — re-downloads saved label photo and runs extraction with B's quantity reply
+  _handle_photo_correction(msg, current_items)    — re-reads macros from a correction photo via vision model, applies changes
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -13,6 +17,7 @@ import re
 
 import psycopg2.extras
 
+from domains.food.service import handle_food_log
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
@@ -26,6 +31,10 @@ _VALID_MEAL_TYPES = {
     "dinner", "supper", "pre_workout", "post_workout",
 }
 
+# Maximum number of past correction texts to carry forward in conversation_state.
+# Caps prompt growth for users who make many sequential corrections to the same meal.
+_MAX_HISTORY = 5
+
 _REESTIMATE_PROMPT = """\
 You are re-estimating a food log entry after a user correction.
 
@@ -36,7 +45,7 @@ Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chines
 (dim sum, congee, braised meats). Use this context when estimating portion sizes and macros.
 
 Previously logged: {previously_logged}
-User correction: {correction_text}
+{history_section}User correction: {correction_text}
 
 The user is correcting what was logged. Use both the original entry and their correction to \
 produce an accurate estimate. The user may be clarifying the item name, the quantity, or \
@@ -73,7 +82,7 @@ You are correcting food log entries for a personal nutrition tracker.
 Previously logged items:
 {logged_items}
 
-Correction from user: {correction_text}
+{history_section}Correction from user: {correction_text}
 
 Determine what the user wants to change. They may want to:
 - Change the meal type (e.g. "that was dinner not lunch")
@@ -115,7 +124,7 @@ Previously logged items:
 {logged_items}
 
 Caption from user (may be empty): {caption}
-
+{history_section}
 The user has sent a photo to correct the logged entries. The photo may be:
 - A nutrition label: read macros directly from the label. Pro-rate by quantity if the caption or \
 previously logged food_meta specifies how much was consumed. If no quantity is known, use 1 serving.
@@ -154,12 +163,28 @@ Rules:
 
 # Handles a correction to a previously logged food entry.
 # B quotes a bot reply → router looks up conversation_state → calls this function.
+#
+# Two sub-cases:
+#   awaiting_quantity — B replied with a quantity for a saved label photo (no food logged yet).
+#                       Re-downloads the saved photo, re-runs handle_food_log with the quantity
+#                       as caption. B never needs to resend the photo.
+#   normal correction — B is editing a previously logged food_log row (food_log_ids in context).
+#
 # Inputs:
-#   msg   — the inbound correction message (msg.text is the correction text)
-#   state — conversation_state row dict from load_state() (includes context.food_log_ids)
+#   msg   — the inbound correction message (msg.text is the correction text or quantity)
+#   state — conversation_state row dict from load_state()
 # Outputs: (reply_text, pending_state) where pending_state has the new state for saving.
 def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict | None]:
     context = state.get("context") or {}
+
+    # awaiting_clearer_photo path: bot couldn't read a label and B is sending a clearer photo.
+    if context.get("awaiting_clearer_photo"):
+        return _handle_awaiting_clearer_photo(msg, context)
+
+    # awaiting_quantity path: bot asked "how much did you have?" and B replied with the quantity.
+    if context.get("awaiting_quantity"):
+        return _handle_awaiting_quantity(msg, context)
+
     food_log_ids = context.get("food_log_ids") or []
     original_meal_type = context.get("meal_type", "snack")
     log_event(
@@ -203,11 +228,17 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     # Format items for LLM context
     logged_items_text = _format_items_for_llm(current_items)
 
+    # Build correction history section — carries prior correction texts forward so the LLM
+    # has full context when B makes sequential corrections to the same meal.
+    correction_history: list[str] = context.get("correction_history") or []
+    history_section = _format_history_section(correction_history)
+
     # Ask LLM to parse the correction
     try:
         raw = generate_text(
             _CORRECTION_PROMPT.format(
                 logged_items=logged_items_text,
+                history_section=history_section,
                 correction_text=correction_text,
             ),
             model=MODEL_FLASH,
@@ -262,7 +293,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
             fid = item.get("food_log_id")
             original = next((r for r in current_items if r["food_log_id"] == fid), None)
             if original is not None:
-                reestimated = _reestimate_item(original, correction_text, msg.update_id)
+                reestimated = _reestimate_item(original, correction_text, msg.update_id, correction_history)
                 if reestimated is None:
                     log_event(
                         logger,
@@ -341,12 +372,120 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> tuple[str, dict 
     )
     reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
 
+    # Append the current correction text to history (capped at _MAX_HISTORY) so the next
+    # correction in this thread has full context about what B has already said.
+    new_history = (correction_history + [correction_text])[-_MAX_HISTORY:] if correction_text else correction_history
     new_state = {
         "domain": "food",
-        "context": {"food_log_ids": surviving_ids, "meal_type": new_meal_type},
+        "context": {
+            "food_log_ids": surviving_ids,
+            "meal_type": new_meal_type,
+            "correction_history": new_history,
+        },
         "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
     }
     return (reply, new_state)
+
+
+# Formats the correction history list into a prompt section string.
+# Returns an empty string when there is no history so prompts are not polluted with empty headers.
+# Inputs: list of prior correction texts (already capped at _MAX_HISTORY by callers).
+# Outputs: formatted string ready to embed in an LLM prompt as the {history_section} placeholder.
+def _format_history_section(history: list[str]) -> str:
+    if not history:
+        return ""
+    lines = ["Prior corrections in this thread (oldest first):"]
+    lines += [f"- {h}" for h in history]
+    lines.append("")  # blank line before "Correction from user:"
+    return "\n".join(lines) + "\n"
+
+
+# Handles the awaiting_quantity correction path.
+#
+# Called when the bot previously returned "how much did you have?" after seeing a nutrition label
+# with no quantity in the caption. The state context contains awaiting_quantity=True and the
+# file_ids of the original label photo(s).
+#
+# B's reply text is treated as the quantity. This function reconstructs a photo message using
+# the saved file_id and B's reply as the caption, then calls handle_food_log — the full label
+# extraction flow runs again with the quantity now available. B never needs to resend the photo.
+#
+# Inputs:
+#   msg     — B's quantity reply (msg.text e.g. "150g", "2 servings")
+#   context — context dict from conversation_state (must contain file_ids list)
+# Outputs: (reply_text, pending_state) — same contract as handle_food_correction.
+def _handle_awaiting_quantity(msg: InboundMessage, context: dict) -> tuple[str, dict | None]:
+    quantity_text = msg.text or msg.caption
+    file_ids = context.get("file_ids") or []
+
+    log_event(
+        logger,
+        logging.INFO,
+        "food_awaiting_quantity_received",
+        update_id=msg.update_id,
+        has_quantity=bool(quantity_text),
+        file_id_count=len(file_ids),
+    )
+
+    if not quantity_text:
+        return ("What quantity did you have? (e.g. '150g', '1 serving', 'half a bar')", None)
+    if not file_ids:
+        log_event(logger, logging.WARNING, "food_awaiting_quantity_no_file_ids", update_id=msg.update_id)
+        return ("Can't find the original photo — please resend it with the quantity in the caption.", None)
+
+    # Reconstruct a PHOTO message: file_id from saved state, quantity text as caption.
+    # handle_food_log routes this through _handle_photo, which now has the quantity it needs.
+    photo_msg = dataclasses.replace(
+        msg,
+        message_type=MessageType.PHOTO,
+        file_id=file_ids[0],
+        caption=quantity_text,
+        text=None,
+    )
+    return handle_food_log(photo_msg)
+
+
+# Handles the awaiting_clearer_photo correction path.
+#
+# Called when the bot returned "can't read the label clearly" and B quotes that reply
+# to send a clearer photo. The original caption (quantity / food name) was saved in state
+# so B does not need to retype it.
+#
+# If B's reply has a photo: reconstruct message with new photo + restored original caption,
+# then re-run handle_food_log — full extraction runs with the caption intact.
+# If B's reply has no photo: ask B to actually send the photo.
+#
+# Inputs:
+#   msg     — B's reply (should be a PHOTO message with the clearer label)
+#   context — context dict from conversation_state (may contain original_caption)
+# Outputs: (reply_text, pending_state) — same contract as handle_food_correction.
+def _handle_awaiting_clearer_photo(msg: InboundMessage, context: dict) -> tuple[str, dict | None]:
+    original_caption = context.get("original_caption") or ""
+    log_event(
+        logger,
+        logging.INFO,
+        "food_awaiting_clearer_photo_received",
+        update_id=msg.update_id,
+        has_photo=bool(msg.message_type == MessageType.PHOTO and msg.file_id),
+        has_original_caption=bool(original_caption),
+    )
+
+    if msg.message_type != MessageType.PHOTO or not msg.file_id:
+        return (
+            "Please send a clearer photo of the label — or type the nutrition values instead.",
+            None,
+        )
+
+    # Combine original caption (food info B sent first) with new caption (may correct or add info).
+    # Gemini resolves conflicts — e.g. "1 serving actually 2 servings" → 2 servings.
+    # Joining both means neither the original quantity nor a new correction gets silently dropped.
+    effective_caption = " ".join(filter(None, [original_caption, msg.caption])).strip() or ""
+    photo_msg = dataclasses.replace(
+        msg,
+        caption=effective_caption,
+        text=None,
+    )
+    return handle_food_log(photo_msg)
 
 
 # Handles a photo-based correction — re-reads macros from an image B attached to the correction.
@@ -362,6 +501,9 @@ def _handle_photo_correction(
 ) -> tuple[str, dict | None]:
     food_log_ids = [item["food_log_id"] for item in current_items]
     log_event(logger, logging.INFO, "food_photo_correction_started", update_id=msg.update_id)
+    context = state.get("context") or {}
+    correction_history: list[str] = context.get("correction_history") or []
+    history_section = _format_history_section(correction_history)
 
     try:
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -379,6 +521,7 @@ def _handle_photo_correction(
             prompt=_PHOTO_CORRECTION_PROMPT.format(
                 logged_items=logged_items_text,
                 caption=caption,
+                history_section=history_section,
             ),
             model=MODEL_FLASH,
         )
@@ -441,9 +584,16 @@ def _handle_photo_correction(
 
     log_event(logger, logging.INFO, "food_photo_correction_completed", update_id=msg.update_id, surviving_item_count=len(surviving_ids))
     reply = _format_correction_reply(new_meal_type, updated_items, correction_items)
+    # Append a note about the photo correction to history so the next correction has context.
+    photo_note = f"[photo correction: {caption}]" if caption else "[photo correction]"
+    new_history = (correction_history + [photo_note])[-_MAX_HISTORY:]
     new_state = {
         "domain": "food",
-        "context": {"food_log_ids": surviving_ids, "meal_type": new_meal_type},
+        "context": {
+            "food_log_ids": surviving_ids,
+            "meal_type": new_meal_type,
+            "correction_history": new_history,
+        },
         "parent_telegram_reply_message_id": state["telegram_reply_message_id"],
     }
     return (reply, new_state)
@@ -454,7 +604,7 @@ def _handle_photo_correction(
 # are all refreshed for the new item rather than inheriting stale values from the original.
 # Returns a dict with food_item, macros, food_meta on success, or None on failure (caller falls back
 # to rename-only behaviour so the correction is never blocked by a re-estimation error).
-def _reestimate_item(original: dict, correction_text: str, update_id: int | None) -> dict | None:
+def _reestimate_item(original: dict, correction_text: str, update_id: int | None, correction_history: list[str] | None = None) -> dict | None:
     parts = [original.get("food_item", "?")]
     macros = []
     if original.get("kcal") is not None:
@@ -469,10 +619,12 @@ def _reestimate_item(original: dict, correction_text: str, update_id: int | None
         parts.append(f"({', '.join(macros)})")
     previously_logged = " ".join(parts)
 
+    history_section = _format_history_section(correction_history or [])
     try:
         raw = generate_text(
             _REESTIMATE_PROMPT.format(
                 previously_logged=previously_logged,
+                history_section=history_section,
                 correction_text=correction_text,
             ),
             model=MODEL_FLASH,

@@ -2,8 +2,12 @@
 Food logging domain — handles log_food intent.
 
 Functions:
-  handle_food_log(msg) — extracts food items from B's message, inserts into nutrition.food_log,
-                         returns a formatted summary of what was logged
+  handle_food_log(msg)            — extracts food items from B's message, inserts into nutrition.food_log,
+                                    returns a formatted summary of what was logged
+  _handle_photo(msg)              — handles PHOTO messages: downloads image, calls vision model,
+                                    applies label backstops and zero-from-label rule
+  _check_label_backstops(item)    — validates a nutrition_label item: rejects partial reads and row-shift mismatches
+  _apply_zero_from_label(item)    — zeros missing secondary fields when all core label fields are present
 """
 
 import json
@@ -90,44 +94,80 @@ Thai dishes (pad kra pao, moo ping, khao soi, boat noodles), and Southern Chines
 Current local time: {local_time}
 Caption from user (may be empty): {caption}
 
-Examine the image and caption together. The caption may refer to the item in the image AND mention additional food items not visible in the image — extract all of them.
+IMPORTANT: Return ALL text fields (food_item, prep, brand, notes) in English, \
+regardless of the language in the photo or caption.
 
 Step 1 — determine photo type:
 - nutrition_label: photo shows a nutrition facts panel, packaging label, or nutrition information table
 - food_image: photo shows actual food, a plate, a dish, or a meal
 
-Step 2 — extract items from the image based on type:
+============================================================
+If photo_type is nutrition_label, follow Steps 2A → 2B → 2C:
+============================================================
 
-If nutrition_label:
-- Read macro values directly from the label per serving
-- Check the caption for quantity consumed (e.g. "150g", "2 servings", "half a bar")
-- If the caption does NOT specify how much was consumed, set needs_quantity=true and return immediately with empty items
-- If quantity is known, pro-rate the macros: (consumed / serving_size) × per_serving_macros
-- Set macro_input="nutrition_label", macro_method="nutrition_label" for this item
+Step 2A — legibility check (do this FIRST):
+Can you clearly read the nutrition values on this label? If the label is blurry, angled,
+partially cut off, or any key values are illegible, return immediately — do not attempt extraction:
+{{"status": "unreadable_label"}}
 
-If food_image:
-- Identify each distinct food item visible
+Step 2B — quantity check:
+Is there a clear, unambiguous quantity in the caption?
+Clear quantities: "150g", "30g", "2 servings", "half a bar", "1 cup", "200ml", "3 pieces".
+If the quantity is missing, unclear, or you are in ANY doubt — return immediately:
+{{"status": "needs_quantity"}}
+When in doubt, ask — do not guess.
+
+Step 2C — read and scale the values:
+Nutrition labels may be in English, Thai, Simplified Chinese, or Traditional Chinese.
+Return all numeric values in standard units (kcal, grams, milligrams).
+
+Thai labels list rows TOP-TO-BOTTOM in this order:
+  พลังงาน (energy/kcal), ไขมันทั้งหมด (total fat), ไขมันอิ่มตัว (saturated fat),
+  คอเลสเตอรอล (cholesterol), โซเดียม (sodium), คาร์โบไฮเดรต (carbohydrates),
+  ใยอาหาร (dietary fibre), น้ำตาล (sugars), โปรตีน (protein).
+  PROTEIN IS NEAR THE BOTTOM — do not confuse it with rows near the top.
+
+Simplified Chinese labels (mainland China):
+  能量 (energy), 蛋白质 (protein), 脂肪 (fat), 碳水化合物 (carbohydrates), 钠 (sodium).
+  Often use kJ — convert to kcal: divide by 4.184.
+
+Traditional Chinese labels (Hong Kong / Taiwan):
+  蛋白質 (protein), 脂肪 (fat), 碳水化合物 (carbohydrates), 鈉 (sodium).
+  Taiwan labels often show values per 100g. HK labels follow UK/EU format.
+
+Read: energy (kcal), protein (g), total carbohydrates (g), total fat (g),
+and if present: dietary fibre (g), sugars (g), sodium (mg).
+Scale the values by the quantity: (quantity consumed / serving size) × per-serving values.
+Set macro_input="nutrition_label", macro_method="nutrition_label" for this item.
+
+========================================
+If photo_type is food_image, follow Step 3:
+========================================
+
+Step 3 — food image extraction:
+- Identify each distinct food item visible in the image
 - Use the caption for additional context (dish name, portion size, extras)
 - Estimate portion sizes from visual cues, plate size, and typical serving sizes for this cuisine
 - Estimate macros for each item
-- Set macro_input="image", macro_method="llm", needs_quantity=false for these items
+- Set macro_input="image", macro_method="llm" for these items
 
-Step 3 — extract any additional items mentioned in the caption that are NOT visible in the image:
-- If the caption mentions food items beyond what is shown in the photo, extract those too
-- For caption-only items: estimate macros from the description, set macro_input="description", macro_method="llm"
-- Examples: caption says "broccoli bowl + a banana" but the image only shows the bowl → also log the banana
-- Do not double-count items already extracted from the image
+============================================================
+For all photo types — Step 4 — caption-only items:
+============================================================
+
+If the caption mentions food items NOT visible in the image, extract those too.
+Set macro_input="description", macro_method="llm" for caption-only items.
+Do not double-count items already extracted from the image.
 
 Return a JSON object with this exact structure:
 {{
   "photo_type": "<nutrition_label or food_image>",
-  "needs_quantity": <true or false>,
   "meal_type": "<one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout>",
-  "macro_input": "<nutrition_label or image — use the value for the primary image item>",
-  "macro_method": "<nutrition_label or llm — use the value for the primary image item>",
+  "macro_input": "<nutrition_label or image — top-level fallback for items missing their own>",
+  "macro_method": "<nutrition_label or llm — top-level fallback>",
   "items": [
     {{
-      "food_item": "<description>",
+      "food_item": "<description in English>",
       "kcal": <number or null>,
       "protein_g": <number or null>,
       "carbs_g": <number or null>,
@@ -139,19 +179,19 @@ Return a JSON object with this exact structure:
       "macro_method": "<nutrition_label or llm — per item>",
       "food_meta": {{
         "qty": {{"amount": <number>, "unit": "<string>"}},
-        "prep": "<string>",
-        "brand": "<string>",
-        "notes": "<string>"
+        "prep": "<string in English>",
+        "brand": "<string in English>",
+        "notes": "<string in English>"
       }}
     }}
   ]
 }}
 
 Rules:
-- If needs_quantity=true, items should be empty
 - meal_type: infer from local time if not stated in caption
-- Each item carries its own macro_input and macro_method — these override the top-level fields when inserting
-- food_meta keys are optional — omit if not meaningful
+- Each item carries its own macro_input and macro_method — these override the top-level fields
+- food_meta keys are optional — omit if not meaningful for this item
+- All text fields must be in English
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
@@ -280,9 +320,35 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
         log_failure(logger, logging.ERROR, "food_photo_extraction_failed", e, update_id=msg.update_id)
         return ("Couldn't read the photo — can you try again or describe it in text?", None)
 
-    if extracted.get("needs_quantity"):
+    # Handle early-return status responses from the label flow (Steps 2A and 2B).
+    status = extracted.get("status")
+    if status == "unreadable_label":
+        log_event(logger, logging.INFO, "food_photo_label_unreadable", update_id=msg.update_id)
+        # Save state only when there is a caption worth preserving — so B does not have to retype
+        # the quantity or food name when resending a clearer photo.
+        pending_state = None
+        if msg.caption:
+            pending_state = {
+                "domain": "food",
+                "context": {
+                    "awaiting_clearer_photo": True,
+                    "original_caption": msg.caption,
+                    "file_ids": [msg.file_id],
+                },
+            }
+        return ("Can't read the label clearly — could you send a clearer photo, or type the values?", pending_state)
+    if status == "needs_quantity":
         log_event(logger, logging.INFO, "food_photo_needs_quantity", update_id=msg.update_id)
-        return ("I can see the label but need to know how much you had. Resend the photo with a caption (e.g. '150g', '1 serving', 'half a bar').", None)
+        # Save state so B can reply with just the quantity — correction handler re-downloads
+        # the photo and re-runs extraction without B needing to resend.
+        pending_state = {
+            "domain": "food",
+            "context": {"awaiting_quantity": True, "file_ids": [msg.file_id]},
+        }
+        return (
+            "I can see the label — how much did you have? (e.g. '150g', '1 serving', 'half a bar')",
+            pending_state,
+        )
 
     items = extracted.get("items", [])
     log_event(
@@ -328,9 +394,31 @@ def _handle_photo(msg: InboundMessage) -> tuple[str, dict | None]:
             item["macro_input"] = top_macro_input
         if "macro_method" not in item:
             item["macro_method"] = top_macro_method
-        # Assign the correct macro_meta shape for this item's method.
+        # Each item gets its own copy of the macro_meta dict so backstops and zero-from-label
+        # can write per-item field_sources without mutating the shared template.
         if "macro_meta" not in item:
-            item["macro_meta"] = caption_macro_meta if item["macro_input"] == "description" else image_macro_meta
+            base = caption_macro_meta if item["macro_input"] == "description" else image_macro_meta
+            item["macro_meta"] = dict(base)
+
+    # Apply label backstops to every nutrition_label item before touching the DB.
+    # If any item fails, return an error — do not log partial results.
+    for item in items:
+        if item.get("macro_input") == "nutrition_label":
+            ok, reason = _check_label_backstops(item)
+            if not ok:
+                log_event(
+                    logger, logging.WARNING, "food_photo_label_backstop_failed",
+                    update_id=msg.update_id, reason=reason,
+                    food_item_chars=len(item.get("food_item") or ""),
+                )
+                return (reason, None)
+
+    # Apply zero-from-label rule: if all four core fields are present on a label item,
+    # zero-fill any missing secondary fields (fibre_g, sugar_g, sodium_mg) and record
+    # which fields were zeroed in macro_meta["field_sources"] for provenance.
+    for item in items:
+        if item.get("macro_input") == "nutrition_label":
+            _apply_zero_from_label(item)
 
     # Batch-level macro_meta is the image meta — used as the fallback in _insert_items
     # for any item that somehow still lacks a per-item override (defensive only).
@@ -518,6 +606,74 @@ def _insert_items(
         macro_method=macro_method,
     )
     return ids
+
+
+# Validates extracted nutrition label values before DB insert.
+# Returns (True, "") if valid, or (False, user-facing error message) if validation fails.
+#
+# Two checks:
+#   Partial read  — both protein_g and carbs_g are null → extraction was incomplete.
+#   Row-shift     — |kcal - (4P + 4C + 9F)| / max(kcal, computed) > 0.60 → values assigned
+#                   to wrong rows (common on angled Thai/Chinese labels).
+#
+# Always uses _to_float() before arithmetic — LLM values may arrive as strings.
+def _check_label_backstops(item: dict) -> tuple[bool, str]:
+    kcal    = _to_float(item.get("kcal"))
+    protein = _to_float(item.get("protein_g"))
+    carbs   = _to_float(item.get("carbs_g"))
+    fat     = _to_float(item.get("fat_g"))
+
+    if protein is None and carbs is None:
+        return (
+            False,
+            "I could see the label but couldn't read all the values clearly — "
+            "could you send a clearer photo, or type the values?",
+        )
+
+    if kcal is not None and protein is not None and carbs is not None and fat is not None:
+        computed = 4.0 * protein + 4.0 * carbs + 9.0 * fat
+        denom = max(kcal, computed)
+        if denom > 0 and abs(kcal - computed) / denom > 0.60:
+            return (
+                False,
+                "The values on that label don't add up — the photo may be angled or hard to read. "
+                "Could you send a clearer photo, or type the values?",
+            )
+
+    return (True, "")
+
+
+# Applies the zero-from-label rule to a nutrition_label item in-place.
+#
+# If all four core fields (kcal, protein_g, carbs_g, fat_g) are present, any missing
+# secondary fields (fibre_g, sugar_g, sodium_mg) are set to 0.0. A label that declares
+# all four core macros but omits fibre is genuinely saying fibre is 0 (or undeclared
+# in that market) — do not leave it NULL and trigger an LLM fill later.
+#
+# Zero-filled fields are recorded in item["macro_meta"]["field_sources"] for provenance.
+# Does nothing if any core field is missing (incomplete read — caller should have caught
+# this via _check_label_backstops, but this is defensive).
+#
+# Only called for items with macro_input="nutrition_label". Never called for image,
+# description, manual, or restaurant_reported items.
+def _apply_zero_from_label(item: dict) -> None:
+    core      = ("kcal", "protein_g", "carbs_g", "fat_g")
+    secondary = ("fibre_g", "sugar_g", "sodium_mg")
+
+    if any(_to_float(item.get(f)) is None for f in core):
+        return
+
+    zeroed = [f for f in secondary if _to_float(item.get(f)) is None]
+    if not zeroed:
+        return
+
+    for field in zeroed:
+        item[field] = 0.0
+
+    meta = item.setdefault("macro_meta", {})
+    sources = meta.setdefault("field_sources", {})
+    for field in zeroed:
+        sources[field] = {"source": "nutrition_label", "status": "zero_from_label"}
 
 
 # Formats the reply shown to B after logging.
