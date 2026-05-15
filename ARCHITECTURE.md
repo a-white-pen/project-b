@@ -7,13 +7,13 @@ Telegram is the interface — B sends messages, the bot replies, and will eventu
 | Folder | Responsibility |
 |---|---|
 | `telegram/` | Everything Telegram — receive updates, route to domains, send replies |
+| `inbound/` | Push-based webhooks from external services (Strava; Garmin and Gmail planned). Each source is a subfolder with `webhook.py` (routes) + `processor.py` (fetch + notify logic). |
 | `domains/` | Business logic per event type; knows nothing about how data arrived |
-| `pulls/` | External data we initiate (Strava, scrapers — future) |
 | `outbound/` | Effects to non-Telegram destinations (reminders, calendar — future) |
 | `system/` | Shared plumbing — db connection, config, logging, LLM client |
 | `schema/` | Generated data dictionary and the dump script |
 
-Previously considered and rejected — do not reintroduce: `apps/`+`ingestion/` split, separate `intake/`, `workflows/`, `llm/` folders, `migrations/` folder, nested `docs/` tree.
+Previously considered and rejected — do not reintroduce: `apps/`+`ingestion/` split, separate `intake/`, `pulls/`, `workflows/`, `llm/` folders, `migrations/` folder, nested `docs/` tree.
 
 ---
 

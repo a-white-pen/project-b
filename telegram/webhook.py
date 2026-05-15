@@ -1,8 +1,8 @@
 """
-Telegram webhook receiver — the single entry point for all inbound Telegram updates.
+Telegram webhook receiver — registers Telegram routes onto the shared FastAPI app.
 
 Functions:
-  create_app()        — builds and returns the FastAPI application instance
+  register_routes(app) — registers POST /telegram/webhook and GET /health onto the app instance
   receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
   check_health()      — GET /health; checks app and DB connectivity, returns status dict
   _extract_media_group_id(payload) — extracts media_group_id from photo/video payloads
@@ -40,10 +40,10 @@ from telegram.router import route
 logger = logging.getLogger(__name__)
 
 
-def create_app() -> FastAPI:
-    # Builds the FastAPI app and registers routes. Called once at startup.
+def register_routes(app: FastAPI) -> None:
+    # Registers Telegram routes onto the shared FastAPI app instance.
+    # Called once from app.py at startup — app is created there, not here.
     config = get_config()
-    app = FastAPI(title="project-b", docs_url=None, redoc_url=None)
 
     @app.post("/telegram/webhook", status_code=status.HTTP_200_OK)
     async def receive_webhook(
@@ -126,8 +126,6 @@ def create_app() -> FastAPI:
         overall = "ok" if db_status == "ok" else "degraded"
         return {"status": overall, "db": db_status}
 
-    return app
-
 
 # Normalizes the payload, classifies intent, sends the reply, and logs to telegram_outbound.
 # Runs as a background task — all errors are caught and logged, never raised.
@@ -145,38 +143,49 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
             reply_to_message_id=message_id,
         )
         msg = normalize(payload)
-        reply_text, pending_state = await asyncio.to_thread(route, msg)
-        sent_message_id, sent_payload = await asyncio.to_thread(send_reply, chat_id, reply_text, message_id)
-        if sent_message_id is not None:
-            try:
-                await asyncio.to_thread(_store_outbound, sent_message_id, update_id, sent_payload)
-                if pending_state is not None:
-                    await asyncio.to_thread(
-                        save_state,
-                        sent_message_id,
-                        update_id,
-                        pending_state["domain"],
-                        pending_state["context"],
-                        pending_state.get("parent_telegram_reply_message_id"),
+        results = await asyncio.to_thread(route, msg)
+        last_sent_message_id = None
+        last_pending_state = None
+        # Send one Telegram message per (reply, state) pair. Food logging produces one per item;
+        # all other domains produce a single-item list. Each message is stored and state saved
+        # independently so B can quote any individual item to correct it.
+        for reply_text, pending_state in results:
+            sent_message_id, sent_payload = await asyncio.to_thread(
+                send_reply, chat_id, reply_text, message_id
+            )
+            last_sent_message_id = sent_message_id
+            last_pending_state = pending_state
+            if sent_message_id is not None:
+                try:
+                    await asyncio.to_thread(_store_outbound, sent_message_id, update_id, sent_payload)
+                    if pending_state is not None:
+                        await asyncio.to_thread(
+                            save_state,
+                            sent_message_id,
+                            update_id,
+                            pending_state["domain"],
+                            pending_state["context"],
+                            pending_state.get("parent_telegram_reply_message_id"),
+                        )
+                except Exception as e:
+                    # Outbound audit log failed — reply already delivered, so non-fatal.
+                    # Log at warning so gaps are visible without blocking the user.
+                    log_failure(
+                        logger,
+                        logging.WARNING,
+                        "process_reply_audit_failed",
+                        e,
+                        update_id=update_id,
+                        sent_message_id=sent_message_id,
                     )
-            except Exception as e:
-                # Outbound audit log failed — reply already delivered, so non-fatal.
-                # Log at warning so gaps are visible without blocking the user.
-                log_failure(
-                    logger,
-                    logging.WARNING,
-                    "process_reply_audit_failed",
-                    e,
-                    update_id=update_id,
-                    sent_message_id=sent_message_id,
-                )
         log_event(
             logger,
             logging.INFO,
             "process_reply_completed",
             update_id=update_id,
-            sent_message_id=sent_message_id,
-            pending_state_domain=(pending_state or {}).get("domain"),
+            sent_message_id=last_sent_message_id,
+            reply_count=len(results),
+            pending_state_domain=(last_pending_state or {}).get("domain"),
         )
     except Exception as e:
         log_failure(
@@ -311,4 +320,3 @@ def _ping_db() -> str:
         return get_error_summary(e)
 
 
-app = create_app()

@@ -11,6 +11,7 @@
 - Attention: starts/finishes `b.attention_sessions` via text or voice. Starting auto-closes the previous open session. Quoted-reply corrections supported. One-open-session invariant enforced in app code.
 
 **In progress:**
+- Strava inbound — webhook receiver live; proactive Telegram notifications on activity create/update. Saving to `exercise` schema is Phase 2.
 - Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
 - Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
 
@@ -20,7 +21,7 @@
 
 **In:** Telegram as the interface. B sends messages; the bot replies and will eventually take actions on B's behalf.
 
-**Out for now:** Strava, Oura, scrapers (those live in `pulls/` when they arrive). Multi-user anything.
+**Out for now:** Oura, scrapers. Multi-user anything.
 
 ## Stack
 
@@ -42,8 +43,8 @@ Analytics views go in a `marts` schema when there is something worth visualizing
 
 ```
 telegram/    Telegram protocol — receive, route, send
+inbound/     Push-based webhooks from external services (Strava; Garmin and Gmail planned)
 domains/     Business logic per domain (food, weight, sleep, attention, etc.)
-pulls/       External data pulls we initiate (Strava, scrapers — future)
 outbound/    Effects to non-Telegram destinations (reminders, calendar — future)
 system/      Shared plumbing: db, config, logging, LLM client
 schema/      Data dictionary (generated) and the dump script

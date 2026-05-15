@@ -57,8 +57,8 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 
 ```
 telegram/    Telegram bot — receive messages, route, reply
+inbound/     Push-based inbound webhooks from external services (Strava)
 domains/     Business logic per domain (food, weight, sleep, attention, etc.)
-pulls/       External data pulls we initiate (Strava, scrapers — future)
 outbound/    Effects to non-Telegram destinations (reminders, calendar — future)
 system/      Shared plumbing: database, config, LLM client, logging
 schema/      Auto-generated data dictionary + dump script
@@ -81,7 +81,7 @@ cp .env.example .env
 cloud-sql-proxy awhitepen-project-b:asia-southeast1:projectb-db
 
 # Run locally
-uvicorn telegram.webhook:app --reload
+uvicorn app:app --reload
 ```
 
 ---
