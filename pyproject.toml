@@ -15,7 +15,7 @@ dependencies = [
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
-include = ["telegram*", "domains*", "pulls*", "outbound*", "system*"]
+include = ["telegram*", "domains*", "pulls*", "outbound*", "system*", "inbound*"]
 namespaces = true
 
 [build-system]
