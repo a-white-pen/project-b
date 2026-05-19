@@ -173,7 +173,18 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
     label = _activity_label(sport_type, activity_category, is_treadmill)
     has_distance = distance_m is not None and distance_m > 0 and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
     stats = f"{distance_m / 1000:.1f} km in {duration_str}" if has_distance else duration_str
-    line1 = f"{update_prefix}<b>{label}</b> — {stats}"
+
+    # Pace/speed suffix for line 1
+    pace_suffix = ""
+    if has_distance and elapsed_seconds > 0:
+        if activity_category in ("run", "walk"):
+            pace_sec = elapsed_seconds / (distance_m / 1000)
+            pace_suffix = f" · {int(pace_sec // 60)}:{int(pace_sec % 60):02d} /km"
+        elif activity_category == "ride":
+            speed_kmh = (distance_m / elapsed_seconds) * 3.6
+            pace_suffix = f" · {speed_kmh:.1f} km/h"
+
+    line1 = f"{update_prefix}<b>{label}</b> — {stats}{pace_suffix}"
 
     line2_parts = []
     if avg_hr and max_hr:
@@ -189,7 +200,65 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
     if not saved:
         lines.append("<i>Not yet saved.</i>")
 
+    # Per-km splits block
+    strava_activity_id = activity.get("id")
+    if strava_activity_id:
+        splits = _fetch_splits(strava_activity_id)
+        if splits:
+            lines.append("")
+            for s in splits:
+                moving = s.get("moving_seconds") or s.get("elapsed_seconds") or 0
+                pace_sec = moving / ((s.get("distance_m") or 1000) / 1000) if moving else 0
+                pace_str = f"{int(pace_sec // 60)}:{int(pace_sec % 60):02d}" if pace_sec else "?:??"
+                row = f"km {s['lap_index']}   {pace_str}"
+                hr = s.get("average_heartrate")
+                cad = s.get("average_cadence")
+                if hr:
+                    row += f"  ❤️ {int(hr)}"
+                if cad:
+                    row += f"  👟 {int(cad)}"
+                lines.append(row)
+
     return "\n".join(lines)
+
+
+# Fetches per-km splits for a cardio activity from exercise.cardio_splits.
+# Inputs: strava_activity_id (the Strava ID, not the internal cardio_activity_id).
+# Outputs: list of dicts with keys: lap_index, distance_m, moving_seconds, elapsed_seconds,
+#          average_heartrate, average_cadence — ordered by lap_index. Empty list if none found.
+def _fetch_splits(strava_activity_id: int) -> list[dict]:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT cs.lap_index, cs.distance_m, cs.moving_seconds, cs.elapsed_seconds,
+                           cs.average_heartrate, cs.average_cadence
+                    FROM exercise.cardio_splits cs
+                    JOIN exercise.cardio_activities ca USING (cardio_activity_id)
+                    WHERE ca.strava_activity_id = %s
+                    ORDER BY cs.lap_index
+                    """,
+                    (strava_activity_id,),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "lap_index": r[0],
+                        "distance_m": float(r[1]) if r[1] is not None else 1000.0,
+                        "moving_seconds": r[2],
+                        "elapsed_seconds": r[3],
+                        "average_heartrate": r[4],
+                        "average_cadence": r[5],
+                    }
+                    for r in rows
+                ]
+    except Exception:
+        # Splits are best-effort — don't break notifications if DB is unavailable
+        return []
+    finally:
+        conn.close()
 
 
 # Formats a duration in seconds as mm:ss or h:mm:ss.
