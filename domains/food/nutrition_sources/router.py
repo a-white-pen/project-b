@@ -112,19 +112,28 @@ def enrich_item(item: dict, update_id: int | None = None) -> dict:
 
     # Try sources in chain order.
     source_chain = _SOURCE_CHAINS.get(food_type, [])
+    tried_sources: list[str] = []
     for source_key, lookup_fn in source_chain:
+        tried_sources.append(source_key)
         try:
-            result = lookup_fn(food_item, grams, update_id)
+            result, all_candidates = lookup_fn(food_item, grams, update_id)
         except Exception as e:
             log_failure(logger, logging.WARNING, "structured_source_lookup_error", e,
                         update_id=update_id, source=source_key, food_item=food_item)
-            result = None
+            result, all_candidates = None, []
 
         if result is None:
             continue
 
+        # Determine untried source: first source in chain not yet tried.
+        untried_source = next(
+            (sk for sk, _ in source_chain if sk not in tried_sources),
+            None,
+        )
+
         # Match found — merge macros and provenance into item.
-        item = _apply_result(item, result, food_type, update_id)
+        item = _apply_result(item, result, food_type, update_id,
+                             all_candidates=all_candidates, untried_source=untried_source)
         log_event(logger, logging.INFO, "structured_source_matched",
                   update_id=update_id, food_item=food_item,
                   source=source_key, food_type=food_type, grams=grams,
@@ -137,10 +146,19 @@ def enrich_item(item: dict, update_id: int | None = None) -> dict:
     return item
 
 
-def _apply_result(item: dict, result: dict, food_type: str, update_id: int | None) -> dict:
+def _apply_result(
+    item: dict,
+    result: dict,
+    food_type: str,
+    update_id: int | None,
+    *,
+    all_candidates: list[dict] | None = None,
+    untried_source: str | None = None,
+) -> dict:
     item = dict(item)
     source = result["_source"]
     scaling_g = result.get("_scaling_g")
+    candidate_name = result.get("_candidate_name")
 
     # Replace macro values with structured source values.
     for field in _MACRO_FIELDS:
@@ -157,15 +175,34 @@ def _apply_result(item: dict, result: dict, food_type: str, update_id: int | Non
                 entry["scaling_g"] = scaling_g
             if result.get("_fdc_id"):
                 entry["fdc_id"] = result["_fdc_id"]
-            elif result.get("_candidate_name"):
-                entry["candidate_name"] = result["_candidate_name"]
+            if candidate_name:
+                entry["candidate_name"] = candidate_name
             field_sources[field] = entry
 
     macro_meta["field_sources"] = field_sources
     macro_meta["food_type"] = food_type
     macro_meta["structured_source"] = source
-    if result.get("_candidate_name"):
-        macro_meta["candidate_name"] = result["_candidate_name"]
+    if candidate_name:
+        macro_meta["candidate_name"] = candidate_name
+
+    # Build candidate_letter_map if we have candidates.
+    if all_candidates:
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        letter_map: dict = {}
+        for i, _cand in enumerate(all_candidates):
+            if i >= len(letters):
+                break
+            letter_map[letters[i]] = {"action": "candidate", "index": i}
+        next_i = len(all_candidates)
+        if untried_source and next_i < len(letters):
+            letter_map[letters[next_i]] = {"action": "cross_source", "source": untried_source}
+            next_i += 1
+        if next_i < len(letters):
+            letter_map[letters[next_i]] = {"action": "llm"}
+
+        macro_meta["source_candidates"] = all_candidates
+        macro_meta["candidate_letter_map"] = letter_map
+        macro_meta["untried_source"] = untried_source
 
     item["macro_meta"] = macro_meta
     item["macro_method"] = source  # "usda" or "open_food_facts"

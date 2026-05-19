@@ -253,6 +253,49 @@ Rules:
 """
 
 
+# Builds a formatted candidate list string from macro_meta for appending to the item reply.
+# Reads candidate_letter_map and source_candidates to construct the lettered list.
+# Returns an empty string if no candidate_letter_map is present.
+#
+# Format:
+#   a. Chicken breast, raw, boneless ✓
+#   b. Chicken breast, cooked, roasted
+#   ...
+#   d. Try Open Food Facts
+#   e. Use LLM estimate
+def _build_candidate_list(macro_meta: dict) -> str:
+    letter_map: dict = macro_meta.get("candidate_letter_map") or {}
+    source_candidates: list = macro_meta.get("source_candidates") or []
+    if not letter_map:
+        return ""
+
+    _SOURCE_DISPLAY = {
+        "usda": "USDA",
+        "open_food_facts": "Open Food Facts",
+    }
+
+    lines: list[str] = []
+    for letter, action in sorted(letter_map.items()):
+        act = action.get("action")
+        if act == "candidate":
+            idx = action.get("index", 0)
+            if idx < len(source_candidates):
+                cand = source_candidates[idx]
+                label = html.escape(str(cand.get("label", "?")))
+                brand = cand.get("brand", "")
+                brand_str = f" ({html.escape(brand)})" if brand else ""
+                checkmark = " ✓" if idx == 0 else ""
+                lines.append(f"{letter}. {label}{brand_str}{checkmark}")
+        elif act == "cross_source":
+            src = action.get("source", "")
+            display = _SOURCE_DISPLAY.get(src, src)
+            lines.append(f"{letter}. Try {html.escape(display)}")
+        elif act == "llm":
+            lines.append(f"{letter}. Use LLM estimate")
+
+    return "\n".join(lines)
+
+
 # Formats one logged food item as an HTML Telegram message.
 # One message per item — keeps correction quoting unambiguous (B quotes exactly the item to fix).
 # All user/LLM strings are passed through html.escape() — required for Telegram HTML parse_mode.
@@ -318,10 +361,14 @@ def _format_item_reply(meal_type: str, item: dict) -> str:
                     return "(meal service label)"
                 if source == "usda":
                     scaling_g = fs.get("scaling_g")
-                    return f"(USDA · {scaling_g:.0f}g)" if scaling_g is not None else "(USDA)"
+                    candidate = fs.get("candidate_name", "")
+                    suffix = f" — {candidate}" if candidate else ""
+                    return f"(USDA · {scaling_g:.0f}g{suffix})" if scaling_g is not None else f"(USDA{suffix})"
                 if source == "open_food_facts":
                     scaling_g = fs.get("scaling_g")
-                    return f"(Open Food Facts · {scaling_g:.0f}g)" if scaling_g is not None else "(Open Food Facts)"
+                    candidate = fs.get("candidate_name", "")
+                    suffix = f" — {candidate}" if candidate else ""
+                    return f"(Open Food Facts · {scaling_g:.0f}g{suffix})" if scaling_g is not None else f"(Open Food Facts{suffix})"
                 return "(LLM estimate)"  # food_image and unrecognised sources
             if status == "stated_by_user":
                 return "(you stated)"
@@ -369,6 +416,12 @@ def _format_item_reply(meal_type: str, item: dict) -> str:
         f"sodium: {_fmt(sodium_val)}mg  <i>{_source_label('sodium_mg')}</i>"
         if sodium_val is not None else "sodium: —"
     )
+
+    # Candidate list (shown when a structured source match was made).
+    candidate_list = _build_candidate_list(macro_meta)
+    if candidate_list:
+        lines.append("")
+        lines.append(candidate_list)
 
     lines.append("")
     lines.append("<i>Quote to correct.</i>")

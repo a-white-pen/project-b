@@ -8,7 +8,7 @@ API: https://world.openfoodfacts.org/cgi/search.pl (no key required)
 Base unit: per 100g
 
 Functions:
-  lookup(food_item, grams, update_id) — returns macro dict + source metadata, or None if no match
+  lookup(food_item, grams, update_id) — returns (macro dict, all_candidates list) or (None, []) if no match
 """
 
 import json
@@ -56,17 +56,19 @@ Return JSON only:
 
 # Searches Open Food Facts and returns the best-matching macro values scaled to grams.
 # Inputs: food_item string, grams (already converted), update_id for logging.
-# Outputs: dict with macro fields and source attribution — or None if no match.
-def lookup(food_item: str, grams: float, update_id: int | None = None) -> dict | None:
+# Outputs: (result dict, all_candidates list) or (None, []) if no match.
+# all_candidates: list of dicts with label, brand, nutrients_per_100g — selected at index 0.
+def lookup(food_item: str, grams: float, update_id: int | None = None) -> tuple[dict | None, list[dict]]:
     candidates = _search(food_item, update_id)
     if not candidates:
-        return None
+        return None, []
 
-    selected_index = _select_candidate(food_item, grams, candidates, update_id)
+    selected_index, all_candidates = _select_candidate(food_item, grams, candidates, update_id)
     if selected_index is None:
-        return None
+        return None, []
 
-    return _scale_candidate(candidates[selected_index], grams, update_id)
+    result = _scale_candidate(candidates[selected_index], grams, update_id)
+    return result, all_candidates
 
 
 def _search(food_item: str, update_id: int | None) -> list[dict] | None:
@@ -103,7 +105,7 @@ def _search(food_item: str, update_id: int | None) -> list[dict] | None:
 
 def _select_candidate(
     food_item: str, grams: float, candidates: list[dict], update_id: int | None
-) -> int | None:
+) -> tuple[int | None, list[dict]]:
     lines: list[str] = []
     for i, p in enumerate(candidates):
         name = p.get("product_name") or "?"
@@ -137,7 +139,7 @@ def _select_candidate(
     except Exception as e:
         log_failure(logger, logging.WARNING, "off_select_failed", e,
                     update_id=update_id, food_item=food_item)
-        return None
+        return None, []
 
     index = result.get("index")
     confidence = result.get("confidence", "low")
@@ -145,17 +147,40 @@ def _select_candidate(
     if index is None or not (0 <= index < len(candidates)):
         log_event(logger, logging.INFO, "off_no_match",
                   update_id=update_id, food_item=food_item)
-        return None
-
-    if confidence == "low":
-        log_event(logger, logging.INFO, "off_low_confidence",
-                  update_id=update_id, food_item=food_item, index=index)
-        return None
+        return None, []
 
     log_event(logger, logging.INFO, "off_candidate_selected",
               update_id=update_id, food_item=food_item,
-              product_name=candidates[index].get("product_name"))
-    return index
+              product_name=candidates[index].get("product_name"),
+              confidence=confidence)
+
+    # Build all_candidates list: selected at index 0, others follow in API order, capped at 6.
+    selected = candidates[index]
+    others = [c for i2, c in enumerate(candidates) if i2 != index]
+    ordered = [selected] + others
+    capped = ordered[:6]
+
+    def _candidate_dict(p: dict) -> dict:
+        nutriments = p.get("nutriments") or {}
+        per_100g: dict = {}
+        for field, key in _NUTRIENT_KEYS.items():
+            raw_val = nutriments.get(key)
+            if raw_val is not None:
+                # OFF stores sodium in g/100g; convert to mg for storage.
+                if field == "sodium_mg":
+                    per_100g[field] = raw_val * 1000
+                else:
+                    per_100g[field] = raw_val
+            else:
+                per_100g[field] = None
+        return {
+            "label": p.get("product_name", "?"),
+            "brand": p.get("brands") or "",
+            "nutrients_per_100g": per_100g,
+        }
+
+    all_candidates = [_candidate_dict(c) for c in capped]
+    return index, all_candidates
 
 
 def _scale_candidate(product: dict, grams: float, update_id: int | None) -> dict:

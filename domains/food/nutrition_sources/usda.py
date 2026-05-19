@@ -18,7 +18,7 @@ USDA-specific gotchas (learned from prior attempt — do not remove these commen
     If it hallucinate an ID not in the list → reject, return None.
 
 Functions:
-  lookup(food_item, grams, update_id) — returns macro dict + source metadata, or None if no match
+  lookup(food_item, grams, update_id) — returns (macro dict, all_candidates list) or (None, []) if no match
 """
 
 import json
@@ -70,25 +70,28 @@ Return JSON only:
 # Searches USDA FoodData Central and returns the best-matching macro values scaled to grams.
 # Inputs: food_item string, grams (already converted — caller must not pass non-gram quantities),
 #         update_id for logging.
-# Outputs: dict with macro fields, food_type metadata, and source attribution — or None if no match.
-def lookup(food_item: str, grams: float, update_id: int | None = None) -> dict | None:
+# Outputs: (result dict, all_candidates list) where result has macro fields + source attribution,
+#          or (None, []) if no match.
+# all_candidates: list of dicts with label, fdc_id, nutrients_per_100g — selected candidate at index 0.
+def lookup(food_item: str, grams: float, update_id: int | None = None) -> tuple[dict | None, list[dict]]:
     api_key = os.environ.get("USDA_API_KEY", "").strip()
     if not api_key:
         log_event(logger, logging.WARNING, "usda_api_key_missing", update_id=update_id)
-        return None
+        return None, []
 
     # Step 1: search for candidates.
     candidates = _search(food_item, api_key, update_id)
     if not candidates:
-        return None
+        return None, []
 
     # Step 2: LLM selects the best candidate.
-    selected = _select_candidate(food_item, grams, candidates, update_id)
+    selected, all_candidates = _select_candidate(food_item, grams, candidates, update_id)
     if selected is None:
-        return None
+        return None, []
 
     # Step 3: extract per-100g nutrients and scale to grams.
-    return _scale_candidate(selected, grams, update_id)
+    result = _scale_candidate(selected, grams, update_id)
+    return result, all_candidates
 
 
 def _search(food_item: str, api_key: str, update_id: int | None) -> list[dict] | None:
@@ -123,15 +126,17 @@ def _search(food_item: str, api_key: str, update_id: int | None) -> list[dict] |
 
 def _select_candidate(
     food_item: str, grams: float, candidates: list[dict], update_id: int | None
-) -> dict | None:
+) -> tuple[dict | None, list[dict]]:
     # Build candidate summary for the LLM — show description, data type, and key macros per 100g.
     lines: list[str] = []
     valid_fdc_ids: set[int] = set()
+    valid_candidates: list[dict] = []
     for c in candidates:
         fdc_id = c.get("fdcId")
         if not fdc_id:
             continue
         valid_fdc_ids.add(fdc_id)
+        valid_candidates.append(c)
         desc = c.get("description", "?")
         data_type = c.get("dataType", "?")
         nutrients = {n["nutrientId"]: n.get("value") for n in c.get("foodNutrients") or []}
@@ -149,7 +154,7 @@ def _select_candidate(
         lines.append(f"ID {fdc_id} [{data_type}] {desc} | {macro_str}")
 
     if not lines:
-        return None
+        return None, []
 
     try:
         raw = generate_text(
@@ -167,7 +172,7 @@ def _select_candidate(
     except Exception as e:
         log_failure(logger, logging.WARNING, "usda_select_failed", e,
                     update_id=update_id, food_item=food_item)
-        return None
+        return None, []
 
     fdc_id = result.get("fdc_id")
     confidence = result.get("confidence", "low")
@@ -176,19 +181,37 @@ def _select_candidate(
     if fdc_id is None or fdc_id not in valid_fdc_ids:
         log_event(logger, logging.INFO, "usda_no_match",
                   update_id=update_id, food_item=food_item, confidence=confidence)
-        return None
+        return None, []
 
-    if confidence == "low":
-        log_event(logger, logging.INFO, "usda_low_confidence",
-                  update_id=update_id, food_item=food_item, fdc_id=fdc_id)
-        return None
+    selected = next((c for c in valid_candidates if c.get("fdcId") == fdc_id), None)
+    if selected is None:
+        return None, []
 
-    selected = next((c for c in candidates if c.get("fdcId") == fdc_id), None)
-    if selected:
-        log_event(logger, logging.INFO, "usda_candidate_selected",
-                  update_id=update_id, food_item=food_item,
-                  fdc_id=fdc_id, description=selected.get("description"))
-    return selected
+    log_event(logger, logging.INFO, "usda_candidate_selected",
+              update_id=update_id, food_item=food_item,
+              fdc_id=fdc_id, description=selected.get("description"),
+              confidence=confidence)
+
+    # Build all_candidates list: selected at index 0, rest follow in API order, capped at 6.
+    others = [c for c in valid_candidates if c.get("fdcId") != fdc_id]
+    ordered = [selected] + others
+    capped = ordered[:6]
+
+    def _candidate_dict(c: dict) -> dict:
+        nutrients = {n["nutrientId"]: n.get("value") for n in c.get("foodNutrients") or []}
+        per_100g: dict = {}
+        for field, nutrient_id in _NUTRIENT_IDS.items():
+            raw_val = nutrients.get(nutrient_id)
+            per_100g[field] = raw_val if raw_val is not None else 0.0
+        # sodium is already mg/100g in USDA (nutrientId 1093 reports in mg)
+        return {
+            "label": c.get("description", "?"),
+            "fdc_id": c.get("fdcId"),
+            "nutrients_per_100g": per_100g,
+        }
+
+    all_candidates = [_candidate_dict(c) for c in capped]
+    return selected, all_candidates
 
 
 def _scale_candidate(candidate: dict, grams: float, update_id: int | None) -> dict | None:
