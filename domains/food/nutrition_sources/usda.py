@@ -27,7 +27,7 @@ import os
 
 import httpx
 
-from system.llm import MODEL_FLASH, generate_text
+from system.llm import MODEL_FLASH, generate_json
 from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
@@ -157,7 +157,7 @@ def _select_candidate(
         return None, []
 
     try:
-        raw = generate_text(
+        raw = generate_json(
             _SELECT_PROMPT.format(
                 food_item=food_item,
                 grams=grams,

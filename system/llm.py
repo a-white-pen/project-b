@@ -122,6 +122,47 @@ def generate_text(prompt: str, model: str = MODEL_LITE) -> str:
         raise
 
 
+# Like generate_text but forces JSON output mode and disables thinking tokens.
+# Use this for prompts that return structured JSON — prevents Gemini 2.5 Flash from
+# consuming all tokens in thinking and returning empty text.
+def generate_json(prompt: str, model: str = MODEL_FLASH) -> str:
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_generate_json_started",
+        model=model,
+        prompt_chars=len(prompt),
+    )
+    try:
+        response = _get_client().models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_generate_json_completed",
+            model=model,
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_generate_json_failed",
+            e,
+            model=model,
+            prompt_chars=len(prompt),
+        )
+        raise
+
+
 # Transcribes a voice message using Gemini's multimodal input.
 # Inputs: raw audio bytes, MIME type (default: audio/ogg for Telegram voice messages), model.
 # Outputs: transcribed text string. Raises on API error.
