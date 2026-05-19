@@ -7,7 +7,7 @@ Three-way macro source routing (A3) — two LLM calls per photo:
 
   Path 1 — nutrition_label: macros read from packaged food label. Backstops + zero-from-label applied.
   Path 2 — macro_screenshot: macros from printed non-label source. Source provenance + gap-fill.
-  Path 3 — food_image: macros estimated by LLM. USDA/OFF routing added in A4.
+  Path 3 — food_image: macros looked up via USDA/OFF (A5) by food type; LLM fallback if no match.
 
 All public handlers return list[tuple[str, dict | None]] — one (reply, state) pair per food item.
 Each item gets its own Telegram message so B can quote exactly the item she wants to correct.
@@ -49,6 +49,7 @@ from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
+from domains.food.nutrition_sources.router import enrich_item
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +316,12 @@ def _format_item_reply(meal_type: str, item: dict) -> str:
                     return "(nutrition label)"
                 if source == "macro_screenshot":
                     return "(meal service label)"
+                if source == "usda":
+                    scaling_g = fs.get("scaling_g")
+                    return f"(USDA · {scaling_g:.0f}g)" if scaling_g is not None else "(USDA)"
+                if source == "open_food_facts":
+                    scaling_g = fs.get("scaling_g")
+                    return f"(Open Food Facts · {scaling_g:.0f}g)" if scaling_g is not None else "(Open Food Facts)"
                 return "(LLM estimate)"  # food_image and unrecognised sources
             if status == "stated_by_user":
                 return "(you stated)"
@@ -502,6 +509,10 @@ def _handle_text_items(
     macro_input = extracted.get("macro_input", "description")
     macro_method = extracted.get("macro_method", "llm")
     macro_meta = {"model": MODEL_FLASH}
+
+    # Attempt structured source lookup for items without user-stated macros.
+    # Items where B stated macro values (macro_input="manual") are left unchanged.
+    items = [enrich_item(item, msg.update_id) for item in items]
 
     try:
         food_log_ids = _insert_items(
@@ -791,6 +802,12 @@ def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> list[tu
 
     meal_type = _resolve_meal_type(extracted, msg.update_id)
     image_macro_meta: dict = {"model": MODEL_FLASH}
+
+    # Attempt structured source lookup for food_image items.
+    # _stamp_photo_provenance runs after so it only fills provenance for items that
+    # didn't get a structured source match (macro_input stays "image" for those).
+    items = [enrich_item(item, msg.update_id) for item in items]
+
     _stamp_photo_provenance(items, "image", image_macro_meta)
 
     try:

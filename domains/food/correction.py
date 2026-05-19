@@ -418,9 +418,14 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
-    reply_ids, _ = _compute_reply_scope(
+    reply_ids, early_result = _compute_reply_scope(
         applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
     )
+    if early_result is not None:
+        log_event(logger, logging.INFO, "food_correction_completed",
+                  update_id=msg.update_id, surviving_item_count=len(surviving_ids),
+                  reply_item_count=0, meal_type=new_meal_type)
+        return early_result
 
     # Build updated item list for the reply.
     # _apply_corrections already committed — guard this re-fetch so a DB hiccup here
@@ -701,9 +706,14 @@ def _handle_photo_correction(
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
-    reply_ids, _ = _compute_reply_scope(
+    reply_ids, early_result = _compute_reply_scope(
         applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
     )
+    if early_result is not None:
+        log_event(logger, logging.INFO, "food_photo_correction_completed",
+                  update_id=msg.update_id, surviving_item_count=len(surviving_ids),
+                  reply_item_count=0)
+        return early_result
 
     try:
         updated_items = _fetch_items(reply_ids) if reply_ids else []
@@ -856,15 +866,18 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
 #   - missing food_log_id keys in LLM output cannot cause a KeyError here
 #
 # Rules:
-#   meal_type changed        → all surviving ids (B needs to see the full meal after a move)
-#   update + delete          → only the updated ids (deleted items are gone; delete count shown on last card)
-#   delete only, survivors   → surviving ids so the correction chain stays open; deleted_count on last card
-#   delete only, all gone    → ([], None) — callers fall through to the "all removed" message at their end
-#   fallback                 → all surviving ids
+#   meal_type changed  → all surviving ids (B needs to see the full meal after a move)
+#   update + delete    → only the updated ids (delete count badge appended on last card)
+#   delete only        → None + early_result "Removed: <name>, ..." so B sees which item was removed
+#   fallback           → all surviving ids
+#
+# Uses actual DB-applied sets (from _apply_corrections) rather than raw LLM items so that:
+#   - hallucinated food_log_ids that were skipped by _apply_corrections never appear in reply text
+#   - missing food_log_id keys in LLM output cannot cause a KeyError here
 #
 # Returns (reply_ids, early_result):
-#   reply_ids    — list of ids to fetch and show; empty list signals "all gone" to caller
-#   early_result — always None (early-return removed; all paths now use the standard reply flow)
+#   reply_ids    — list of ids to fetch and show, or None when early_result is set
+#   early_result — ready-made result list for delete-only case, or None
 def _compute_reply_scope(
     applied_deleted_ids: set[int],
     applied_updated_ids: set[int],
@@ -872,7 +885,7 @@ def _compute_reply_scope(
     current_items: list[dict],
     new_meal_type: str,
     original_meal_type: str,
-) -> tuple[list[int], None]:
+) -> tuple[list[int] | None, list[tuple[str, dict | None]] | None]:
     if new_meal_type != original_meal_type:
         return surviving_ids, None
 
@@ -880,11 +893,11 @@ def _compute_reply_scope(
     reply_ids = [fid for fid in applied_updated_ids if fid in surviving_set]
 
     if not reply_ids and applied_deleted_ids:
-        # Delete-only path. Return surviving ids so the caller can show remaining item cards
-        # (with deleted_count badge) and keep the correction chain alive.
-        # When nothing survived either, return an empty list so callers hit their
-        # "all items removed" message naturally — no special early_result needed.
-        return surviving_ids, None
+        # Delete-only: return a plain confirmation naming the removed item(s).
+        # B can still quote any remaining item card directly to keep correcting.
+        deleted_names = [r["food_item"] for r in current_items if r["food_log_id"] in applied_deleted_ids]
+        removed_str = ", ".join(deleted_names) if deleted_names else "item"
+        return None, [(f"Removed: {removed_str}.", None)]
 
     return reply_ids if reply_ids else surviving_ids, None
 
