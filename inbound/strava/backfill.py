@@ -8,19 +8,23 @@ Usage:
 Requires DATABASE_URL and Strava env vars to be set (or a .env file in the project root).
 """
 
+import os
 import sys
 import time
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # Look for .env in the project root (works from both the main repo and a worktree)
+    _here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _env = os.path.join(_here, ".env")
+    if not os.path.exists(_env):
+        # worktree sibling — main repo is ../project-b
+        _env = os.path.join(os.path.dirname(_here), "project-b", ".env")
+    load_dotenv(_env)
 except ImportError:
     pass  # not installed in prod; env vars come from the environment directly
 
 import httpx
-
-# Add project root to path so local imports work when run directly
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from system.config import get_strava_config
