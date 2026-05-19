@@ -9,6 +9,7 @@ Telegram is the interface — B sends messages, the bot replies, and will eventu
 | `telegram/` | Everything Telegram — receive updates, route to domains, send replies |
 | `inbound/` | Push-based webhooks from external services (Strava; Garmin and Gmail planned). Each source is a subfolder with `webhook.py` (routes) + `processor.py` (fetch + notify logic). |
 | `domains/` | Business logic per event type; knows nothing about how data arrived |
+| `api/` | Public read APIs — one file per audience/purpose. `limiter.py` holds the shared slowapi instance. Current: `data_visualisation.py`. Future: `nutrition_external.py`, `location.py`. |
 | `outbound/` | Effects to non-Telegram destinations (reminders, calendar — future) |
 | `system/` | Shared plumbing — db connection, config, logging, LLM client |
 | `schema/` | Generated data dictionary and the dump script |
@@ -44,6 +45,23 @@ Cloud Tasks
   → outbound/reminders.py      reads system.reminders, decides skip vs send
   → if send: calls telegram/replies.py
   → updates system.reminders row
+```
+
+### Flow 3 — Cloud Scheduler refreshes the visualisation snapshot
+
+```
+Cloud Scheduler (*/15 * * * *)
+  → POST /internal/refresh-nutrition   X-Internal-Key header checked against INTERNAL_API_KEY
+  → api/data_visualisation.py          TRUNCATE + INSERT from nutrition.food_log (last 7 days)
+  → data_visualisation.nutrition_visualisation   snapshot table updated
+```
+
+External consumers (e.g. awhitepen.com dashboard) read from:
+```
+GET /api/data-visualisation/nutrition
+  → rate limited: 5/min + 200/day per IP, 1000/day per instance (in-memory; not shared across Cloud Run instances)
+  → reads data_visualisation.nutrition_visualisation
+  → returns {"refreshed_at": <iso8601>, "data": [...]}
 ```
 
 **Invariants — do not break these:**

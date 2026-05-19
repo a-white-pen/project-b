@@ -35,8 +35,9 @@
 
 ## Schemas
 
-`b` · `nutrition` · `finances` · `system` · `external` · `exercise` — all Postgres.
+`b` · `nutrition` · `finances` · `system` · `external` · `exercise` · `data_visualisation` — all Postgres.
 
+`data_visualisation` holds snapshot tables refreshed by Cloud Scheduler for external read APIs.
 Analytics views go in a `marts` schema when there is something worth visualizing. Not yet.
 
 ## Repo layout
@@ -45,6 +46,7 @@ Analytics views go in a `marts` schema when there is something worth visualizing
 telegram/    Telegram protocol — receive, route, send
 inbound/     Push-based webhooks from external services (Strava; Garmin and Gmail planned)
 domains/     Business logic per domain (food, weight, sleep, attention, etc.)
+api/         Public read APIs — one file per audience/purpose (data_visualisation, future: nutrition_external, location)
 outbound/    Effects to non-Telegram destinations (reminders, calendar — future)
 system/      Shared plumbing: db, config, logging, LLM client
 schema/      Data dictionary (generated) and the dump script

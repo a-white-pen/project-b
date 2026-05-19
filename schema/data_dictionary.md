@@ -84,7 +84,7 @@ One row per body-weight reading for B. Grain: one measurement. No telegram_updat
 ## Schema: `data_visualisation`
 
 ### Table: `data_visualisation.nutrition_visualisation`
-Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud Scheduler. Fully overwritten on each refresh (TRUNCATE + INSERT). Grain: one row per food_log_id from nutrition.food_log. Consumed by GET /api/food/recent.
+Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud Scheduler. Fully overwritten on each refresh (TRUNCATE + INSERT). Grain: one row per food_log_id from nutrition.food_log. Consumed by GET /api/data-visualisation/nutrition.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|

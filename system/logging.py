@@ -24,6 +24,7 @@ _SENSITIVE_ENV_KEYS = (
     "STRAVA_CLIENT_SECRET",
     "STRAVA_REFRESH_TOKEN",
     "STRAVA_WEBHOOK_VERIFY_TOKEN",
+    "INTERNAL_API_KEY",
 )
 
 _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (

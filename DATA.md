@@ -35,6 +35,7 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 | `external` | Raw reference data from external sources (menus, scraped data) |
 | `system` | Internal state — Telegram raw payloads, outbound log, conversation state, OAuth tokens |
 | `marts` | Read-only analytics views — never written by the app |
+| `data_visualisation` | Snapshot tables refreshed by Cloud Scheduler for external read APIs — never written by the live request path |
 
 If unsure which schema a new table belongs to, ask. Do not invent a new schema without approval.
 

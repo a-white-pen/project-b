@@ -7,10 +7,11 @@ Functions:
   _handle_awaiting_clearer_photo(msg, context)   — re-runs extraction with a new photo when the original label was unreadable
   _handle_awaiting_quantity(msg, context)         — re-downloads saved label photo and runs extraction with B's quantity reply
   _handle_photo_correction(msg, current_items)    — re-reads macros from a correction photo via vision model, applies changes
-  _reestimate_item(original, correction_text, ...) — re-estimates macros for a renamed food item via LLM
+  _reestimate_item(original, correction_text, ...) — re-estimates macros when food name or quantity changes
   _fetch_items(food_log_ids)                      — fetches food_log rows by ID list
   _format_items_for_llm(items)                    — formats items as readable text for correction LLM prompts
   _apply_corrections(correction_items, ...)       — applies parsed corrections to DB; returns surviving food_log_ids
+  _compute_reply_scope(correction_items, ...)    — determines which ids to show in reply (meal move vs item edit vs delete-only)
 """
 
 import dataclasses
@@ -19,7 +20,7 @@ import os
 
 import psycopg2.extras
 
-from domains.food.service import _build_item_results, _format_item_reply, _parse_json, handle_food_log
+from domains.food.service import _build_item_results, _parse_json, handle_food_log
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
@@ -100,6 +101,7 @@ Return a JSON object with this exact structure:
       "food_log_id": <int — the id of the existing row to update or delete>,
       "action": "<update or delete>",
       "food_item": "<description — ONLY include if the user explicitly changed the name>",
+      "food_meta": {{"qty": {{"amount": <number>, "unit": "<string>"}}}} ,
       "kcal": <number — ONLY include if the user explicitly stated a new value>,
       "protein_g": <number — ONLY include if explicitly changed>,
       "carbs_g": <number — ONLY include if explicitly changed>,
@@ -115,6 +117,9 @@ Rules:
 - Only include items that need to change (action=update) or be removed (action=delete)
 - For items not mentioned by the user, omit them from the list entirely
 - For fields not explicitly changed, OMIT the key entirely — do NOT include null
+- food_meta.qty: include ONLY if the user explicitly stated a new weight or quantity \
+(e.g. "actually 70g", "2 servings"). When only quantity changes, do NOT include macro \
+fields — the system will re-estimate them from the new quantity
 - meal_type must be one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout
 - meal_type: only change if the user explicitly mentions it
 - "pre workout", "pre-workout", "post workout", "post-workout" always refer to meal_type changes — \
@@ -312,8 +317,13 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         # Snapshot explicit macro values before any re-estimation merge.
         user_stated = [col for col in _MACRO_COLS if col in item]
 
-        if "food_item" in item:
-            # Food item name changed — re-estimate macros and food_meta for the new item.
+        # Quantity change: LLM returns food_meta.qty but no macros → re-estimate from new weight.
+        # This is distinct from explicit macro correction ("kcal is 300") which stays as "manual".
+        correction_food_meta = item.pop("food_meta", None) or {}
+        has_qty_change = bool(correction_food_meta.get("qty"))
+
+        if "food_item" in item or has_qty_change:
+            # Re-estimate: food name changed, OR quantity changed (macros scale with weight).
             fid = item.get("food_log_id")
             original = next((r for r in current_items if r["food_log_id"] == fid), None)
             if original is not None:
@@ -326,27 +336,47 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                         update_id=msg.update_id,
                         food_log_id=fid,
                     )
+                    # Re-estimation failed. Macros stay unchanged.
+                    # If the user stated a new quantity, still persist food_meta.qty so the
+                    # logged quantity is at least correct even though macros weren't scaled.
+                    if has_qty_change:
+                        original_food_meta = original.get("food_meta") or {}
+                        merged_food_meta = {**original_food_meta, **correction_food_meta}
+                        if merged_food_meta:
+                            item["_food_meta"] = merged_food_meta
                 else:
-                    # food_item: use re-estimation (has full context of original + correction text)
-                    item["food_item"] = reestimated.get("food_item") or item["food_item"]
+                    if "food_item" in item:
+                        # food_item: use re-estimation (has full context of original + correction text)
+                        item["food_item"] = reestimated.get("food_item") or item["food_item"]
                     # macros: re-estimation as base; user-stated values (snapshotted above) take priority
                     for col in _MACRO_COLS:
                         if col not in item:
                             item[col] = reestimated.get(col)
-                    # food_meta: only write if re-estimation returned something non-empty —
-                    # never wipe existing metadata just because the model omitted those keys.
+                    # food_meta: three-layer merge so existing brand/prep/notes are never wiped.
+                    # Priority (low → high): original DB row → re-estimation → user correction.
+                    original_food_meta = original.get("food_meta") or {}
                     reestimated_food_meta = reestimated.get("food_meta") or {}
-                    if reestimated_food_meta:
-                        item["_food_meta"] = reestimated_food_meta
+                    merged_food_meta = {**original_food_meta, **reestimated_food_meta, **correction_food_meta}
+                    if merged_food_meta:
+                        item["_food_meta"] = merged_food_meta
                     item["_macro_meta"] = {
                         "model": MODEL_FLASH,
-                        "corrected_from": original["food_item"],
+                        **({"corrected_from": original["food_item"]} if "food_item" in item else {}),
                         "correction_update_id": msg.update_id,
                         **({"user_stated_fields": user_stated} if user_stated else {}),
                     }
+        elif correction_food_meta:
+            # food_meta changed but no qty (e.g. brand/prep note) — no re-estimation needed,
+            # just persist the updated metadata merged on top of the original so existing
+            # brand/prep/notes/qty are not wiped by a partial LLM response.
+            fid = item.get("food_log_id")
+            original = next((r for r in current_items if r["food_log_id"] == fid), None)
+            original_food_meta = (original.get("food_meta") or {}) if original else {}
+            item["_food_meta"] = {**original_food_meta, **correction_food_meta}
 
-        # Set macro provenance. Applies whether or not food_item changed.
-        # "manual" when B explicitly stated any value; "llm" when all macros came from re-estimation.
+        # Set macro provenance. Applies whether or not food_item / qty changed.
+        # "manual" when B explicitly stated any macro value; "llm" when macros came from re-estimation.
+        # Quantity-only corrections never set user_stated, so they always land in the llm branch.
         # If neither (e.g. only meal_type changed), leave provenance columns untouched.
         if user_stated:
             item["_macro_input"] = "manual"
@@ -362,7 +392,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                 item["_macro_input"] = "manual"
                 item["_macro_method"] = "manual"
         elif "_macro_meta" in item:
-            # food_item changed, re-estimation ran, no explicit macros — all LLM.
+            # food_item or qty changed, re-estimation ran, no explicit macros — all LLM.
             item["_macro_input"] = "description"
             item["_macro_method"] = "llm"
 
@@ -372,7 +402,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
     # The quoted food_log_ids are already marked as [quoted target] in the LLM prompt, so the
     # model knows which item triggered the correction without an allowlist filter here.
     try:
-        surviving_ids = _apply_corrections(
+        surviving_ids, applied_deleted_ids, applied_updated_ids = _apply_corrections(
             correction_items=correction_items,
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
@@ -384,15 +414,19 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         return [("Correction parsed but failed to save — please try again.", None)]
 
     new_history = (correction_history + [correction_text])[-_MAX_HISTORY:] if correction_text else correction_history
-    deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
+    deleted_count = len(applied_deleted_ids)
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
+
+    reply_ids, _ = _compute_reply_scope(
+        applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
+    )
 
     # Build updated item list for the reply.
     # _apply_corrections already committed — guard this re-fetch so a DB hiccup here
     # does not silence the reply entirely after a successful write.
     try:
-        updated_items = _fetch_items(surviving_ids) if surviving_ids else []
+        updated_items = _fetch_items(reply_ids) if reply_ids else []
     except Exception as e:
         log_failure(logger, logging.WARNING, "food_correction_refetch_failed", e, update_id=msg.update_id)
         if surviving_ids:
@@ -414,6 +448,7 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         "food_correction_completed",
         update_id=msg.update_id,
         surviving_item_count=len(surviving_ids),
+        reply_item_count=len(reply_ids),
         meal_type=new_meal_type,
     )
 
@@ -649,7 +684,7 @@ def _handle_photo_correction(
             item["_macro_meta"] = item_meta
 
     try:
-        surviving_ids = _apply_corrections(
+        surviving_ids, applied_deleted_ids, applied_updated_ids = _apply_corrections(
             correction_items=correction_items,
             new_meal_type=new_meal_type,
             original_meal_type=original_meal_type,
@@ -662,12 +697,16 @@ def _handle_photo_correction(
 
     photo_note = f"[photo correction: {caption}]" if caption else "[photo correction]"
     new_history = (correction_history + [photo_note])[-_MAX_HISTORY:]
-    deleted_count = sum(1 for c in correction_items if c.get("action") == "delete")
+    deleted_count = len(applied_deleted_ids)
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
+    reply_ids, _ = _compute_reply_scope(
+        applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
+    )
+
     try:
-        updated_items = _fetch_items(surviving_ids) if surviving_ids else []
+        updated_items = _fetch_items(reply_ids) if reply_ids else []
     except Exception as e:
         log_failure(logger, logging.WARNING, "food_photo_correction_refetch_failed", e, update_id=msg.update_id)
         if surviving_ids:
@@ -684,7 +723,15 @@ def _handle_photo_correction(
             return [("Correction saved — quote this message to correct further.", fallback_state)]
         updated_items = []
 
-    log_event(logger, logging.INFO, "food_photo_correction_completed", update_id=msg.update_id, surviving_item_count=len(surviving_ids))
+    log_event(
+        logger,
+        logging.INFO,
+        "food_photo_correction_completed",
+        update_id=msg.update_id,
+        surviving_item_count=len(surviving_ids),
+        reply_item_count=len(reply_ids),
+        meal_type=new_meal_type,
+    )
 
     if not updated_items:
         return [(f"Done — all items removed from the {new_meal_type.replace('_', ' ')} log.", None)]
@@ -701,14 +748,22 @@ def _handle_photo_correction(
 
 
 # Re-estimates a single food item using the original logged entry plus the user's correction text.
-# Called when food_item changes in a correction — ensures macros, food_meta, and metadata columns
-# are all refreshed for the new item rather than inheriting stale values from the original.
+# Called when food_item name changes OR quantity changes — ensures macros, food_meta, and metadata
+# columns are refreshed rather than inheriting stale values from the original.
 # Inputs: original — the current food_log row dict; correction_text — what B said;
 #         update_id — for logging; correction_history — prior corrections forwarded to the LLM for context.
 # Returns a dict with food_item, macros, food_meta on success, or None on failure (caller falls back
 # to rename-only behaviour so the correction is never blocked by a re-estimation error).
 def _reestimate_item(original: dict, correction_text: str, update_id: int | None, correction_history: list[str] | None = None) -> dict | None:
     parts = [original.get("food_item", "?")]
+    # Include original quantity so the LLM knows the baseline to scale from.
+    # Without this, "actually 70g" when logged at 150g gets estimated from scratch
+    # rather than scaled from the known baseline.
+    orig_qty = (original.get("food_meta") or {}).get("qty") or {}
+    if orig_qty.get("amount") is not None:
+        unit = orig_qty.get("unit", "")
+        qty_str = f"{orig_qty['amount']}{' ' + unit if unit else ''}"
+        parts.append(f"[logged qty: {qty_str}]")
     macros = []
     if original.get("kcal") is not None:
         macros.append(f"{original['kcal']:.0f} kcal")
@@ -794,6 +849,46 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
         conn.close()
 
 
+# Determines which food_log_ids to include in the correction reply.
+#
+# Uses actual DB-applied sets (from _apply_corrections) rather than raw LLM items so that:
+#   - hallucinated food_log_ids that were skipped by _apply_corrections never appear in reply text
+#   - missing food_log_id keys in LLM output cannot cause a KeyError here
+#
+# Rules:
+#   meal_type changed        → all surviving ids (B needs to see the full meal after a move)
+#   update + delete          → only the updated ids (deleted items are gone; delete count shown on last card)
+#   delete only, survivors   → surviving ids so the correction chain stays open; deleted_count on last card
+#   delete only, all gone    → ([], None) — callers fall through to the "all removed" message at their end
+#   fallback                 → all surviving ids
+#
+# Returns (reply_ids, early_result):
+#   reply_ids    — list of ids to fetch and show; empty list signals "all gone" to caller
+#   early_result — always None (early-return removed; all paths now use the standard reply flow)
+def _compute_reply_scope(
+    applied_deleted_ids: set[int],
+    applied_updated_ids: set[int],
+    surviving_ids: list[int],
+    current_items: list[dict],
+    new_meal_type: str,
+    original_meal_type: str,
+) -> tuple[list[int], None]:
+    if new_meal_type != original_meal_type:
+        return surviving_ids, None
+
+    surviving_set = set(surviving_ids)
+    reply_ids = [fid for fid in applied_updated_ids if fid in surviving_set]
+
+    if not reply_ids and applied_deleted_ids:
+        # Delete-only path. Return surviving ids so the caller can show remaining item cards
+        # (with deleted_count badge) and keep the correction chain alive.
+        # When nothing survived either, return an empty list so callers hit their
+        # "all items removed" message naturally — no special early_result needed.
+        return surviving_ids, None
+
+    return reply_ids if reply_ids else surviving_ids, None
+
+
 # Formats current food_log rows as readable text for the correction LLM prompt.
 # Includes logged quantity from food_meta so the model can pro-rate label macros correctly
 # without needing B to repeat the quantity in the correction message.
@@ -828,14 +923,18 @@ def _format_items_for_llm(items: list[dict], quoted_ids: set[int] | None = None)
     return "\n".join(lines)
 
 
-# Applies parsed corrections: updates or deletes rows. Returns surviving food_log_ids.
+# Applies parsed corrections: updates or deletes rows.
+# Returns a 3-tuple: (surviving_ids, deleted_ids, updated_ids).
+#   surviving_ids — food_log_ids from all_ids that were not deleted
+#   deleted_ids   — set of food_log_ids that were DELETE'd this call
+#   updated_ids   — set of food_log_ids where at least one column was actually written
 def _apply_corrections(
     correction_items: list[dict],
     new_meal_type: str,
     original_meal_type: str,
     all_ids: list[int],
     meal_ids: list[int] | None = None,
-) -> list[int]:
+) -> tuple[list[int], set[int], set[int]]:
     deleted_ids: set[int] = set()
     updated_ids: set[int] = set()
 
@@ -884,7 +983,9 @@ def _apply_corrections(
                                 f"UPDATE nutrition.food_log SET {set_clause} WHERE food_log_id = %s",
                                 values,
                             )
-                        updated_ids.add(fid)
+                            updated_ids.add(fid)
+                        # If updates is empty nothing was written; omit from updated_ids so the
+                        # caller does not treat a no-op item as a successful update.
 
                 # Pass 2: if meal_type changed, apply it to ALL surviving meal rows in one shot.
                 # Uses meal_ids (the full batch) so "that was dinner" moves every item logged
@@ -907,6 +1008,6 @@ def _apply_corrections(
                     surviving_count=len(surviving),
                     meal_type_changed=new_meal_type != original_meal_type,
                 )
-                return surviving
+                return surviving, deleted_ids, updated_ids
     finally:
         conn.close()

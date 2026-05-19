@@ -213,6 +213,8 @@ dim sum, congee, braised meats.
 
 Identify each distinct food item visible. Use caption for dish name, portion, and extras. \
 Estimate portion sizes and macros.
+Do not log sauces, condiments, dressings, or dipping sauces as separate items unless the \
+caption explicitly names them.
 If caption mentions food not visible in the image, include as separate items \
 with macro_input="description", macro_method="llm".
 
