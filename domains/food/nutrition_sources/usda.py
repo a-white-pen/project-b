@@ -37,7 +37,7 @@ _TIMEOUT = 10  # seconds
 
 # USDA nutrient IDs for the fields we track.
 _NUTRIENT_IDS: dict[str, int] = {
-    "kcal":      1008,  # Energy, Atwater factors (kcal)
+    "kcal":      1008,  # Energy, Atwater general factors (kcal)
     "protein_g": 1003,  # Protein
     "fat_g":     1004,  # Total lipid (fat)
     "carbs_g":   1005,  # Carbohydrate, by difference
@@ -45,6 +45,10 @@ _NUTRIENT_IDS: dict[str, int] = {
     "sugar_g":   2000,  # Sugars, total including NLEA
     "sodium_mg": 1093,  # Sodium
 }
+
+# Some SR Legacy entries store kcal under 2047 (Atwater specific factors) instead of 1008.
+# Fall back to 2047 when 1008 is null so we don't zero-default a real calorie value.
+_KCAL_FALLBACK_ID = 2047
 
 _SELECT_PROMPT = """\
 Select the best USDA food match for this food log entry.
@@ -202,6 +206,8 @@ def _select_candidate(
         per_100g: dict = {}
         for field, nutrient_id in _NUTRIENT_IDS.items():
             raw_val = nutrients.get(nutrient_id)
+            if raw_val is None and field == "kcal":
+                raw_val = nutrients.get(_KCAL_FALLBACK_ID)
             per_100g[field] = raw_val if raw_val is not None else 0.0
         # sodium is already mg/100g in USDA (nutrientId 1093 reports in mg)
         return {
@@ -227,6 +233,9 @@ def _scale_candidate(candidate: dict, grams: float, update_id: int | None) -> di
 
     for field, nutrient_id in _NUTRIENT_IDS.items():
         raw_val = nutrients.get(nutrient_id)
+        # For kcal: some SR Legacy entries use 2047 (Atwater specific) instead of 1008.
+        if raw_val is None and field == "kcal":
+            raw_val = nutrients.get(_KCAL_FALLBACK_ID)
         # USDA null means trace/zero for a matched item — zero-default it.
         # This prevents LLM gap-fill from running on USDA-matched items for genuinely-trace fields.
         result[field] = round(raw_val * factor, 1) if raw_val is not None else 0.0
