@@ -3,7 +3,7 @@ One-off script to fully sync all Strava activities into exercise.cardio_activiti
 and exercise.cardio_splits.
 
 Usage:
-    python3 scripts/backfill_strava.py
+    python3 inbound/strava/backfill.py
 
 Requires DATABASE_URL and Strava env vars to be set (or a .env file in the project root).
 """
@@ -21,7 +21,7 @@ import httpx
 
 # Add project root to path so local imports work when run directly
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from system.config import get_strava_config
 from system.db import get_connection
