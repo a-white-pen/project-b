@@ -189,6 +189,11 @@ def parse_active_sets(
             # WARMUP, COOLDOWN, unknown — not stored as set rows.
             continue
 
+        # Skip sets with 0 reps — they represent incomplete or cancelled sets.
+        # set_index does not advance so numbering stays contiguous.
+        if item.get("repetitionCount") == 0:
+            continue
+
         set_index += 1
         exercise_name, exercise_category, all_candidates = _pick_exercise(item)
         weight_kg = _convert_grams_to_kg(item.get("weight") or item.get("weightValue"))
