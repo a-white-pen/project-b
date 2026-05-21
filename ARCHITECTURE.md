@@ -7,7 +7,7 @@ Telegram is the interface — B sends messages, the bot replies, and will eventu
 | Folder | Responsibility |
 |---|---|
 | `telegram/` | Everything Telegram — receive updates, route to domains, send replies |
-| `inbound/` | Push-based webhooks from external services (Strava; Garmin and Gmail planned). Each source is a subfolder with `webhook.py` (routes) + `processor.py` (fetch + notify logic). |
+| `inbound/` | Push-based webhooks and triggered fetches from external services. Each source is a subfolder with `processor.py` (fetch + persist logic). Strava has a `webhook.py` (routes); Garmin has no webhook — it is triggered by the Strava processor when a strength activity lands. |
 | `domains/` | Business logic per event type; knows nothing about how data arrived |
 | `api/` | Public read APIs — one file per audience/purpose. `limiter.py` holds the shared slowapi instance. Current: `data_visualisation.py`. Future: `nutrition_external.py`, `location.py`. |
 | `outbound/` | Effects to non-Telegram destinations (reminders, calendar — future) |
@@ -37,7 +37,27 @@ Telegram servers
 
 **Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food`, `attention`, `sleep_wake`, and `weight`.
 
-### Flow 2 — A reminder fires *(not yet implemented)*
+### Flow 2 — Strava strength activity (WeightTraining / Workout / Crossfit)
+
+```
+Strava webhook (existing)
+  → POST /strava/webhook (existing)
+  → inbound/strava/processor.py
+      → save_cardio_activity() returns (False, "strength") — no cardio row written
+      → inbound/garmin/processor.process_strength_event() [background, same thread]
+          → inbound/garmin/client.get_garmin_client()
+              → system.garmin_tokens          hydrate session (or login fresh + persist)
+          → Garmin Connect API               fetch activity list, match by start_time ±120s
+          → Garmin Connect API               get_activity() + get_activity_exercise_sets()
+          → system.garmin_inbound            store raw payload
+          → retries at +90s / +240s / +600s  if Garmin hasn't synced yet
+          → exercise.strength_sessions + exercise.strength_sets  if exercise_sets non-empty
+          → telegram/replies.py    proactive notification with per-exercise set tables + per-set HR
+```
+
+No new webhook route needed — Garmin is polled in response to the Strava trigger.
+
+### Flow 3 — A reminder fires *(not yet implemented)*
 
 ```
 Cloud Tasks
@@ -47,7 +67,7 @@ Cloud Tasks
   → updates system.reminders row
 ```
 
-### Flow 3 — Cloud Scheduler refreshes the visualisation snapshot
+### Flow 4 — Cloud Scheduler refreshes the visualisation snapshot
 
 ```
 Cloud Scheduler (*/15 * * * *)

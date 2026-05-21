@@ -4,6 +4,9 @@ Centralised config — reads all environment variables in one place.
 Functions:
   get_config()        — returns a Config instance populated from os.environ; raises on missing required vars
   get_strava_config() — returns a StravaConfig instance; raises if Strava vars are not set
+
+Note: Garmin has no env-var config in the app — it uses a token blob stored in
+system.garmin_tokens (written by the `garmin auth` CLI bootstrap step). See inbound/garmin/client.py.
 """
 
 import os

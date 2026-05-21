@@ -2,19 +2,24 @@
 Single send path for all outbound Telegram messages.
 
 Functions:
-  send_reply(chat_id, text, reply_to_message_id) — sends a text message to the given Telegram chat,
-      optionally quoting a specific message.
+  send_reply(chat_id, text, reply_to_message_id, parse_mode, bot_token) — sends a text message
+      to the given Telegram chat, optionally quoting a specific message.
       Returns (telegram_message_id, sent_payload) so the caller can log to telegram_outbound.
       telegram_message_id is None if the send failed.
-  _detect_parse_mode(text) — enables Telegram HTML parsing when formatted tags are present
+      Pass bot_token explicitly to bypass get_config() (e.g. from scripts without full env).
+  get_latest_chat_id()            — reads B's chat_id from system.telegram_outbound.
+  store_outbound(message_id, payload) — logs a proactive outbound message to system.telegram_outbound.
+  _detect_parse_mode(text)        — enables Telegram HTML parsing when formatted tags are present.
 """
 
+import json
 import logging
 import re
 
 import httpx
 
 from system.config import get_config
+from system.db import get_connection
 from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
@@ -25,7 +30,9 @@ _HTML_TAG_RE = re.compile(r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a)(?:\s+
 # Sends a text message to a Telegram chat via the sendMessage API.
 # Inputs: chat_id (from the inbound update), text (message to send),
 #         reply_to_message_id (optional — quotes a specific message as a Telegram reply),
-#         parse_mode (optional — Telegram parse_mode; auto-detected for safe HTML tags).
+#         parse_mode (optional — Telegram parse_mode; auto-detected for safe HTML tags),
+#         bot_token (optional — pass explicitly to skip get_config(); useful in scripts
+#                   that don't have the full env set, e.g. replay.py).
 # Outputs: (telegram_message_id, sent_payload).
 #   telegram_message_id — Telegram's message_id for the sent message; None on failure.
 #   sent_payload        — the full JSON body sent to the API (for outbound logging).
@@ -35,9 +42,10 @@ def send_reply(
     text: str,
     reply_to_message_id: int | None = None,
     parse_mode: str | None = None,
+    bot_token: str | None = None,
 ) -> tuple[int | None, dict]:
-    config = get_config()
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    token = bot_token or get_config().telegram_bot_token
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload: dict = {"chat_id": chat_id, "text": text}
     resolved_parse_mode = parse_mode or _detect_parse_mode(text)
     if resolved_parse_mode:
@@ -70,6 +78,48 @@ def send_reply(
             text_chars=len(text),
         )
         return None, payload
+
+
+# Reads the most recent chat_id from system.telegram_outbound.
+# Used to find B's chat_id for proactive (unprompted) messages — both processors call this.
+# Inputs: none.
+# Outputs: chat_id as int, or None if no usable rows exist.
+def get_latest_chat_id() -> int | None:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT (payload->>'chat_id')::bigint
+                    FROM system.telegram_outbound
+                    WHERE payload->>'chat_id' IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+    finally:
+        conn.close()
+
+
+# Inserts a row into system.telegram_outbound for a proactive (unprompted) message.
+# telegram_update_id is NULL because there is no inbound update that triggered this.
+# Inputs: Telegram message_id from the API response, full sent payload dict.
+def store_outbound(message_id: int, payload: dict) -> None:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO system.telegram_outbound"
+                    " (message_id, telegram_update_id, payload)"
+                    " VALUES (%s, NULL, %s)",
+                    (message_id, json.dumps(payload)),
+                )
+    finally:
+        conn.close()
 
 
 # Detects whether a reply uses Telegram-compatible HTML tags and sets parse_mode="HTML".

@@ -9,9 +9,11 @@
 - Sleep/wake: `/sleep`, `/wake`, voice phrases ("night night", "good morning", "orh orh"). Classifier tightened against greeting false positives.
 - Location: stores `b.location` updates; used to resolve timezone for all other domains.
 - Attention: starts/finishes `b.attention_sessions` via text or voice. Starting auto-closes the previous open session. Quoted-reply corrections supported. One-open-session invariant enforced in app code.
-- Exercise (Strava cardio): webhook receiver; proactive Telegram notifications on create/update/delete; saves to `exercise.cardio_activities` + `exercise.cardio_splits`. Strength/non-cardio types logged but not saved (Phase 3).
+- Exercise (Strava cardio): webhook receiver; proactive Telegram notifications on create/update/delete; saves to `exercise.cardio_activities` + `exercise.cardio_splits`.
+- Exercise (Garmin strength — live): `WeightTraining`, `Workout`, `Crossfit` from Strava trigger a Garmin Connect fetch. Raw payload stored in `system.garmin_inbound`; parsed into `exercise.strength_sessions` + `exercise.strength_sets`; Telegram notification sent with per-exercise set tables and per-set HR.
 
 **In progress:**
+- Exercise strength module (`exercise/strength`) — live; pending merge to master
 - Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
 - Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
 
@@ -44,7 +46,7 @@ Analytics views go in a `marts` schema when there is something worth visualizing
 
 ```
 telegram/    Telegram protocol — receive, route, send
-inbound/     Push-based webhooks from external services (Strava; Garmin and Gmail planned)
+inbound/     Push-based webhooks from external services (Strava live; Garmin polling via Strava trigger)
 domains/     Business logic per domain (food, weight, sleep, attention, etc.)
 api/         Public read APIs — one file per audience/purpose (data_visualisation, future: nutrition_external, location)
 outbound/    Effects to non-Telegram destinations (reminders, calendar — future)

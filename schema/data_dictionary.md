@@ -208,6 +208,58 @@ Per-km lap data for each cardio activity. One row per Garmin auto-lap (typically
 | `pace_zone` | `integer` | yes |  | Strava pace zone (1–5) for this lap. Null for walks and some outdoor activities. |
 | `created_at` | `timestamp with time zone` | no | now() |  |
 
+### Table: `exercise.strength_sessions`
+One row per strength training session. Source-agnostic: source_app + source_activity_id identify the origin platform. inbound_row_id is a loose FK into whichever raw inbound table applies (system.garmin_inbound today).
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `strength_session_id` | `integer` | no | nextval('exercise.strength_sessions_strength_session_id_seq'::regclass) |  |
+| `strava_inbound_id` | `integer` | yes |  | Loose FK to system.strava_inbound. NULL if session did not come via a Strava webhook trigger (e.g. manual entry or future direct-source ingestion). |
+| `strava_activity_id` | `bigint` | yes |  | Strava-side activity ID. NULL if not Strava-triggered. |
+| `source_app` | `text` | no | 'garmin'::text | Platform that recorded the session. garmin = Garmin Connect. hevy = HEVY app. manual = logged directly. |
+| `inbound_row_id` | `integer` | yes |  | Loose FK into the relevant raw inbound table — garmin_inbound_id when source_app=garmin. No PG foreign key because the target table varies by source. |
+| `source_activity_id` | `text` | yes |  | Activity ID in the source platform. TEXT to accommodate non-integer IDs from future sources. |
+| `activity_name` | `text` | yes |  | Session name as recorded in the source platform, e.g. Full Body (Set A). |
+| `started_at` | `timestamp with time zone` | no |  | UTC timestamp when the session began. |
+| `duration_seconds` | `integer` | yes |  | Total elapsed session duration in seconds, as reported by the source platform. |
+| `avg_hr` | `numeric(5,1)` | yes |  | Average heart rate across the full session, from the source platform summary. |
+| `max_hr` | `numeric(5,1)` | yes |  | Peak heart rate recorded during the session. |
+| `calories_kcal` | `integer` | yes |  | Active calories burned as reported by the source platform. NULL when not available. |
+| `total_active_sets` | `integer` | yes |  | Count of ACTIVE sets only. REST periods are not counted. |
+| `total_exercises` | `integer` | yes |  | Count of distinct exercise names recorded in the session. |
+| `perceived_exertion` | `integer` | yes |  | RPE 1–10, B-reported via Telegram. NULL until reported. Not device-recorded. |
+| `device_name` | `text` | yes |  | Name of the recording device, e.g. Garmin Forerunner 265. NULL when not available from source. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific fields not promoted to dedicated columns. Keeps schema stable as source platforms evolve. |
+| `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp (UTC). |
+| `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp (UTC). Set on any correction or re-sync. |
+
+### Table: `exercise.strength_sets`
+One row per active set in a strength session. REST periods from Garmin are folded into rest_seconds_after on the preceding active set — not stored as separate rows. Source-agnostic: source_app on the parent session identifies whether data came from Garmin, HEVY, etc.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `strength_set_id` | `integer` | no | nextval('exercise.strength_sets_strength_set_id_seq'::regclass) |  |
+| `strength_session_id` | `integer` | no |  | FK → exercise.strength_sessions. Cascades on delete. |
+| `set_index` | `integer` | no |  | 1-based position of this active set within the session, in chronological order. First set = 1. REST rows from Garmin are skipped when numbering. |
+| `exercise_name` | `text` | yes |  | Exercise label as reported by the source app. For Garmin: highest-probability candidate from the on-device ML classifier (e.g. GOBLET_SQUAT). For HEVY: user-defined exercise name. |
+| `exercise_category` | `text` | yes |  | Broad movement category as reported by the source app. For Garmin: the category field returned by get_activity_exercise_sets (e.g. STRENGTH_TRAINING). May differ across sources — do not assume a controlled vocabulary until a catalog table is introduced. |
+| `reps_recorded` | `integer` | yes |  | Rep count recorded by the device. NULL for timed sets (planks etc.) or if device did not record reps. |
+| `weight_recorded` | `numeric(10,3)` | yes |  | Weight as recorded by the device, in the unit given by weight_recorded_unit. Garmin stores grams internally; we convert to kg on write so weight_recorded_unit is always kg for Garmin rows. Derive kg and lb values via CASE when needed. |
+| `weight_recorded_unit` | `text` | yes |  | Unit of weight_recorded. 'kg' or 'lb'. Garmin rows are always 'kg' (converted from grams at write time). HEVY rows may be 'lb' if the user logs in imperial. |
+| `duration_seconds` | `numeric(7,2)` | yes |  | Active set duration in seconds. Populated for timed sets (e.g. planks, wall sits). NULL for rep-based sets where duration was not tracked. |
+| `rest_seconds_after` | `numeric(7,2)` | yes |  | Rest time in seconds between this set and the next active set. Derived from Garmin REST-type rows that immediately follow this set. NULL if no rest was recorded or this is the last set. |
+| `started_at` | `timestamp with time zone` | yes |  | Wall-clock start time of this set. From Garmin startTime field. NULL if source did not provide per-set timestamps. |
+| `avg_hr_during_set` | `numeric(5,1)` | yes |  | Average heart rate in bpm during the active set, as reported by the device. NULL if HR was not recorded or device lacked a heart rate sensor at set time. |
+| `max_hr_during_set` | `numeric(5,1)` | yes |  | Peak heart rate in bpm during the active set, as reported by the device. NULL if HR was not recorded or device lacked a heart rate sensor at set time. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-app-specific fields that do not fit the normalised columns. For Garmin: full exercise candidate list with probability scores (e.g. [{'exercise': 'GOBLET_SQUAT', 'probability': 0.996}, ...]). For HEVY: superset_id, notes, etc. Schema varies by source_app. |
+| `reps_reported` | `integer` | yes |  | Self-reported rep count from B via Telegram quote-reply correction. Overrides reps_recorded for display; device value is preserved. |
+| `weight_reported` | `numeric(10,3)` | yes |  | Self-reported weight from B via Telegram, in the unit given by weight_reported_unit. NULL until a correction arrives. |
+| `weight_reported_unit` | `text` | yes |  | Unit of weight_reported. 'kg' or 'lb'. Preserved exactly as B stated (e.g. '25 lb each hand' → weight_reported=25, weight_reported_unit='lb'). |
+| `reported_at` | `timestamp with time zone` | yes |  | Timestamp when B submitted the Telegram correction. NULL until a correction arrives. |
+| `reported_meta` | `jsonb` | no | '{}'::jsonb | Raw extracted correction data from B's Telegram message. Stores the original text and any structured fields the LLM extracted (e.g. '25kg each hand', notes). Useful for debugging extraction quality. |
+| `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp. Set once on insert. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp. Set on every correction write. |
+
 ## Schema: `nutrition`
 
 ### Table: `nutrition.food_log`
@@ -246,6 +298,27 @@ One row per bot reply that may participate in a quoted correction chain. Root ro
 | `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
 | `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids": [int], "meal_type": str} attention: {"attention_session_ids": [int]} |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+
+### Table: `system.garmin_inbound`
+Raw payloads fetched from Garmin Connect. One row per successful fetch (no upsert) so we have full history of what Garmin returned, including any schema changes over time.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `garmin_inbound_id` | `integer` | no | nextval('system.garmin_inbound_garmin_inbound_id_seq'::regclass) |  |
+| `object_id` | `bigint` | no |  | Garmin activityId. Not unique — a single activity may be fetched multiple times (e.g. backfill + live capture). |
+| `payload` | `jsonb` | no |  | JSON shape: {"summary": <activity_detail>, "exercise_sets": <exerciseSets response>, "hr_samples": [[timestamp_ms, hr_bpm], ...]}. hr_samples is the second-by-second HR stream from the details endpoint; may be absent for rows captured before that field was added. |
+| `strava_inbound_id` | `integer` | yes |  | FK to the Strava webhook event that triggered this fetch. NULL for backfill or manual CLI runs. |
+| `received_at` | `timestamp with time zone` | no | now() |  |
+| `source` | `text` | no |  | Why this fetch happened. strava_trigger = Strava webhook fired and we looked up the matching Garmin activity. backfill = one-off historical sync. manual = ad-hoc CLI run. |
+
+### Table: `system.garmin_tokens`
+Single-row cache of the Garmin Connect DI OAuth2 token blob. Written by the garmin-health-data CLI bootstrap (garmin auth). di_token (~18h) is refreshed automatically; di_refresh_token rotates on each refresh (~30d). Re-bootstrap needed only if refresh_token expires.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `garmin_token_id` | `integer` | no | 1 |  |
+| `token_blob` | `jsonb` | no |  | JSON: {"auth_mode": "garmin_health_data", "di_token": "<jwt>", "di_refresh_token": "<base64>", "di_client_id": "GARMIN_CONNECT_MOBILE_ANDROID_DI_2025Q2"}. Upserted on every token refresh. |
+| `updated_at` | `timestamp with time zone` | no | now() |  |
 
 ### Table: `system.strava_inbound`
 Every inbound Strava webhook event received by the app, stored as raw JSON. One row per event delivery. Written before any processing so nothing is lost even if processing fails. Mirrors the pattern of system.telegram_inbound. aspect_type in payload distinguishes create, update, and delete events for the same object_id.

@@ -4,28 +4,31 @@ and sends proactive Telegram notifications.
 
 Functions:
   process_activity_event(strava_inbound_id, activity_id, aspect_type) — fetches Strava activity,
-      saves to exercise.cardio_activities + cardio_splits, sends Telegram notification
+      saves to exercise.cardio_activities + cardio_splits (cardio), or routes to Garmin
+      processor (strength); sends Telegram notification for cardio only
   process_delete_event(strava_inbound_id, activity_id) — deletes a cardio activity row and notifies B
   _exchange_token()                                      — exchanges refresh token for access token
   _fetch_activity(access_token, activity_id)             — fetches full activity detail from Strava API
   _activity_label(sport_type, category, is_treadmill)          — maps sport_type to readable label
-  _format_notification(activity, aspect_type, saved, category) — builds HTML-formatted Telegram message
-  _get_latest_chat_id()                                  — reads chat_id from system.telegram_outbound
-  _store_outbound(message_id, payload)                   — logs proactive outbound with telegram_update_id=NULL
+  _format_notification(activity, aspect_type, saved, category) — builds HTML-formatted Telegram message;
+      format: name — label / distance·duration·pace / HR·kcal·cadence / per-km splits with avg/max HR and zone
+  _fetch_splits(strava_activity_id)                      — reads per-km splits including max_heartrate and pace_zone
+  get_latest_chat_id(), store_outbound() — shared helpers from telegram.replies
 """
 
 import html
-import json
 import logging
 import re
 
 import httpx
 
 from domains.exercise.service import delete_cardio_activity, save_cardio_activity
+from domains.exercise.strength_service import delete_strength_session
+from inbound.garmin.processor import process_strength_event
 from system.config import get_strava_config
 from system.db import get_connection
 from system.logging import log_event, log_failure
-from telegram.replies import send_reply
+from telegram.replies import get_latest_chat_id, send_reply, store_outbound
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,25 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
 
         saved, activity_category = save_cardio_activity(strava_inbound_id, activity)
 
-        chat_id = _get_latest_chat_id()
+        if activity_category == "strength":
+            # Only process on create — update events for the same activity would
+            # insert duplicate strength_sessions rows. Garmin data doesn't change
+            # meaningfully on Strava updates, so safe to skip.
+            if aspect_type != "create":
+                log_event(logger, logging.INFO, "strava_strength_update_skipped",
+                          strava_inbound_id=strava_inbound_id,
+                          activity_id=activity_id,
+                          aspect_type=aspect_type)
+                return
+            # Hand off to Garmin processor — it owns the fetch, storage, and
+            # notification for strength sessions. No Telegram message sent from here.
+            log_event(logger, logging.INFO, "strava_strength_handed_to_garmin",
+                      strava_inbound_id=strava_inbound_id,
+                      activity_id=activity_id)
+            process_strength_event(strava_inbound_id, activity)
+            return
+
+        chat_id = get_latest_chat_id()
         if chat_id is None:
             log_event(logger, logging.WARNING, "strava_no_chat_id",
                       strava_inbound_id=strava_inbound_id)
@@ -58,7 +79,7 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
         text = _format_notification(activity, aspect_type, saved, activity_category)
         message_id, sent_payload = send_reply(chat_id, text)
         if message_id is not None:
-            _store_outbound(message_id, sent_payload)
+            store_outbound(message_id, sent_payload)
         log_event(logger, logging.INFO, "strava_notification_sent",
                   strava_inbound_id=strava_inbound_id,
                   chat_id=chat_id,
@@ -76,9 +97,12 @@ def process_delete_event(strava_inbound_id: int, activity_id: int) -> None:
     log_event(logger, logging.INFO, "strava_delete_started",
               strava_inbound_id=strava_inbound_id, activity_id=activity_id)
     try:
-        deleted = delete_cardio_activity(activity_id)
+        # Try both table families — we don't know from the delete event which type it was.
+        cardio_deleted = delete_cardio_activity(activity_id)
+        strength_deleted = delete_strength_session(activity_id)
+        deleted = cardio_deleted or strength_deleted
 
-        chat_id = _get_latest_chat_id()
+        chat_id = get_latest_chat_id()
         if chat_id is None:
             log_event(logger, logging.WARNING, "strava_no_chat_id",
                       strava_inbound_id=strava_inbound_id)
@@ -91,7 +115,7 @@ def process_delete_event(strava_inbound_id: int, activity_id: int) -> None:
 
         message_id, sent_payload = send_reply(chat_id, text)
         if message_id is not None:
-            _store_outbound(message_id, sent_payload)
+            store_outbound(message_id, sent_payload)
         log_event(logger, logging.INFO, "strava_delete_notification_sent",
                   strava_inbound_id=strava_inbound_id, activity_id=activity_id, deleted=deleted)
 
@@ -150,53 +174,67 @@ def _activity_label(sport_type: str, activity_category: str | None, is_treadmill
         }.get(sport_type, "Ride")
     if activity_category == "swim":
         return "Open Water Swim" if sport_type == "OpenWaterSwim" else "Swim"
-    if sport_type in ("WeightTraining", "Workout"):
-        return "Strength Session"
-    # Convert CamelCase sport_type to readable words for everything else
+    # Convert CamelCase sport_type to readable words for everything else.
+    # Note: strength activities (WeightTraining/Workout/Crossfit) are handed off to the
+    # Garmin processor before _format_notification is called — this branch is never reached
+    # for them, so no explicit strength case is needed here.
     return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", sport_type) or "Activity"
 
 
-# Builds the proactive Telegram notification text for an activity.
-# Uses HTML formatting — bold label, HR pair, cadence, italic not-saved status.
+# Builds the proactive Telegram notification text for a cardio activity.
+# Format: Line 1 = activity name — type label, Line 2 = distance/duration/pace,
+# Line 3 = HR · kcal · cadence. Per-km splits follow with avg/max HR and pace zone.
 # Inputs: full Strava activity dict, aspect_type, whether it was saved, and its category.
 def _format_notification(activity: dict, aspect_type: str, saved: bool, activity_category: str | None) -> str:
     sport_type = activity.get("sport_type", "")
     is_treadmill = bool(activity.get("trainer"))
     elapsed_seconds = activity.get("elapsed_time") or activity.get("moving_time") or 0
-    duration_str = _format_duration(elapsed_seconds)
     distance_m = activity.get("distance")  # keep None vs 0 distinct: 0.0 = treadmill/GPS failure
     avg_hr = activity.get("average_heartrate")
     max_hr = activity.get("max_heartrate")
     cadence = activity.get("average_cadence")
+    calories = activity.get("calories")
+    activity_name = html.escape(activity.get("name") or "Activity")
     update_prefix = "Updated: " if aspect_type == "update" else ""
 
     label = _activity_label(sport_type, activity_category, is_treadmill)
-    has_distance = distance_m is not None and distance_m > 0 and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
-    stats = f"{distance_m / 1000:.1f} km in {duration_str}" if has_distance else duration_str
+    has_distance = (
+        distance_m is not None
+        and distance_m > 0
+        and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
+    )
 
-    # Pace/speed suffix for line 1
-    pace_suffix = ""
-    if has_distance and elapsed_seconds > 0:
-        if activity_category in ("run", "walk"):
-            pace_sec = elapsed_seconds / (distance_m / 1000)
-            pace_suffix = f" · {int(pace_sec // 60)}:{int(pace_sec % 60):02d} /km"
-        elif activity_category == "ride":
-            speed_kmh = (distance_m / elapsed_seconds) * 3.6
-            pace_suffix = f" · {speed_kmh:.1f} km/h"
+    # Line 1: activity name (bold) — type label
+    lines = [f"{update_prefix}<b>{activity_name}</b> — {label}"]
 
-    line1 = f"{update_prefix}<b>{label}</b> — {stats}{pace_suffix}"
+    # Line 2: distance · duration · pace or speed
+    duration_str = _format_duration(elapsed_seconds)
+    if has_distance:
+        stats_parts = [f"{distance_m / 1000:.2f} km", duration_str]
+        if elapsed_seconds > 0:
+            if activity_category in ("run", "walk"):
+                pace_sec = elapsed_seconds / (distance_m / 1000)
+                stats_parts.append(f"{int(pace_sec // 60)}:{int(pace_sec % 60):02d} /km")
+            elif activity_category == "ride":
+                speed_kmh = (distance_m / elapsed_seconds) * 3.6
+                stats_parts.append(f"{speed_kmh:.1f} km/h")
+        lines.append(" · ".join(stats_parts))
+    else:
+        lines.append(duration_str)
 
-    line2_parts = []
+    # Line 3: ❤️ avg · max · 🔥 kcal · 👟 cadence (all on one line)
+    stat3_parts = []
     if avg_hr and max_hr:
-        line2_parts.append(f"❤️ {int(avg_hr)} avg · {int(max_hr)} max")
+        stat3_parts.append(f"❤️ {int(avg_hr)} avg · {int(max_hr)} max")
     elif avg_hr:
-        line2_parts.append(f"❤️ {int(avg_hr)} avg")
+        stat3_parts.append(f"❤️ {int(avg_hr)} avg")
+    if calories:
+        stat3_parts.append(f"🔥 {int(calories)} kcal")
     if cadence and activity_category in ("run", "walk", "ride", "swim", "other_cardio"):
-        line2_parts.append(f"👟 {int(cadence)} spm")
+        stat3_parts.append(f"👟 {int(cadence)} spm")
+    if stat3_parts:
+        lines.append(" · ".join(stat3_parts))
 
-    lines = [line1]
-    if line2_parts:
-        lines.append("  |  ".join(line2_parts))
     if not saved:
         lines.append("<i>Not yet saved.</i>")
 
@@ -211,12 +249,18 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
                 pace_sec = moving / ((s.get("distance_m") or 1000) / 1000) if moving else 0
                 pace_str = f"{int(pace_sec // 60)}:{int(pace_sec % 60):02d}" if pace_sec else "?:??"
                 row = f"km {s['lap_index']}   {pace_str}"
-                hr = s.get("average_heartrate")
+                avg = s.get("average_heartrate")
+                mx = s.get("max_heartrate")
                 cad = s.get("average_cadence")
-                if hr:
-                    row += f"  ❤️ {int(hr)}"
+                zone = s.get("pace_zone")
+                if avg and mx:
+                    row += f"   ❤️ {int(avg)}/{int(mx)}"
+                elif avg:
+                    row += f"   ❤️ {int(avg)}"
                 if cad:
-                    row += f"  👟 {int(cad)}"
+                    row += f"   👟 {int(cad)}"
+                if zone:
+                    row += f"   z{zone}"
                 lines.append(row)
 
     return "\n".join(lines)
@@ -225,7 +269,8 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
 # Fetches per-km splits for a cardio activity from exercise.cardio_splits.
 # Inputs: strava_activity_id (the Strava ID, not the internal cardio_activity_id).
 # Outputs: list of dicts with keys: lap_index, distance_m, moving_seconds, elapsed_seconds,
-#          average_heartrate, average_cadence — ordered by lap_index. Empty list if none found.
+#          average_heartrate, max_heartrate, average_cadence, pace_zone
+#          — ordered by lap_index. Empty list if none found.
 def _fetch_splits(strava_activity_id: int) -> list[dict]:
     conn = get_connection()
     try:
@@ -234,7 +279,8 @@ def _fetch_splits(strava_activity_id: int) -> list[dict]:
                 cur.execute(
                     """
                     SELECT cs.lap_index, cs.distance_m, cs.moving_seconds, cs.elapsed_seconds,
-                           cs.average_heartrate, cs.average_cadence
+                           cs.average_heartrate, cs.max_heartrate,
+                           cs.average_cadence, cs.pace_zone
                     FROM exercise.cardio_splits cs
                     JOIN exercise.cardio_activities ca USING (cardio_activity_id)
                     WHERE ca.strava_activity_id = %s
@@ -250,12 +296,14 @@ def _fetch_splits(strava_activity_id: int) -> list[dict]:
                         "moving_seconds": r[2],
                         "elapsed_seconds": r[3],
                         "average_heartrate": r[4],
-                        "average_cadence": r[5],
+                        "max_heartrate": r[5],
+                        "average_cadence": r[6],
+                        "pace_zone": r[7],
                     }
                     for r in rows
                 ]
     except Exception:
-        # Splits are best-effort — don't break notifications if DB is unavailable
+        # Splits are best-effort — don't break notifications if DB is unavailable.
         return []
     finally:
         conn.close()
@@ -272,47 +320,3 @@ def _format_duration(total_seconds: int) -> str:
     if m:
         return f"{m} min"
     return f"{total_seconds} sec"
-
-
-# Reads the most recent chat_id from system.telegram_outbound.
-# Used to find B's chat_id for proactive (unprompted) messages.
-# Inputs: none.
-# Outputs: chat_id as int, or None if system.telegram_outbound has no usable rows.
-def _get_latest_chat_id() -> int | None:
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT (payload->>'chat_id')::bigint
-                    FROM system.telegram_outbound
-                    WHERE payload->>'chat_id' IS NOT NULL
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """
-                )
-                row = cur.fetchone()
-                return row[0] if row else None
-    finally:
-        conn.close()
-
-
-# Inserts a row into system.telegram_outbound for a proactive (unprompted) message.
-# telegram_update_id is NULL because there is no inbound update that triggered this message.
-# Inputs: Telegram message_id from the API response, full sent payload dict.
-def _store_outbound(message_id: int, payload: dict) -> None:
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO system.telegram_outbound"
-                    " (message_id, telegram_update_id, payload)"
-                    " VALUES (%s, NULL, %s)",
-                    (message_id, json.dumps(payload)),
-                )
-    finally:
-        conn.close()
-
-

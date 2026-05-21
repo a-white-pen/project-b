@@ -6,9 +6,14 @@ Functions:
   save_cardio_activity(strava_inbound_id, activity) — classifies, upserts activity row,
       replaces splits; returns (saved, activity_category) tuple
   delete_cardio_activity(strava_activity_id)        — deletes one activity row (and its splits via CASCADE)
-  _classify_activity(sport_type)  — maps Strava sport_type to activity_category or None
+  _classify_activity(sport_type)  — maps Strava sport_type to activity_category, "strength", or None
   _extract_timezone(tz_str)       — extracts IANA timezone from Strava timezone string
   _build_splits(activity)         — merges laps + splits_metric into per-km split rows
+
+Strength routing:
+  WeightTraining, Workout, and Crossfit return "strength" from _classify_activity().
+  save_cardio_activity() returns (False, "strength") for these without writing any row —
+  the Strava processor uses the "strength" category to hand off to inbound.garmin.processor.
 """
 
 import json
@@ -20,17 +25,25 @@ from system.logging import log_event, log_failure
 logger = logging.getLogger(__name__)
 
 # Strava sport_type → Project B activity_category.
-# Types not listed here that are not weight training fall back to "other_cardio".
+# Types not listed here that are not strength or skipped fall back to "other_cardio".
 _RUN_TYPES = {"Run", "TrailRun", "VirtualRun", "Treadmill"}
 _WALK_TYPES = {"Walk", "Hike"}
 _RIDE_TYPES = {"Ride", "VirtualRide", "EBikeRide", "MountainBikeRide", "GravelRide", "Velomobile"}
 _SWIM_TYPES = {"Swim", "OpenWaterSwim"}
-_SKIP_TYPES = {"WeightTraining", "Workout", "Crossfit", "RockClimbing", "Yoga", "Pilates"}
+# Routed to Garmin processor — Garmin exercise_sets presence determines if they
+# end up in strength tables. No cardio row is written for these.
+_STRENGTH_TYPES = {"WeightTraining", "Workout", "Crossfit"}
+# Truly skipped — no Garmin lookup, no row written anywhere.
+_SKIP_TYPES = {"RockClimbing", "Yoga", "Pilates"}
 
 
 # Classifies a Strava sport_type into a Project B activity_category.
-# Returns None for weight training and non-exercise types that should not be saved here.
+# Returns "strength" for types routed to Garmin, None for truly skipped types.
+# Inputs: Strava sport_type string.
+# Outputs: category string ("run", "walk", "ride", "swim", "strength", "other_cardio") or None.
 def _classify_activity(sport_type: str) -> str | None:
+    if sport_type in _STRENGTH_TYPES:
+        return "strength"
     if sport_type in _SKIP_TYPES:
         return None
     if sport_type in _RUN_TYPES:
@@ -101,6 +114,11 @@ def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, 
         log_event(logger, logging.INFO, "exercise_activity_skipped",
                   sport_type=sport_type, strava_activity_id=activity.get("id"))
         return False, None
+    if category == "strength":
+        # Strength types are handled by inbound.garmin.processor — no cardio row written.
+        log_event(logger, logging.INFO, "exercise_strength_routed_to_garmin",
+                  sport_type=sport_type, strava_activity_id=activity.get("id"))
+        return False, "strength"
 
     strava_activity_id = activity["id"]
     start_latlng = activity.get("start_latlng") or []
