@@ -20,7 +20,9 @@ import os
 
 import psycopg2.extras
 
-from domains.food.service import _build_item_results, _parse_json, handle_food_log
+from domains.food.service import _build_item_results, _gap_fill_macros, _MEAL_LABELS, _parse_json, handle_food_log
+from domains.food.nutrition_sources import usda, off
+from domains.food.nutrition_sources.router import build_letter_map, enrich_item, to_grams, DB_METHOD
 from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
@@ -92,10 +94,16 @@ Determine what the user wants to change. They may want to:
 - Update macros for one or more items (e.g. "actually the chicken rice was 600 kcal")
 - Delete one or more items (e.g. "remove the yoghurt", "delete that")
 - Update the food description or quantity
+- Pick a different candidate from the list shown (e.g. "go with b", "try c", "use d", \
+"no it should be b") — extract the letter as candidate_letter
+- Escape to LLM estimate (e.g. "use LLM", "skip USDA", "skip Open Food Facts") — \
+set skip_structured_source to true
 
 Return a JSON object with this exact structure:
 {{
   "meal_type": "<meal type — use original if unchanged>",
+  "candidate_letter": "<letter a-z or null — set when user picks a candidate from the list>",
+  "skip_structured_source": <true or false — set true when user wants LLM estimate instead>,
   "items": [
     {{
       "food_log_id": <int — the id of the existing row to update or delete>,
@@ -124,6 +132,9 @@ fields — the system will re-estimate them from the new quantity
 - meal_type: only change if the user explicitly mentions it
 - "pre workout", "pre-workout", "post workout", "post-workout" always refer to meal_type changes — \
 they are meal timing labels, NOT food item names; never rename food_item based on these words
+- candidate_letter: set when the user references a letter from the candidate list shown \
+(e.g. "go with b" → "b", "try c" → "c"). If no candidate pick, set to null.
+- skip_structured_source: set to true only when user explicitly wants LLM instead of USDA/OFF
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
 
@@ -171,6 +182,273 @@ service card, app screenshot, simplified macro display without sodium); "food_im
 - For fields not changed, OMIT the key entirely — do NOT include null
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
+
+
+# Applies a candidate pick action to a food_log row and returns formatted reply pairs.
+# Called when the user picks a different candidate from the list (e.g. "go with b").
+#
+# action_entry is from candidate_letter_map:
+#   {"action": "candidate", "index": i}   — apply stored per-100g values × (grams/100)
+#   {"action": "cross_source", "source": key} — fresh API lookup on the other source
+#   {"action": "llm"}                     — re-estimate with LLM (handled by skip_structured_source path)
+#
+# Returns list of (reply, state) on success, or None if the action could not be applied
+# (caller falls through to normal correction handling).
+def _apply_candidate_action(
+    action_entry: dict,
+    original_item: dict,
+    macro_meta: dict,
+    update_id: int | None,
+    state: dict | None = None,
+) -> list[tuple[str, dict | None]] | None:
+    _MACRO_COLS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+    fid = original_item["food_log_id"]
+    act = action_entry.get("action")
+
+    food_meta = original_item.get("food_meta") or {}
+    qty = food_meta.get("qty") or {}
+    grams: float | None = None
+    is_count_unit = False
+    grams = to_grams({"qty": qty}) if qty.get("amount") is not None and qty.get("unit") else None
+    # Fallback: use resolved_grams stored by USDA portion resolution for count/natural units
+    # (e.g. "2 egg" → grams was resolved to 100g at log time via foodPortions).
+    if grams is None:
+        stored = (original_item.get("macro_meta") or {}).get("resolved_grams")
+        if stored is not None:
+            grams = stored
+            is_count_unit = True  # original unit was a count/natural unit, not a gram weight
+
+    db_updates: dict = {}
+
+    if act == "candidate":
+        idx = action_entry.get("index", 0)
+        source_candidates: list = macro_meta.get("source_candidates") or []
+        if idx >= len(source_candidates):
+            return None
+        cand = source_candidates[idx]
+        per_100g = cand.get("nutrients_per_100g") or {}
+
+        # P1 fix: for count-unit foods, re-resolve portions for the newly selected candidate.
+        # The original resolved_grams came from candidate A's USDA foodPortions; candidate B
+        # may have different portion weights (e.g. different egg size classification).
+        # Re-fetch the detail endpoint for the new candidate and re-resolve. Fall back to the
+        # original resolved_grams only if re-resolution fails, so we degrade gracefully.
+        resolved_grams = grams
+        re_resolution_succeeded = False
+        if is_count_unit and cand.get("fdc_id") and cand.get("data_type", "").lower() != "branded":
+            api_key = os.environ.get("USDA_API_KEY", "").strip()
+            if api_key:
+                pseudo_candidate = {"fdcId": cand["fdc_id"]}  # resolve_grams_from_portions expects fdcId key
+                try:
+                    re_resolved = usda.resolve_grams_from_portions(
+                        pseudo_candidate, food_meta, api_key, update_id
+                    )
+                    if re_resolved is not None:
+                        resolved_grams = re_resolved
+                        re_resolution_succeeded = True
+                        log_event(logger, logging.INFO, "food_correction_candidate_portions_reresolved",
+                                  update_id=update_id, fdc_id=cand["fdc_id"], grams=resolved_grams)
+                except Exception as e:
+                    log_failure(logger, logging.WARNING, "food_correction_candidate_portion_reresolution_failed",
+                                e, update_id=update_id, fdc_id=cand.get("fdc_id"))
+        grams = resolved_grams
+
+        factor = (grams / 100.0) if grams else 1.0
+        for col in _MACRO_COLS:
+            raw = per_100g.get(col)
+            if raw is not None:
+                db_updates[col] = round(raw * factor, 1)
+
+        candidate_name = cand.get("label", "?")
+        # Derive source from candidate's data_type (USDA candidates have it; OFF candidates don't).
+        # Avoids wrongly defaulting to "usda" when macro_meta.structured_source is missing.
+        if macro_meta.get("structured_source"):
+            source = macro_meta["structured_source"]
+        elif cand.get("data_type"):
+            source = "usda"  # Foundation / SR Legacy / Branded Food → USDA
+        else:
+            source = "open_food_facts"  # OFF candidates have no data_type key
+
+        # Rebuild field_sources:
+        # - B previously stated a value → outranks candidate data; carry forward and pop from db_updates
+        # - new data from this candidate → from_source attribution
+        # - everything else null out → gap_fill_macros re-estimates below
+        old_field_sources = macro_meta.get("field_sources") or {}
+        field_sources: dict = {}
+        for col in _MACRO_COLS:
+            stated = old_field_sources.get(col, {}).get("status") == "stated_by_user"
+            if stated:
+                # B's explicit value outranks the candidate value — carry forward as-is.
+                field_sources[col] = old_field_sources[col]
+                db_updates.pop(col, None)  # leave DB column untouched
+            elif col in db_updates:
+                field_sources[col] = {
+                    "status": "from_source",
+                    "source": source,
+                    "scaling_g": grams,
+                    "candidate_name": candidate_name,
+                }
+            else:
+                db_updates[col] = None  # explicit NULL — prevents stale values from prior candidate
+
+        # Rebuild candidate_letter_map with new selection (index 0 moves to chosen candidate).
+        old_candidates = list(source_candidates)
+        chosen = old_candidates.pop(idx)
+        new_order = [chosen] + old_candidates
+        untried_source = macro_meta.get("untried_source")
+
+        new_macro_meta = {
+            **macro_meta,
+            "candidate_name": candidate_name,
+            "field_sources": field_sources,
+            "source_candidates": new_order,
+            "candidate_letter_map": build_letter_map(new_order, untried_source),
+            "correction_update_id": update_id,
+            **({"resolved_grams": grams} if is_count_unit else {}),
+            # When re-resolution succeeded, origin is the new candidate; when it fell back
+            # to the original resolved_grams, stamp "previous_candidate" so debuggers know
+            # the stored grams came from a prior portion resolution, not this candidate's portions.
+            **({"resolved_grams_origin": "new_candidate" if re_resolution_succeeded else "previous_candidate"} if is_count_unit else {}),
+        }
+        db_updates["macro_meta"] = psycopg2.extras.Json(new_macro_meta)
+
+    elif act == "cross_source":
+        source_key = action_entry.get("source", "")
+        lookup_fn = usda.lookup if source_key == "usda" else off.lookup
+        if grams is None:
+            return None
+        food_item = original_item.get("food_item", "")
+        try:
+            result, new_candidates = lookup_fn(food_item, grams, update_id, food_meta=food_meta)
+        except Exception as e:
+            log_failure(logger, logging.WARNING, "food_correction_cross_source_failed", e,
+                        update_id=update_id, source=source_key)
+            result, new_candidates = None, []
+
+        if result is None:
+            _SOURCE_DISPLAY = {"usda": "USDA", "open_food_facts": "Open Food Facts"}
+            display = _SOURCE_DISPLAY.get(source_key, source_key)
+            # Return a quotable no-match message — carries state so B can try another option.
+            log_event(logger, logging.INFO, "food_correction_cross_source_no_match",
+                      update_id=update_id, source=source_key)
+            fid = original_item.get("food_log_id")
+            ctx = (state or {}).get("context") or {}
+            no_match_state: dict = {
+                "domain": "food",
+                "context": {
+                    "food_log_ids": ctx.get("food_log_ids") or [fid],
+                    "meal_food_log_ids": ctx.get("meal_food_log_ids") or [fid],
+                    "meal_type": original_item.get("meal_type", "snack"),
+                    "correction_history": ctx.get("correction_history") or [],
+                },
+            }
+            if state and state.get("telegram_reply_message_id"):
+                no_match_state["parent_telegram_reply_message_id"] = state["telegram_reply_message_id"]
+            return [(f"No match found in {display} — quote this to try something else.", no_match_state)]
+
+        candidate_name = result.get("_candidate_name", "?")
+        old_field_sources = macro_meta.get("field_sources") or {}
+        field_sources: dict = {}
+        for col in _MACRO_COLS:
+            stated = old_field_sources.get(col, {}).get("status") == "stated_by_user"
+            if stated:
+                # B's explicit value outranks the cross-source value — carry forward as-is.
+                field_sources[col] = old_field_sources[col]
+                db_updates.pop(col, None)  # leave DB column untouched
+            elif result.get(col) is not None:
+                db_updates[col] = result[col]
+                field_sources[col] = {
+                    "status": "from_source",
+                    "source": source_key,
+                    "scaling_g": grams,
+                    "candidate_name": candidate_name,
+                }
+            else:
+                db_updates[col] = None  # explicit NULL — prevents stale values from prior source
+        # Cross-source was the only untried source — no new untried, so LLM is next option.
+        new_macro_meta = {
+            **macro_meta,
+            "candidate_name": candidate_name,
+            "structured_source": source_key,
+            "field_sources": field_sources,
+            "source_candidates": new_candidates,
+            "candidate_letter_map": build_letter_map(new_candidates, None),
+            "untried_source": None,
+            "correction_update_id": update_id,
+        }
+        db_updates["macro_meta"] = psycopg2.extras.Json(new_macro_meta)
+        db_updates["macro_method"] = DB_METHOD.get(source_key, source_key)
+        # Logic 3 fix: do NOT touch macro_input — cross-source changes the macro source,
+        # not the input channel. A food_image item stays macro_input="image".
+
+    else:
+        return None
+
+    # Apply to DB.
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                if db_updates:
+                    set_clause = ", ".join(f"{col} = %s" for col in db_updates)
+                    values = list(db_updates.values()) + [fid]
+                    cur.execute(
+                        f"UPDATE nutrition.food_log SET {set_clause} WHERE food_log_id = %s",
+                        values,
+                    )
+                    log_event(logger, logging.INFO, "food_correction_candidate_applied",
+                              update_id=update_id, food_log_id=fid, action=act)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "food_correction_candidate_apply_failed", e,
+                    update_id=update_id, food_log_id=fid)
+        return None
+    finally:
+        conn.close()
+
+    # Re-fetch, gap-fill any nulled fields, then return.
+    # Nulled fields (from new candidate missing a nutrient) are re-estimated by LLM anchored
+    # to the known values from the new candidate — prevents stale values from the old source
+    # while still giving B a reasonable number rather than a blank "—" on the card.
+    try:
+        updated_items = _fetch_items([fid])
+    except Exception:
+        return None
+    if not updated_items:
+        return None
+
+    updated_item = updated_items[0]
+    # Check all 7 macro cols — a Foundation food may also lack carbs/fat/protein,
+    # and we null out every col not covered by the new candidate (see db_updates loop above).
+    _ALL_MACRO_COLS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+    if any(updated_item.get(col) is None for col in _ALL_MACRO_COLS):
+        _gap_fill_macros(updated_item, update_id)
+        # Persist gap-filled values and updated field_sources back to DB.
+        gap_macro_meta = updated_item.get("macro_meta") or {}
+        gap_updates: dict = {col: updated_item.get(col) for col in _ALL_MACRO_COLS if updated_item.get(col) is not None}
+        if gap_updates or gap_macro_meta:
+            gap_updates["macro_meta"] = psycopg2.extras.Json(gap_macro_meta)
+            conn2 = None
+            try:
+                conn2 = get_connection()
+                with conn2:
+                    with conn2.cursor() as cur2:
+                        set_clause2 = ", ".join(f"{col} = %s" for col in gap_updates)
+                        cur2.execute(
+                            f"UPDATE nutrition.food_log SET {set_clause2} WHERE food_log_id = %s",
+                            list(gap_updates.values()) + [fid],
+                        )
+                        log_event(logger, logging.INFO, "food_correction_candidate_gap_filled",
+                                  update_id=update_id, food_log_id=fid)
+            except Exception as e:
+                log_failure(logger, logging.WARNING, "food_correction_candidate_gap_fill_failed", e,
+                            update_id=update_id, food_log_id=fid)
+                # Non-fatal: return the in-memory gap-filled item even if DB write failed.
+            finally:
+                if conn2 is not None:
+                    conn2.close()
+
+    meal_type = original_item.get("meal_type", "snack")
+    return _build_item_results([updated_item], [fid], meal_type)
 
 
 # Handles a correction to a previously logged food entry.
@@ -270,6 +548,8 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         new_meal_type = original_meal_type
 
     correction_items = parsed.get("items", [])
+    candidate_letter = parsed.get("candidate_letter")
+    skip_structured_source = parsed.get("skip_structured_source", False)
     log_event(
         logger,
         logging.INFO,
@@ -277,7 +557,58 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         update_id=msg.update_id,
         item_count=len(correction_items),
         meal_type=new_meal_type,
+        candidate_letter=candidate_letter,
+        skip_structured_source=skip_structured_source,
     )
+
+    # Handle candidate pick — only when no food_item change is present.
+    # food_item change beats candidate pick: re-run enrich_item fresh on the new name.
+    if candidate_letter and not any("food_item" in ci for ci in correction_items if ci.get("action") != "delete"):
+        if len(food_log_ids) > 1:
+            log_event(logger, logging.WARNING, "food_correction_candidate_pick_multi_item",
+                      update_id=msg.update_id, food_log_id_count=len(food_log_ids),
+                      candidate_letter=candidate_letter)
+        # Find the quoted item to apply the candidate pick to.
+        quoted_item = next((r for r in current_items if r["food_log_id"] in food_log_ids), None)
+        if quoted_item is not None:
+            macro_meta = quoted_item.get("macro_meta") or {}
+            letter_map = macro_meta.get("candidate_letter_map") or {}
+            action_entry = letter_map.get(candidate_letter)
+            if action_entry:
+                if action_entry.get("action") == "llm":
+                    # "Use LLM estimate" letter — route through the existing LLM escape path
+                    # below rather than _apply_candidate_action (which returns None for "llm").
+                    skip_structured_source = True
+                else:
+                    candidate_result = _apply_candidate_action(
+                        action_entry, quoted_item, macro_meta, msg.update_id, state=state
+                    )
+                    if candidate_result is not None:
+                        return candidate_result
+
+    # Handle skip_structured_source (LLM escape) — re-estimate without structured source.
+    if skip_structured_source and not any("food_item" in ci for ci in correction_items if ci.get("action") != "delete"):
+        quoted_item = next((r for r in current_items if r["food_log_id"] in food_log_ids), None)
+        if quoted_item is not None:
+            reestimated = _reestimate_item(quoted_item, correction_text, msg.update_id, correction_history)
+            if reestimated is not None:
+                fid = quoted_item["food_log_id"]
+                updates: dict = {
+                    "macro_method": "llm",
+                    "macro_input": "description",
+                    "_macro_meta": {
+                        "model": MODEL_FLASH,
+                        "correction_update_id": msg.update_id,
+                        "skip_structured_source": True,
+                    },
+                }
+                for col in ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg"):
+                    if reestimated.get(col) is not None:
+                        updates[col] = reestimated[col]
+                skip_item = {"food_log_id": fid, "action": "update", **updates}
+                # Inject as the sole correction item and fall through to _apply_corrections.
+                correction_items = [skip_item]
+
     if not correction_items and new_meal_type == original_meal_type:
         log_event(logger, logging.WARNING, "food_correction_no_changes", update_id=msg.update_id)
         # Preserve state so B can quote again and try a different correction.
@@ -348,10 +679,6 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                     if "food_item" in item:
                         # food_item: use re-estimation (has full context of original + correction text)
                         item["food_item"] = reestimated.get("food_item") or item["food_item"]
-                    # macros: re-estimation as base; user-stated values (snapshotted above) take priority
-                    for col in _MACRO_COLS:
-                        if col not in item:
-                            item[col] = reestimated.get(col)
                     # food_meta: three-layer merge so existing brand/prep/notes are never wiped.
                     # Priority (low → high): original DB row → re-estimation → user correction.
                     original_food_meta = original.get("food_meta") or {}
@@ -359,8 +686,42 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                     merged_food_meta = {**original_food_meta, **reestimated_food_meta, **correction_food_meta}
                     if merged_food_meta:
                         item["_food_meta"] = merged_food_meta
+
+                    # Run structured source lookup on the corrected food name + quantity.
+                    # Seed the synthetic item with LLM estimates as fallback so enrich_item
+                    # keeps them when no USDA/OFF match is found.
+                    corrected_food_item = item.get("food_item") or original["food_item"]
+                    synthetic = {
+                        "food_item": corrected_food_item,
+                        "food_meta": merged_food_meta,
+                        "macro_input": "description",  # allow enrich_item to run
+                        "macro_meta": {},
+                    }
+                    for col in _MACRO_COLS:
+                        val = reestimated.get(col)
+                        if val is not None:
+                            synthetic[col] = val
+
+                    enriched = enrich_item(synthetic, msg.update_id)
+
+                    # Pull enriched macros into item; user-stated values (snapshotted above) take priority.
+                    for col in _MACRO_COLS:
+                        if col not in item:
+                            item[col] = enriched.get(col)
+
+                    enriched_macro_meta = enriched.get("macro_meta") or {}
+
+                    # P2 fix: overwrite field_sources for any user-stated field.
+                    # enriched_macro_meta["field_sources"] carries USDA/OFF attribution for all fields;
+                    # if B explicitly stated "kcal is 300", that field must show stated_by_user —
+                    # not the structured-source attribution that came from enrich_item.
+                    enriched_field_sources = dict(enriched_macro_meta.get("field_sources") or {})
+                    for col in user_stated:
+                        enriched_field_sources[col] = {"status": "stated_by_user"}
+
                     item["_macro_meta"] = {
-                        "model": MODEL_FLASH,
+                        **enriched_macro_meta,
+                        **({"field_sources": enriched_field_sources} if enriched_field_sources else {}),
                         **({"corrected_from": original["food_item"]} if "food_item" in item else {}),
                         "correction_update_id": msg.update_id,
                         **({"user_stated_fields": user_stated} if user_stated else {}),
@@ -392,9 +753,11 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                 item["_macro_input"] = "manual"
                 item["_macro_method"] = "manual"
         elif "_macro_meta" in item:
-            # food_item or qty changed, re-estimation ran, no explicit macros — all LLM.
+            # food_item or qty changed, re-estimation + enrich ran.
+            # Use structured source as method when enrich_item found a match; else LLM.
+            structured_source = item["_macro_meta"].get("structured_source")
             item["_macro_input"] = "description"
-            item["_macro_method"] = "llm"
+            item["_macro_method"] = DB_METHOD.get(structured_source, structured_source) if structured_source else "llm"
 
     # Apply changes to DB.
     # all_ids uses meal_food_log_ids (the full batch) so the LLM can act on any meal item —
@@ -418,9 +781,14 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
-    reply_ids, _ = _compute_reply_scope(
+    reply_ids, early_result = _compute_reply_scope(
         applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
     )
+    if early_result is not None:
+        log_event(logger, logging.INFO, "food_correction_completed",
+                  update_id=msg.update_id, surviving_item_count=len(surviving_ids),
+                  card_count=0, meal_type=new_meal_type)
+        return early_result
 
     # Build updated item list for the reply.
     # _apply_corrections already committed — guard this re-fetch so a DB hiccup here
@@ -448,14 +816,14 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         "food_correction_completed",
         update_id=msg.update_id,
         surviving_item_count=len(surviving_ids),
-        reply_item_count=len(reply_ids),
+        card_count=len(reply_ids),
         meal_type=new_meal_type,
     )
 
     if not updated_items:
         return [(f"Done — all items removed from the {new_meal_type.replace('_', ' ')} log.", None)]
 
-    return _build_item_results(
+    results = _build_item_results(
         updated_items,
         [item["food_log_id"] for item in updated_items],
         new_meal_type,
@@ -464,6 +832,11 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
         parent_reply_id=state["telegram_reply_message_id"],
         deleted_count=deleted_count,
     )
+    if new_meal_type != original_meal_type and len(results) > 1:
+        meal_label = _MEAL_LABELS.get(new_meal_type, new_meal_type.replace("_", " ").title())
+        n = len(updated_items)
+        results = [(f"Moved {n} item{'s' if n != 1 else ''} to {meal_label}.", None)] + results
+    return results
 
 
 # Formats the correction history list into a prompt section string.
@@ -701,9 +1074,14 @@ def _handle_photo_correction(
     deleted_from_batch = set(meal_food_log_ids) - set(surviving_ids)
     updated_meal_ids = [i for i in meal_food_log_ids if i not in deleted_from_batch]
 
-    reply_ids, _ = _compute_reply_scope(
+    reply_ids, early_result = _compute_reply_scope(
         applied_deleted_ids, applied_updated_ids, surviving_ids, current_items, new_meal_type, original_meal_type,
     )
+    if early_result is not None:
+        log_event(logger, logging.INFO, "food_photo_correction_completed",
+                  update_id=msg.update_id, surviving_item_count=len(surviving_ids),
+                  card_count=0)
+        return early_result
 
     try:
         updated_items = _fetch_items(reply_ids) if reply_ids else []
@@ -729,14 +1107,14 @@ def _handle_photo_correction(
         "food_photo_correction_completed",
         update_id=msg.update_id,
         surviving_item_count=len(surviving_ids),
-        reply_item_count=len(reply_ids),
+        card_count=len(reply_ids),
         meal_type=new_meal_type,
     )
 
     if not updated_items:
         return [(f"Done — all items removed from the {new_meal_type.replace('_', ' ')} log.", None)]
 
-    return _build_item_results(
+    results = _build_item_results(
         updated_items,
         [item["food_log_id"] for item in updated_items],
         new_meal_type,
@@ -745,6 +1123,11 @@ def _handle_photo_correction(
         parent_reply_id=state["telegram_reply_message_id"],
         deleted_count=deleted_count,
     )
+    if new_meal_type != original_meal_type and len(results) > 1:
+        meal_label = _MEAL_LABELS.get(new_meal_type, new_meal_type.replace("_", " ").title())
+        n = len(updated_items)
+        results = [(f"Moved {n} item{'s' if n != 1 else ''} to {meal_label}.", None)] + results
+    return results
 
 
 # Re-estimates a single food item using the original logged entry plus the user's correction text.
@@ -856,15 +1239,18 @@ def _fetch_items(food_log_ids: list[int]) -> list[dict]:
 #   - missing food_log_id keys in LLM output cannot cause a KeyError here
 #
 # Rules:
-#   meal_type changed        → all surviving ids (B needs to see the full meal after a move)
-#   update + delete          → only the updated ids (deleted items are gone; delete count shown on last card)
-#   delete only, survivors   → surviving ids so the correction chain stays open; deleted_count on last card
-#   delete only, all gone    → ([], None) — callers fall through to the "all removed" message at their end
-#   fallback                 → all surviving ids
+#   meal_type changed  → all surviving ids (B needs to see the full meal after a move)
+#   update + delete    → only the updated ids (delete count badge appended on last card)
+#   delete only        → None + early_result "Removed: <name>, ..." so B sees which item was removed
+#   fallback           → all surviving ids
+#
+# Uses actual DB-applied sets (from _apply_corrections) rather than raw LLM items so that:
+#   - hallucinated food_log_ids that were skipped by _apply_corrections never appear in reply text
+#   - missing food_log_id keys in LLM output cannot cause a KeyError here
 #
 # Returns (reply_ids, early_result):
-#   reply_ids    — list of ids to fetch and show; empty list signals "all gone" to caller
-#   early_result — always None (early-return removed; all paths now use the standard reply flow)
+#   reply_ids    — list of ids to fetch and show, or None when early_result is set
+#   early_result — ready-made result list for delete-only case, or None
 def _compute_reply_scope(
     applied_deleted_ids: set[int],
     applied_updated_ids: set[int],
@@ -872,7 +1258,7 @@ def _compute_reply_scope(
     current_items: list[dict],
     new_meal_type: str,
     original_meal_type: str,
-) -> tuple[list[int], None]:
+) -> tuple[list[int] | None, list[tuple[str, dict | None]] | None]:
     if new_meal_type != original_meal_type:
         return surviving_ids, None
 
@@ -880,11 +1266,11 @@ def _compute_reply_scope(
     reply_ids = [fid for fid in applied_updated_ids if fid in surviving_set]
 
     if not reply_ids and applied_deleted_ids:
-        # Delete-only path. Return surviving ids so the caller can show remaining item cards
-        # (with deleted_count badge) and keep the correction chain alive.
-        # When nothing survived either, return an empty list so callers hit their
-        # "all items removed" message naturally — no special early_result needed.
-        return surviving_ids, None
+        # Delete-only: return a plain confirmation naming the removed item(s).
+        # B can still quote any remaining item card directly to keep correcting.
+        deleted_names = [r["food_item"] for r in current_items if r["food_log_id"] in applied_deleted_ids]
+        removed_str = ", ".join(deleted_names) if deleted_names else "item"
+        return None, [(f"Removed: {removed_str}.", None)]
 
     return reply_ids if reply_ids else surviving_ids, None
 

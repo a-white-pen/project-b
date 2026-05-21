@@ -98,15 +98,14 @@ All LLM calls go through `system/llm.py`. Model constants:
 
 | Constant | Use |
 |---|---|
-| `MODEL_LITE` | Intent classification (router) — high volume, simple decision |
-| `MODEL_FLASH` | Extraction and corrections — moderate complexity, most domain handlers |
+| `MODEL_FLASH` | All LLM calls: routing, food-type classification, extraction, corrections, structured source candidate selection. A lite tier was evaluated but produced 503 overload errors and insufficient classification quality; the `MODEL_LITE` constant has been removed. |
 | `MODEL_PRO` | Reserved for hard cases (not yet wired to auto-escalate) |
 
 The transcription helper in `system/llm.py` also uses Gemini for voice → text, with a domain-aware hint prompt that improves accuracy for food phrases, sleep phrases, and baby talk.
 
 **Planned but not yet implemented:**
 
-- **Tiered model escalation** — router currently always uses MODEL_LITE with no fallback. Plan: if confidence below threshold, retry with MODEL_FLASH, then MODEL_PRO. If still uncertain after MODEL_PRO, bot asks B a clarifying question rather than guessing.
+- **Tiered model escalation** — router currently always uses MODEL_FLASH with no fallback. Plan: if confidence below threshold, retry with MODEL_PRO. If still uncertain, bot asks B a clarifying question rather than guessing.
 
 - **Embedding-based few-shot retrieval for the classifier** — every inbound message gets embedded (Gemini `text-embedding-004` or similar) and stored in `system.classification_history` using the `pgvector` Postgres extension (same DB, no new infra). When classifying a new message, embed it, find the top-K most similar past messages B has confirmed or corrected, and inject those as few-shot examples into the prompt. Near-exact cache: if cosine similarity to a known past message exceeds a threshold (e.g. 0.95), return the cached intent without an LLM call.
 

@@ -24,25 +24,25 @@ Remaining work:
 1. **Full multi-photo album food logging** — current webhook waits briefly and routes the caption-bearing album item so quantity text is not lost, but it still processes only one photo. Need a staging mechanism to collect all album photos, call Gemini with all images, group photos by product, and match caption quantities to the right product group. Example: label + front-of-pack photos for Kinder Bueno and a tuna roll with caption "1 bar and whole box" should become 2 rows from all available photos.
 2. **Local USDA/Open Food Facts source index** — current implementation uses live API search plus Gemini candidate selection. Future improvement: propose schema in `external`, import/cache a focused USDA subset first, then optionally cache OFF products B actually logs or country-filtered OFF data. Search should become DB retrieval → deterministic prefilter → Gemini candidate selection. Do not implement before SQL is reviewed and applied.
 3. **Open Food Facts barcode lookup** — lower priority than nutrition-label extraction. If a packaged product has no readable label and text search fails, a future flow can accept a typed/visible barcode and call the direct OFF product endpoint before falling back to USDA/LLM. For now, taking a label photo is usually more useful than turning the package around just for the barcode.
-4. **Direct official chain nutrition sources** — current `official_chain` component uses USDA branded data as a proxy. Later: add chain-specific source components/scrapers only for chains B actually logs often.
+4. **Direct official chain nutrition sources** — no official-chain component exists yet; restaurant_chain items currently go through USDA (Foundation/SR Legacy) + OFF like any other structured lookup. Future: add chain-specific scrapers for chains B logs often.
 
 Fallback chain summary:
 - Field-level rule: preserve any macro values already known from B, a nutrition label, or a menu/restaurant screenshot. Fallback sources fill only missing fields; they must not replace known values unless B corrects them.
 - Routing has two stages: evidence sources first, then classification fallback for still-missing fields. Classification is still useful, but only to choose the fallback family after stronger evidence has been used.
-- Normal description/image extraction should identify items and quantities, not act as the final macro source. Any speculative description/image LLM macro fields are cleared before fallback routing so USDA/Open Food Facts can run first.
+- Normal description/image extraction should identify items and quantities, not act as the final macro source. Structured sources (USDA/OFF) are tried first; LLM estimates are kept as fallback when no structured source matches.
 - Evidence priority: user-provided/manual macros → nutrition label → restaurant/menu reported published values. Store each known field in `macro_meta.field_sources`; later sources fill missing fields only.
-- User-provided/manual macros: preserve B's stated fields exactly → food-type fallback for missing fields. If B says "2 eggs, 140 kcal, 12g protein", keep kcal/protein and use the whole-food fallback for missing carbs/fat/fibre/sugar/sodium.
-- Nutrition label: visible label values, pro-rated by consumed quantity → food-type fallback for missing fields. If OCR is unclear, ask for a clearer photo or typed values; never insert zero macros because extraction failed.
-- Restaurant/menu reported: published nutrition values from screenshot/menu/meal-plan → food-type fallback for missing fields. The reported values are preserved exactly; only missing fields are enriched.
-- Whole food fallback: USDA → Open Food Facts → LLM Flash → LLM Pro.
-- Packaged fallback without readable label: Open Food Facts → USDA → LLM Flash → LLM Pro.
-- Standardized restaurant chain fallback: official/branded chain nutrition → USDA → Open Food Facts → LLM Flash → LLM Pro. Current implementation uses USDA branded search for the official-chain component; direct chain-site scrapers can be added later if useful.
-- Hawker/Asian/local fallback: LLM Flash → LLM Pro.
-- Mixed home/non-chain restaurant meal fallback: LLM Flash → LLM Pro.
-- Unknown fallback: LLM Flash → LLM Pro. If still uncertain, leave fields missing rather than inventing precision. Do not start with USDA for vague/unknown items.
-- Structured sources are implemented in `domains/food/nutrition_sources/sources.py`: USDA FoodData Central (requires `USDA_API_KEY`) and Open Food Facts (no key). Source attempts are recorded in `macro_meta.source_attempts`; field provenance is recorded in `macro_meta.field_sources`.
-- External source matching uses API candidate retrieval, obvious-garbage prefiltering, then Gemini Flash candidate selection. Gemini may only choose a real candidate ID returned by USDA/Open Food Facts, or no match. If no candidate is selected, the route continues to the next fallback.
-- LLM macro fallback uses Gemini Flash first; if Flash returns no usable JSON a second Flash pass (SOURCE_LLM_PRO) is tried. If still no values, missing fields remain null.
+- User-provided/manual macros: preserve B's stated fields exactly → LLM gap-fill for missing fields (current); intended future: food-type USDA/OFF fallback for missing fields. If B says "2 eggs, 140 kcal, 12g protein", keep kcal/protein and fill missing carbs/fat/fibre/sugar/sodium via gap-fill.
+- Nutrition label: visible label values, pro-rated by consumed quantity → LLM gap-fill for missing fields (current); intended future: food-type USDA/OFF fallback for missing fields. If OCR is unclear, ask for a clearer photo or typed values; never insert zero macros because extraction failed.
+- Restaurant/menu reported: published nutrition values from screenshot/menu/meal-plan → LLM gap-fill for missing fields (current); intended future: food-type USDA/OFF fallback for missing fields. The reported values are preserved exactly; only missing fields are enriched.
+- Whole food fallback: USDA → Open Food Facts → LLM Flash (LLM Pro auto-escalation not yet wired).
+- Packaged fallback without readable label: Open Food Facts → USDA → LLM Flash (LLM Pro not yet wired).
+- Standardized restaurant chain fallback: USDA (Foundation/SR Legacy) → Open Food Facts → LLM Flash (LLM Pro not yet wired). Note: USDA Branded Food is excluded (per-serving nutrient reporting makes scaling unreliable). A future official-chain step (chain-site scrapers or branded data) can be inserted before USDA when needed.
+- Hawker/Asian/local fallback: LLM Flash (LLM Pro not yet wired).
+- Mixed home/non-chain restaurant meal fallback: LLM Flash (LLM Pro not yet wired).
+- Unknown fallback: LLM Flash (LLM Pro not yet wired). If still uncertain, leave fields missing rather than inventing precision. Do not start with USDA for vague/unknown items.
+- Structured sources are implemented across `domains/food/nutrition_sources/router.py` (orchestration + food-type classifier), `usda.py` (USDA FoodData Central, requires `USDA_API_KEY`), and `off.py` (Open Food Facts, no key required). Field provenance is recorded in `macro_meta.field_sources`; source attribution in `macro_meta.structured_source`. Note: OFF requires a gram weight and is skipped when `grams is None` (count/natural units like "1 egg" or "2 bananas"); USDA handles those via `foodPortions` resolution.
+- External source matching uses live API candidate retrieval, then Gemini Flash candidate selection. Gemini may only choose a real candidate ID returned by USDA/Open Food Facts, or no match. If no candidate is selected, the route continues to the next fallback.
+- LLM macro fallback uses Gemini Flash. If no structured source match is found, the original LLM estimates are kept unchanged.
 
 ---
 
