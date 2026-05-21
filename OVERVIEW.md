@@ -29,7 +29,7 @@
 |---|---|
 | OLTP | Cloud SQL Postgres 16, `asia-southeast1`, instance `projectb-db`, database `projectb` |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | Gemini via `google-genai` SDK; MODEL_LITE for routing, MODEL_FLASH for extraction and corrections |
+| LLM | Gemini via `google-genai` SDK; MODEL_FLASH for routing, classification, extraction, and corrections |
 | Async | Cloud Tasks (reminders, delayed work — not yet wired) |
 | Secrets | GCP Secret Manager; `.env` for local dev only |
 

@@ -25,7 +25,7 @@ from domains.sleep.service import handle_sleep_log, handle_wake_log
 from domains.weight.correction import handle_weight_correction
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
-from system.llm import MODEL_LITE, generate_text, transcribe_audio
+from system.llm import MODEL_FLASH, generate_text, transcribe_audio
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
@@ -192,7 +192,7 @@ def _classify_intent(msg: InboundMessage) -> Intent:
         caption=msg.caption or "—",
     )
     try:
-        raw = generate_text(prompt, model=MODEL_LITE)
+        raw = generate_text(prompt, model=MODEL_FLASH)
         return _parse_intent(raw)
     except Exception as e:
         log_failure(

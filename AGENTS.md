@@ -119,7 +119,7 @@ Functions:
 - Use `system/logging.py` helpers: `configure_logging()` at app startup, `log_event(...)` for normal flow, `log_failure(...)` for caught exceptions, and `get_error_summary(...)` when a redacted error string is needed.
 - Log structured context only: `update_id`, `message_type`, row counts, IDs, model names, byte counts, timestamps, booleans, chosen intent, etc.
 - Do **not** log secrets or anything that may contain them: bot tokens, API keys, webhook secrets, `DATABASE_URL`, authorization headers, or raw exception strings from HTTP clients unless passed through the redaction helper.
-- Do **not** log raw freeform user content by default: message text, captions, full transcriptions, prompts, model responses, exact coordinates, or full payload JSON. Prefer lengths, presence flags, IDs, and summaries.
+- Do **not** log raw freeform user content where it carries PII risk: message text, captions, full transcriptions, prompts, model responses, exact coordinates, or full payload JSON. Prefer lengths, presence flags, IDs, and summaries. Exception: `food_item` strings are logged throughout `domains/food/` for traceability — this is an accepted pattern since food descriptions are not considered sensitive PII in this system.
 - `INFO` = normal lifecycle milestones and successful decisions; `WARNING` = degraded fallback, retries, or non-fatal misses; `ERROR` = request-affecting failure where the current action could not complete.
 - When adding a new domain or external call, include logs for: entry into the handler, key branch decisions, successful write/send completion, and any caught failure path.
 
@@ -127,7 +127,7 @@ Functions:
 
 ## Stack gotchas
 
-- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model constants live in `system/llm.py` — use `MODEL_LITE` for high-volume simple calls (routing), `MODEL_FLASH` for extraction and corrections, `MODEL_PRO` reserved for hard cases. Verify current model IDs by running `client.models.list()`. Route all LLM calls through `system/llm.py`.
+- Use `google-genai` SDK, not the deprecated `google-generativeai`. Model constants live in `system/llm.py` — use `MODEL_FLASH` for intent routing, food-type classification, extraction, and corrections (flash-lite produced 503 overload errors under load; classification quality also justifies flash). `MODEL_PRO` is reserved for hard cases. Verify current model IDs by running `client.models.list()`. Route all LLM calls through `system/llm.py`.
 - `GEMINI_API_KEY` is a required secret — Secret Manager for Cloud Run, `.env` for local dev.
 - Postgres folds unquoted identifiers to lowercase. Never use camelCase for table or column names.
 - Secret Manager values created via `gcloud` often have a trailing newline. Always `.strip()` at load time.

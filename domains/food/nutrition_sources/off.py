@@ -8,12 +8,17 @@ API: https://world.openfoodfacts.org/cgi/search.pl (no key required)
 Base unit: per 100g
 
 Functions:
-  lookup(food_item, grams, update_id) — returns (macro dict, all_candidates list) or (None, []) if no match
+  lookup(food_item, grams, update_id, food_meta) — returns (macro dict, all_candidates list) or (None, []).
+                                                    Skips immediately when grams is None (no portion data in OFF).
+
+Internal helpers:
+  _search(food_item, update_id)                  — queries OFF search API; returns usable products list.
+  _select_candidate(food_item, grams, candidates, update_id) — LLM selects best product; returns (index, all_candidates).
+  _scale_candidate(product, grams, update_id)    — scales per-100g nutrient values to logged grams.
 """
 
 import json
 import logging
-import re
 
 import httpx
 
@@ -47,18 +52,23 @@ Candidates (all values per 100g):
 Rules:
 - Choose the product that best matches the food logged — same brand name matters for packaged goods.
 - Return null if no candidate is a clearly good match.
-- Rate confidence: "high" = clearly the same product; "low" = uncertain.
 
 Return JSON only:
-{{"index": <int or null>, "confidence": "high" or "low"}}\
+{{"index": <int or null>}}\
 """
 
 
 # Searches Open Food Facts and returns the best-matching macro values scaled to grams.
-# Inputs: food_item string, grams (already converted), update_id for logging.
+# Inputs: food_item string, grams (pre-converted, or None for count/natural units),
+#         update_id for logging, food_meta (accepted but unused — OFF lacks foodPortions data).
 # Outputs: (result dict, all_candidates list) or (None, []) if no match.
 # all_candidates: list of dicts with label, brand, nutrients_per_100g — selected at index 0.
-def lookup(food_item: str, grams: float, update_id: int | None = None) -> tuple[dict | None, list[dict]]:
+# Note: OFF is skipped when grams is None — it does not have reliable per-serving gram weights.
+def lookup(food_item: str, grams: float | None, update_id: int | None = None, *, food_meta: dict | None = None) -> tuple[dict | None, list[dict]]:
+    if grams is None:
+        log_event(logger, logging.INFO, "off_skipped_no_grams",
+                  update_id=update_id, food_item=food_item)
+        return None, []
     candidates = _search(food_item, update_id)
     if not candidates:
         return None, []
@@ -71,6 +81,9 @@ def lookup(food_item: str, grams: float, update_id: int | None = None) -> tuple[
     return result, all_candidates
 
 
+# Searches Open Food Facts for products matching food_item.
+# Inputs: food_item string, update_id for logging.
+# Outputs: list of raw product dicts (with nutriments), or None on error / no results.
 def _search(food_item: str, update_id: int | None) -> list[dict] | None:
     try:
         resp = httpx.get(
@@ -103,6 +116,10 @@ def _search(food_item: str, update_id: int | None) -> list[dict] | None:
     return usable
 
 
+# Uses LLM to select the best-matching OFF product for food_item at grams.
+# Inputs: food_item string, grams float, list of raw OFF product dicts, update_id.
+# Outputs: (selected_index | None, all_candidates list) — index is None when no match; all_candidates
+#   is the capped ordered list used to build the candidate_letter_map.
 def _select_candidate(
     food_item: str, grams: float, candidates: list[dict], update_id: int | None
 ) -> tuple[int | None, list[dict]]:
@@ -134,15 +151,13 @@ def _select_candidate(
             ),
             model=MODEL_FLASH,
         ).strip()
-        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-        result = json.loads(cleaned)
+        result = json.loads(raw)
     except Exception as e:
         log_failure(logger, logging.WARNING, "off_select_failed", e,
                     update_id=update_id, food_item=food_item)
         return None, []
 
     index = result.get("index")
-    confidence = result.get("confidence", "low")
 
     if index is None or not (0 <= index < len(candidates)):
         log_event(logger, logging.INFO, "off_no_match",
@@ -151,8 +166,7 @@ def _select_candidate(
 
     log_event(logger, logging.INFO, "off_candidate_selected",
               update_id=update_id, food_item=food_item,
-              product_name=candidates[index].get("product_name"),
-              confidence=confidence)
+              product_name=candidates[index].get("product_name"))
 
     # Build all_candidates list: selected at index 0, others follow in API order, capped at 6.
     selected = candidates[index]
@@ -183,6 +197,9 @@ def _select_candidate(
     return index, all_candidates
 
 
+# Scales a raw OFF product's per-100g nutriments to the requested gram weight.
+# Inputs: raw OFF product dict, grams float, update_id for logging.
+# Outputs: result dict with _source/_candidate_name/_scaling_g metadata and scaled macro fields.
 def _scale_candidate(product: dict, grams: float, update_id: int | None) -> dict:
     nutriments = product.get("nutriments") or {}
     factor = grams / 100.0

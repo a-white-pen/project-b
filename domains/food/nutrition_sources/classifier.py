@@ -13,12 +13,13 @@ Types:
   UNKNOWN          — cannot classify
 
 Functions:
-  classify(food_item, update_id) — returns (food_type, confidence) where confidence is "high"/"low"
+  classify(food_item, update_id) — returns food_type string
 """
 
 import logging
+import re
 
-from system.llm import MODEL_LITE, generate_text
+from system.llm import MODEL_FLASH, generate_text
 from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
@@ -34,62 +35,56 @@ UNKNOWN = "unknown"
 # for dishes where the final macro profile depends on cooking method and proportions.
 SKIP_STRUCTURED_SOURCES = {ASIAN_HAWKER, MIXED_MEAL, UNKNOWN}
 
-_LETTER_TO_TYPE: dict[str, str] = {
-    "A": WHOLE_FOOD,
-    "B": PACKAGED_GOOD,
-    "C": RESTAURANT_CHAIN,
-    "D": ASIAN_HAWKER,
-    "E": MIXED_MEAL,
-    "F": UNKNOWN,
-}
-
 _CLASSIFY_PROMPT = """\
 Classify this food item for nutrition source routing.
 
 Food item: {food_item}
 
-Choose the single best category:
-A. whole_food — raw or minimally processed single ingredient: \
+Choose the single best category and return ONLY that category name, nothing else:
+- whole_food — raw or minimally processed single ingredient: \
 eggs, chicken breast, apple, oats, salmon, tofu, milk, broccoli, banana
-B. packaged_good — branded product sold in a package with a nutrition label: \
+- packaged_good — branded product sold in a package with a nutrition label: \
 protein bar, instant noodle, Greek yoghurt, sports drink, cereal, crackers
-C. restaurant_chain — item from a known international or regional chain or franchise: \
+- restaurant_chain — item from a known international or regional chain or franchise: \
 McDonald's Big Mac, Starbucks latte, KFC fried chicken, Subway sandwich, Pizza Hut pizza
-D. asian_hawker — hawker/kopitiam/street food or local Asian dish: \
+- asian_hawker — hawker/kopitiam/street food or local Asian dish: \
 chicken rice, pad kra pao, laksa, char kway teow, moo ping, khao soi, wonton noodles, \
 dim sum, congee, nasi lemak, boat noodles, som tum, mango sticky rice
-E. mixed_meal — home-cooked or restaurant mixed plate not covered above: \
+- mixed_meal — home-cooked or restaurant mixed plate not covered above: \
 bento set, salad bowl, mixed grill, grain bowl, set meal
-F. unknown — cannot classify with confidence
+- unknown — cannot classify
 
-Return ONLY one letter (A–F) on the first line, then "high" or "low" confidence on the second line.
-Example:
-D
-high\
+Return exactly one of: whole_food, packaged_good, restaurant_chain, asian_hawker, mixed_meal, unknown\
 """
 
 
 # Classifies a food item for structured source routing.
 # Inputs: food_item string, update_id for logging.
-# Outputs: (food_type constant, confidence) — "high" means use the match; "low" means fall through.
-# Never raises — returns (UNKNOWN, "low") on any error so callers always get a safe default.
-def classify(food_item: str, update_id: int | None = None) -> tuple[str, str]:
+# Outputs: food_type constant string.
+# Never raises — returns UNKNOWN on any error so callers always get a safe default.
+def classify(food_item: str, update_id: int | None = None) -> str:
+    _VALID_TYPES = {WHOLE_FOOD, PACKAGED_GOOD, RESTAURANT_CHAIN, ASIAN_HAWKER, MIXED_MEAL, UNKNOWN}
     try:
         raw = generate_text(
             _CLASSIFY_PROMPT.format(food_item=food_item),
-            model=MODEL_LITE,
-        ).strip()
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        first_letter = lines[0].upper()[:1] if lines else ""
-        food_type = _LETTER_TO_TYPE.get(first_letter, UNKNOWN)
-        confidence = "high" if len(lines) > 1 and "high" in lines[1].lower() else "low"
+            model=MODEL_FLASH,
+        ).strip().lower()
+        # Extract the first contiguous [a-z_] run from the first line.
+        # re.match stops at the first non-matching character, so:
+        #   "whole_food."              → "whole_food"  ✓
+        #   "whole_food — raw ingredient" → "whole_food"  ✓
+        #   "WHOLE_FOOD" (lowercased)  → "whole_food"  ✓
+        first_line = raw.splitlines()[0].strip() if raw else ""
+        m = re.match(r"[a-z_]+", first_line)
+        first_token = m.group(0) if m else ""
+        food_type = first_token if first_token in _VALID_TYPES else UNKNOWN
         log_event(
             logger, logging.INFO, "food_type_classified",
             update_id=update_id, food_item=food_item,
-            food_type=food_type, confidence=confidence,
+            food_type=food_type,
         )
-        return food_type, confidence
+        return food_type
     except Exception as e:
         log_failure(logger, logging.WARNING, "food_type_classify_failed", e,
                     update_id=update_id, food_item=food_item)
-        return UNKNOWN, "low"
+        return UNKNOWN

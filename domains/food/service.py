@@ -86,8 +86,8 @@ Message from user: {text}
 Extract each distinct food item mentioned. Return a JSON object with this exact structure:
 {{
   "meal_type": "<one of: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout>",
-  "macro_input": "<one of: description, nutrition_label, restaurant_reported, image, manual>",
-  "macro_method": "<one of: llm, nutrition_label, restaurant_reported, usda, open_foods, edamam, manual>",
+  "macro_input": "<one of: description, nutrition_label, macro_screenshot, image, manual>",
+  "macro_method": "<one of: llm, nutrition_label, restaurant_reported, usda, open_foods, manual>",
   "items": [
     {{
       "food_item": "<description of the item>",
@@ -116,6 +116,7 @@ Rules:
 - Estimate macros as accurately as you can from nutritional knowledge. Only use null if truly unknowable.
 - stated_fields: list only the macro field names (from: kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg) where B explicitly gave a numeric value in the message. Empty list if B gave no explicit values. Never list estimated or inferred fields.
 - food_meta keys are optional — omit any key that is not meaningful for this item.
+- qty: when the user states an explicit gram/weight alongside a container or count, always use the gram weight as qty. Examples: "1 box 80g" → {{"amount": 80, "unit": "g"}}; "1 bar 45g" → {{"amount": 45, "unit": "g"}}; "2 eggs 55g each" → {{"amount": 110, "unit": "g"}} (multiply count × per-item weight). Gram weight always beats container unit (box, bag, bar, packet, slice, piece, scoop, serving).
 - A named dish is ONE item even if it contains multiple components. "Chicken rice" = 1 item (not chicken + rice separately). "Laksa" = 1 item. Only split into multiple items when B explicitly lists separate things (e.g. "2 eggs, yoghurt, blueberries").
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
@@ -300,19 +301,23 @@ def _build_candidate_list(macro_meta: dict) -> str:
 # One message per item — keeps correction quoting unambiguous (B quotes exactly the item to fix).
 # All user/LLM strings are passed through html.escape() — required for Telegram HTML parse_mode.
 #
-# Source attribution per field is read from macro_meta.field_sources when present;
-# falls back to row-level macro_method for older rows or paths that don't set field_sources.
+# Layout:
+#   Header:    <b>Meal · food_name</b>
+#   Subheader: candidate_name · scaling_g  (or brand · qty from food_meta when no structured source)
+#   Grid:      field  value unit  <i>chip</i>  — one row per macro; field name first
+#   Footer:    <i>Source · candidate_name</i>  — once per card, only for USDA / OFF matches
+#   Extras:    expandable alternatives block, "Quote to correct."
 #
-# field_sources status → display label:
-#   zero_from_label                          → (assumed 0)
-#   from_source + source=nutrition_label     → (nutrition label)
-#   from_source + source=macro_screenshot    → (meal service label)
-#   stated_by_user                           → (you stated)
-#   gap_filled / llm_estimated               → (LLM estimate)
-#   fallback macro_method=nutrition_label    → (nutrition label)
-#   fallback macro_method=restaurant_reported → (meal service label)
-#   fallback macro_method=manual             → (you stated)
-#   fallback anything else                   → (LLM estimate)
+# Short source chips (per field):
+#   from_source + usda              → USDA
+#   from_source + open_food_facts   → OFF
+#   from_source + nutrition_label   → nutrition label
+#   from_source + macro_screenshot  → restaurant reported
+#   zero_from_label                 → -0
+#   stated_by_user                  → B reported
+#   gap_filled / llm_estimated      → llm est.
+#   fallback macro_method=manual    → B reported
+#   fallback anything else          → llm est.
 #
 # Null secondary macros (fibre/sugar/sodium) show "—" rather than being omitted.
 # Null sodium specifically means genuinely unknown; non-null sodium=0 means confirmed zero.
@@ -324,104 +329,145 @@ def _format_item_reply(meal_type: str, item: dict) -> str:
     food_name = html.escape(str(item.get("food_item") or "?"))
     lines: list[str] = [f"<b>{meal_label} · {food_name}</b>"]
 
-    # Optional subheader: brand and/or quantity from food_meta.
-    food_meta = item.get("food_meta") or {}
-    brand = food_meta.get("brand")
-    qty = food_meta.get("qty") or {}
-    subparts: list[str] = []
-    if brand:
-        subparts.append(html.escape(str(brand)))
-    if qty.get("amount") is not None:
-        unit = qty.get("unit") or ""
-        qty_str = str(qty["amount"])
-        if unit:
-            qty_str += " " + unit
-        subparts.append(html.escape(qty_str))
-    if subparts:
-        lines.append(f"<i>{' · '.join(subparts)}</i>")
-
-    lines.append("")
-
-    # Per-field source attribution.
     macro_meta = item.get("macro_meta") or {}
     field_sources: dict = macro_meta.get("field_sources") or {}
     macro_method: str = item.get("macro_method") or "llm"
+    food_meta = item.get("food_meta") or {}
 
-    def _source_label(field: str) -> str:
+    # Subheader: candidate_name + scaling_g when a structured source was used;
+    # falls back to brand + qty from food_meta (LLM / label / screenshot paths).
+    structured_source = macro_meta.get("structured_source")
+    candidate_name_meta: str = macro_meta.get("candidate_name") or ""
+
+    # Scaling_g: scan field_sources first, then resolved_grams (count/natural units).
+    scaling_g: float | None = None
+    for _fs in field_sources.values():
+        if _fs.get("scaling_g") is not None:
+            scaling_g = float(_fs["scaling_g"])
+            break
+    if scaling_g is None and macro_meta.get("resolved_grams") is not None:
+        scaling_g = float(macro_meta["resolved_grams"])
+
+    _STRUCTURED_SOURCES = {"usda", "open_food_facts"}
+
+    if structured_source in _STRUCTURED_SOURCES and candidate_name_meta:
+        raw_cn = candidate_name_meta
+        truncated_cn = (raw_cn[:30] + "…") if len(raw_cn) > 30 else raw_cn
+        subheader = html.escape(truncated_cn)
+        if scaling_g is not None:
+            subheader += f" · {scaling_g:.0f}g"
+        lines.append(f"<i>{subheader}</i>")
+    else:
+        brand = food_meta.get("brand")
+        qty = food_meta.get("qty") or {}
+        subparts: list[str] = []
+        if brand:
+            subparts.append(html.escape(str(brand)))
+        if qty.get("amount") is not None:
+            unit = qty.get("unit") or ""
+            qty_str = str(qty["amount"])
+            if unit:
+                qty_str += " " + unit
+            subparts.append(html.escape(qty_str))
+        if subparts:
+            lines.append(f"<i>{' · '.join(subparts)}</i>")
+
+    lines.append("")
+
+    # Short source chip per field — full attribution goes in the footer line, not repeated per field.
+    def _chip(field: str) -> str:
         fs = field_sources.get(field)
         if fs:
             status = fs.get("status", "")
             source = fs.get("source", "")
             if status == "zero_from_label":
-                return "(assumed 0)"
+                return "-0"
             if status == "from_source":
                 if source == "nutrition_label":
-                    return "(nutrition label)"
+                    return "nutrition label"
                 if source == "macro_screenshot":
-                    return "(meal service label)"
+                    return "restaurant reported"
                 if source == "usda":
-                    scaling_g = fs.get("scaling_g")
-                    candidate = fs.get("candidate_name", "")
-                    suffix = f" — {candidate}" if candidate else ""
-                    return f"(USDA · {scaling_g:.0f}g{suffix})" if scaling_g is not None else f"(USDA{suffix})"
+                    return "USDA"
                 if source == "open_food_facts":
-                    scaling_g = fs.get("scaling_g")
-                    candidate = fs.get("candidate_name", "")
-                    suffix = f" — {candidate}" if candidate else ""
-                    return f"(Open Food Facts · {scaling_g:.0f}g{suffix})" if scaling_g is not None else f"(Open Food Facts{suffix})"
-                return "(LLM estimate)"  # food_image and unrecognised sources
+                    return "OFF"
+                return "llm est."
             if status == "stated_by_user":
-                return "(you stated)"
+                return "B reported"
             if status in ("gap_filled", "llm_estimated"):
-                return "(LLM estimate)"
+                return "llm est."
+        # Fallback to row-level macro_method for older rows or paths without field_sources.
         if macro_method == "nutrition_label":
-            return "(nutrition label)"
+            return "nutrition label"
         if macro_method == "restaurant_reported":
-            return "(meal service label)"
+            return "restaurant reported"
         if macro_method == "manual":
-            return "(you stated)"
-        return "(LLM estimate)"
+            return "B reported"
+        return "llm est."
 
     def _fmt(val) -> str | None:
         f = _to_float(val)
         return None if f is None else f"{f:.0f}"
 
-    # Core macros.
+    # Core macros — field name first, then value + unit, then short source chip.
     kcal = _fmt(item.get("kcal"))
     protein = _fmt(item.get("protein_g"))
     carbs = _fmt(item.get("carbs_g"))
     fat = _fmt(item.get("fat_g"))
     if kcal is not None:
-        lines.append(f"{kcal} kcal  <i>{_source_label('kcal')}</i>")
+        lines.append(f"kcal  {kcal}  <i>{_chip('kcal')}</i>")
     if protein is not None:
-        lines.append(f"{protein}g protein  <i>{_source_label('protein_g')}</i>")
+        lines.append(f"protein  {protein} g  <i>{_chip('protein_g')}</i>")
     if carbs is not None:
-        lines.append(f"{carbs}g carbs  <i>{_source_label('carbs_g')}</i>")
+        lines.append(f"carbs  {carbs} g  <i>{_chip('carbs_g')}</i>")
     if fat is not None:
-        lines.append(f"{fat}g fat  <i>{_source_label('fat_g')}</i>")
+        lines.append(f"fat  {fat} g  <i>{_chip('fat_g')}</i>")
 
     lines.append("")
 
-    # Secondary macros — always shown; null renders as "—".
+    # Secondary macros — always shown; null renders as "—" so the field is visible.
     fibre = _fmt(item.get("fibre_g"))
     sugar = _fmt(item.get("sugar_g"))
     sodium_val = _to_float(item.get("sodium_mg"))
+    lines.append(f"fibre  {fibre} g  <i>{_chip('fibre_g')}</i>" if fibre is not None else "fibre  —")
+    lines.append(f"sugar  {sugar} g  <i>{_chip('sugar_g')}</i>" if sugar is not None else "sugar  —")
     lines.append(
-        f"fibre: {fibre}g  <i>{_source_label('fibre_g')}</i>" if fibre is not None else "fibre: —"
-    )
-    lines.append(
-        f"sugar: {sugar}g  <i>{_source_label('sugar_g')}</i>" if sugar is not None else "sugar: —"
-    )
-    lines.append(
-        f"sodium: {_fmt(sodium_val)}mg  <i>{_source_label('sodium_mg')}</i>"
-        if sodium_val is not None else "sodium: —"
+        f"sodium  {_fmt(sodium_val)} mg  <i>{_chip('sodium_mg')}</i>"
+        if sodium_val is not None else "sodium  —"
     )
 
+    # Footer: structured source attribution once per card — only for USDA / OFF matches.
+    # Mixed sources (some fields gap-filled by LLM) still show the primary source here;
+    # per-field chips already surface "llm est." for the gap-filled ones.
+    _SOURCE_DISPLAY = {"usda": "USDA", "open_food_facts": "Open Food Facts"}
+    footer_source = structured_source if structured_source in _SOURCE_DISPLAY else None
+    if not footer_source:
+        # Scan field_sources in case macro_meta.structured_source wasn't set (e.g. post-correction).
+        for _fs in field_sources.values():
+            if _fs.get("status") == "from_source" and _fs.get("source") in _SOURCE_DISPLAY:
+                footer_source = _fs["source"]
+                if not candidate_name_meta:
+                    candidate_name_meta = _fs.get("candidate_name") or ""
+                break
+
+    if footer_source:
+        source_display = _SOURCE_DISPLAY[footer_source]
+        footer_candidate = macro_meta.get("candidate_name") or candidate_name_meta
+        if footer_candidate:
+            raw_fc = footer_candidate
+            truncated_fc = (raw_fc[:40] + "…") if len(raw_fc) > 40 else raw_fc
+            footer_line = f"{source_display} · {html.escape(truncated_fc)}"
+        else:
+            footer_line = source_display
+        lines.append("")
+        lines.append(f"<i>{footer_line}</i>")
+
     # Candidate list (shown when a structured source match was made).
+    # Wrapped in <blockquote expandable> so it collapses by default in Telegram.
     candidate_list = _build_candidate_list(macro_meta)
     if candidate_list:
         lines.append("")
-        lines.append(candidate_list)
+        lines.append(f"<blockquote expandable>{candidate_list}</blockquote>")
 
     lines.append("")
     lines.append("<i>Quote to correct.</i>")
@@ -548,6 +594,21 @@ def _handle_text_items(
                         # Field was estimated by the extraction LLM (not stated by B).
                         # Record provenance so analytics can distinguish stated vs estimated fields.
                         field_sources[field] = {"status": "llm_estimated", "model": MODEL_FLASH}
+
+    # Gap 4: when B stated kcal but not the full macro breakdown, null out LLM-estimated
+    # P/C/F/fibre/sugar/sodium so gap-fill can re-estimate them anchored to the stated kcal.
+    # Without this the reply would show LLM-estimated P/C/F alongside a stated kcal that
+    # doesn't add up to the estimated breakdown.
+    _DERIVED_FIELDS = ("protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg")
+    for item in items:
+        field_sources = (item.get("macro_meta") or {}).get("field_sources") or {}
+        stated_set = {f for f, fs in field_sources.items() if fs.get("status") == "stated_by_user"}
+        if "kcal" in stated_set and not stated_set.issuperset({"protein_g", "carbs_g", "fat_g"}):
+            for field in _DERIVED_FIELDS:
+                if field not in stated_set:
+                    item[field] = None
+                    field_sources.pop(field, None)
+            _gap_fill_macros(item, msg.update_id)
 
     meal_type = extracted.get("meal_type", "snack")
     if meal_type not in _VALID_MEAL_TYPES:
@@ -759,6 +820,10 @@ def _handle_label_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[s
         if item.get("macro_input") == "nutrition_label":
             _apply_zero_from_label(item)
 
+    # Caption-only items (label unreadable but caption names the food) get description/llm treatment.
+    # Run enrich_item so they get the same USDA/OFF structured source lookup as text items.
+    items = [enrich_item(item, msg.update_id) if item.get("macro_input") == "description" else item for item in items]
+
     try:
         food_log_ids = _insert_items(items=items, meal_type=meal_type, update_id=msg.update_id,
                                      source="telegram", macro_input="nutrition_label",
@@ -813,6 +878,10 @@ def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> l
                     field_sources[field] = {"status": "from_source", "source": "macro_screenshot"}
             _gap_fill_macros(item, msg.update_id)
 
+    # Caption-only items (screenshot unreadable but caption names the food) get description/llm treatment.
+    # Run enrich_item so they get the same USDA/OFF structured source lookup as text items.
+    items = [enrich_item(item, msg.update_id) if item.get("macro_input") == "description" else item for item in items]
+
     try:
         food_log_ids = _insert_items(items=items, meal_type=meal_type, update_id=msg.update_id,
                                      source="telegram", macro_input="macro_screenshot",
@@ -827,8 +896,7 @@ def _handle_macro_screenshot_photo(msg: InboundMessage, image_bytes: bytes) -> l
 
 
 # Path 3 — food image (actual food photo, no printed macro numbers).
-# Calls _FOOD_IMAGE_PROMPT for LLM macro estimation, inserts.
-# USDA/OFF structured source routing will be added here in A4.
+# Calls _FOOD_IMAGE_PROMPT for LLM macro estimation, then runs enrich_item for structured source lookup.
 # Inputs: msg, raw image bytes.
 # Outputs: list of (reply, state) — one per item found.
 def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> list[tuple[str, dict | None]]:
@@ -857,8 +925,9 @@ def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> list[tu
     image_macro_meta: dict = {"model": MODEL_FLASH}
 
     # Attempt structured source lookup for food_image items.
-    # _stamp_photo_provenance runs after so it only fills provenance for items that
-    # didn't get a structured source match (macro_input stays "image" for those).
+    # enrich_item may set macro_method/macro_meta on matched items but never touches macro_input
+    # (it stays "image" throughout). _stamp_photo_provenance fills any missing macro_input/method
+    # keys on the remaining items — it is a no-op for fields already set.
     items = [enrich_item(item, msg.update_id) for item in items]
 
     _stamp_photo_provenance(items, "image", image_macro_meta)
@@ -1023,11 +1092,12 @@ def _insert_items(
     return ids
 
 
-# Fills null macro fields for a macro_screenshot item using a constrained LLM call.
-# Known non-null fields (read from the printed source) are passed to the LLM as fixed
-# constraints; only null fields are estimated. Never overwrites non-null values.
-# Text items with stated_fields do not call this — the extraction LLM already estimated
-# all fields in the same pass, so a second call would be redundant.
+# Fills null macro fields using a constrained LLM call anchored to known values.
+# Used in three contexts: (1) macro_screenshot items where some fields were read from the label,
+# (2) text items where B stated kcal but not full P/C/F, (3) after a candidate switch in correction
+# to fill fields the new candidate lacks.
+# Known non-null fields are passed to the LLM as fixed constraints; only null fields are estimated.
+# Never overwrites non-null values.
 # Records each gap-filled field in item["macro_meta"]["field_sources"] for provenance.
 # Inputs: item dict (modified in-place), update_id for logging.
 # Outputs: None (modifies item in-place).
