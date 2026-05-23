@@ -32,7 +32,7 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 | `nutrition` | Food logs and meal data |
 | `finances` | Spend and transactions |
 | `exercise` | Cardio and strength activities |
-| `external` | Raw reference data from external sources (menus, scraped data) |
+| `external_data` | Raw reference data from external sources (menus, scraped data) |
 | `system` | Internal state — Telegram raw payloads, outbound log, conversation state, OAuth tokens |
 | `marts` | Read-only analytics views — never written by the app |
 | `data_visualisation` | Snapshot tables refreshed by Cloud Scheduler for external read APIs — never written by the live request path |
@@ -76,12 +76,14 @@ Date derivation uses B's reported location (stored in `b` schema) to determine l
 
 ## External and raw data
 
-Tables in `external` are append-only. Raw scraped data stays native — do not auto-clean or normalize without B's approval.
+Tables in `external_data` are append-only. Raw scraped data stays native — do not auto-clean or normalize without B's approval.
 
 To query current state:
 ```sql
 WHERE scraped_at = (SELECT max(scraped_at) FROM ...)
 ```
+
+`external_data.menu_items` — restaurant menu items scraped from FitFuel by Grain, Jones Salad, and WongNai delivery shops. Leanlicious rows come from WongNai for menu availability/prices and are enriched from official LINE Shopping product pages where WongNai only exposes product codes. Every scrape run appends rows sharing one `scraped_at` timestamp (the batch identifier). To query the current menu per restaurant, filter by `max(scraped_at)`. Partial failure tolerant: if one shop fails, the last good rows for that shop are still in the table. Prices are stored in both `price_thb` and `price_sgd` (converted via frankfurter.app at scrape time; rate stored in `meta`).
 
 ---
 

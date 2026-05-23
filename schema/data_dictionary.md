@@ -260,6 +260,63 @@ One row per active set in a strength session. REST periods from Garmin are folde
 | `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp. Set once on insert. |
 | `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp. Set on every correction write. |
 
+## Schema: `external_data`
+
+### View: `external_data.menu_current`
+Most recent successful menu batch per restaurant. Use this for agent meal-planning queries. Partial-failure tolerant: if a shop fails this run, its last-good batch is still returned. item_name_en holds the best available name — English from source when available, Thai script otherwise.
+
+**View definition:**
+```sql
+SELECT restaurant_name,
+    item_name_en,
+    category,
+    price_sgd,
+    price_thb,
+    kcal,
+    protein_g,
+    carbs_g,
+    fat_g
+   FROM external_data.menu_items m
+  WHERE scraped_at = (( SELECT max(menu_items.scraped_at) AS max
+           FROM external_data.menu_items
+          WHERE menu_items.restaurant_name = m.restaurant_name));
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `restaurant_name` | `text` | yes |  |  |
+| `item_name_en` | `text` | yes |  |  |
+| `category` | `text` | yes |  |  |
+| `price_sgd` | `numeric(8,4)` | yes |  |  |
+| `price_thb` | `numeric(8,2)` | yes |  |  |
+| `kcal` | `numeric(7,2)` | yes |  |  |
+| `protein_g` | `numeric(6,2)` | yes |  |  |
+| `carbs_g` | `numeric(6,2)` | yes |  |  |
+| `fat_g` | `numeric(6,2)` | yes |  |  |
+
+### Table: `external_data.menu_items`
+Append-only restaurant menu snapshots. Every scrape run appends a new batch; rows never change after insert. To read the latest menu per restaurant, filter by max(scraped_at) per restaurant_name.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `menu_item_id` | `bigint` | no | nextval('external_data.menu_items_menu_item_id_seq'::regclass) | Surrogate primary key. |
+| `source` | `text` | no |  | Scraper that produced this row. Values: fitfuel, jones, wongnai. |
+| `restaurant_name` | `text` | no |  | Canonical English restaurant name — hardcoded in scraper config, never taken from the page. Consistent across every scrape. Grouping key for latest-menu queries. |
+| `item_name_en` | `text` | yes |  | Best available item name — English when the source provides it (FitFuel, Jones smoothies, some WongNai items), Thai script otherwise (most WongNai shops, Jones Salad food rows). Translation is deferred to agent time, not performed at scrape time. |
+| `category` | `text` | yes |  | Menu section as labelled by the source. Not normalised across sources. |
+| `price_thb` | `numeric(8,2)` | yes |  | Price in Thai Baht. Set for WongNai and FitFuel. NULL for Jones Salad (no prices published) and future Singapore menus. |
+| `price_sgd` | `numeric(8,4)` | yes |  | Price in Singapore Dollars. For Thailand menus: price_thb converted at the THB/SGD spot rate fetched once per scrape run (rate stored in meta). For future Singapore menus: the native price. NULL if FX fetch failed. |
+| `kcal` | `numeric(7,2)` | yes |  | Energy in kilocalories. |
+| `protein_g` | `numeric(6,2)` | yes |  | Protein in grams. |
+| `carbs_g` | `numeric(6,2)` | yes |  | Carbohydrates in grams. |
+| `fat_g` | `numeric(6,2)` | yes |  | Fat in grams. |
+| `fibre_g` | `numeric(6,2)` | yes |  | Dietary fibre in grams. |
+| `sugar_g` | `numeric(6,2)` | yes |  | Sugar in grams. |
+| `sodium_mg` | `numeric(7,2)` | yes |  | Sodium in milligrams. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific extras. For Thailand menus includes fx_rate_thb_sgd, fx_source, fx_fetched_at. For FitFuel includes dish_id, dietary_flags, allergens. For WongNai includes wongnai_shop_id and Leanlicious LINE enrichment fields. |
+| `scraped_at` | `timestamp with time zone` | no |  | Timestamp shared by all rows in one scrape run. Acts as the batch identifier — use max(scraped_at) per restaurant_name to get the current menu. |
+| `created_at` | `timestamp with time zone` | no | now() | Row insert timestamp. |
+
 ## Schema: `nutrition`
 
 ### Table: `nutrition.food_log`

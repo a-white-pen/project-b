@@ -76,6 +76,32 @@ Cloud Scheduler (*/15 * * * *)
   → data_visualisation.nutrition_visualisation   snapshot table updated
 ```
 
+### Flow 5 — Menu refresh (B command or weekly scheduler)
+
+```
+B sends /refresh_menus   OR   Cloud Scheduler (Thu 18:00 ICT)
+  → telegram/router.py (command)       Intent.REFRESH_MENUS → domains/menus/service.py
+      → rate-limit check               query max(scraped_at); if < 15 min ago, return cooldown reply
+      → ack + fire                     immediate "refreshing…" reply, then POST to internal endpoint
+                                       with ?notify_start=false (ack already sent — no duplicate ping)
+     OR Cloud Scheduler                POST /internal/refresh-menus   X-Internal-Key header
+                                       (notify_start defaults to true — background task sends start ping)
+  → api/menus.py                       returns 202 immediately; adds background task
+      → BackgroundTask: _scrape_and_notify(notify_start)
+          → if notify_start: _notify_telegram("refreshing menus · weekly…")
+          → inbound/menus/runner.run_all()
+              → inbound/menus/fitfuel.scrape_all()    REST API: grainth.nutribotcrm.com (no auth)
+              → inbound/menus/jones.scrape_all()      BeautifulSoup over jonessalad.com/menu/nutrition-fact/
+              → inbound/menus/wongnai.scrape_all()    direct WongNai delivery HTML via curl_cffi
+                  → LINE Shopping product pages       official Leanlicious macro enrichment
+              → runner._drop_unusable_macro_items()   drop no-macro and all-zero rows
+              → runner._fetch_thb_sgd_rate()          frankfurter.app FX fetch once per run
+              → inbound/menus/writer.bulk_insert()    one transaction to external_data.menu_items
+          → _notify_telegram(summary_message)         proactive Telegram summary to B when done
+```
+
+Query current menu: `SELECT * FROM external_data.menu_items WHERE scraped_at = (SELECT max(scraped_at) FROM external_data.menu_items WHERE restaurant_name = '...')`.
+
 External consumers (e.g. awhitepen.com dashboard) read from:
 ```
 GET /api/data-visualisation/nutrition

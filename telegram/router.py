@@ -1,7 +1,8 @@
 """
 Routes normalized inbound messages to domain handlers based on LLM-classified intent.
 Callback query updates are routed deterministically from callback_data, not via the LLM.
-Slash commands are routed deterministically and the command token is stripped before dispatch.
+Slash commands are reserved for administrative actions that command the bot to do something.
+Free-form messages (text, photo, voice) are classified by the LLM.
 
 Functions:
   route(msg) — classifies intent (or resolves callback/command) and returns list of (reply, state)
@@ -12,6 +13,7 @@ import logging
 import os
 from enum import Enum
 
+from domains.menus.service import handle_refresh_menus
 from domains.attention.correction import handle_attention_correction
 from domains.attention.service import handle_attention_log
 from domains.expense.service import handle_expense_log
@@ -34,31 +36,25 @@ logger = logging.getLogger(__name__)
 
 
 class Intent(str, Enum):
-    LOG_FOOD = "log_food"           # logging food, meals, nutrition
-    LOG_WEIGHT = "log_weight"       # logging body weight or measurements
-    LOG_SLEEP = "log_sleep"         # going to sleep
-    LOG_WAKE = "log_wake"           # just woke up
-    LOG_EXPENSE = "log_expense"     # logging money spent
-    LOG_ATTENTION = "log_attention" # logging what B is working on / paying attention to
-    QUERY_DATA = "query_data"       # question about B's own stored data
-    ASK_GENERAL = "ask_general"     # general question — use as an LLM, unrelated to personal data
-    CORRECT = "correct"             # correction to a previously logged item (quoted bot reply)
-    UNKNOWN = "unknown"             # cannot determine intent
+    LOG_FOOD = "log_food"               # logging food, meals, nutrition
+    LOG_WEIGHT = "log_weight"           # logging body weight or measurements
+    LOG_SLEEP = "log_sleep"             # going to sleep
+    LOG_WAKE = "log_wake"               # just woke up
+    LOG_EXPENSE = "log_expense"         # logging money spent
+    LOG_ATTENTION = "log_attention"     # logging what B is working on / paying attention to
+    QUERY_DATA = "query_data"           # question about B's own stored data
+    ASK_GENERAL = "ask_general"         # general question — use as an LLM, unrelated to personal data
+    CORRECT = "correct"                 # correction to a previously logged item (quoted bot reply)
+    REFRESH_MENUS = "refresh_menus"     # trigger full menu scrape across all sources
+    UNKNOWN = "unknown"                 # cannot determine intent
 
 
 # Maps slash commands to intents — bypasses LLM entirely.
-# /eat@BotName form (used in groups) is handled by stripping the @suffix.
-# Note: @suffix is not validated against the bot's own username — acceptable for a
-# single-user private bot, but worth tightening if the bot is ever added to groups.
+# Slash commands are for administrative bot actions, not data logging.
+# Free-form messages (text, photo, voice) go through the LLM classifier instead.
+# /command@BotName form (used in groups) is handled by stripping the @suffix.
 _COMMAND_MAP: dict[str, Intent] = {
-    "/eat": Intent.LOG_FOOD,
-    "/weight": Intent.LOG_WEIGHT,
-    "/sleep": Intent.LOG_SLEEP,
-    "/wake": Intent.LOG_WAKE,
-    "/spend": Intent.LOG_EXPENSE,
-    "/focus": Intent.LOG_ATTENTION,
-    "/data": Intent.QUERY_DATA,
-    "/ask": Intent.ASK_GENERAL,
+    "/refresh_menus": Intent.REFRESH_MENUS,
 }
 
 _CLASSIFY_PROMPT = """\
@@ -173,7 +169,7 @@ def _extract_command(msg: InboundMessage) -> Intent | None:
 
 
 # Strips the leading slash command token from msg.text before handing to domain handlers.
-# Domains should receive "chicken rice", not "/eat chicken rice".
+# Domains should receive the trailing content, not the raw command token.
 # Inputs: InboundMessage where text starts with a slash command.
 # Outputs: new InboundMessage with text set to the post-command content (or None if no content).
 def _strip_command(msg: InboundMessage) -> InboundMessage:
@@ -315,4 +311,6 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | Non
         return [handle_query_data(msg)]
     if intent == Intent.ASK_GENERAL:
         return [handle_general_ask(msg)]
+    if intent == Intent.REFRESH_MENUS:
+        return [handle_refresh_menus(msg)]
     return [("not sure what to do with that yet", None)]

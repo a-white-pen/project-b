@@ -16,14 +16,17 @@
 - Exercise strength module (`exercise/strength`) — live; pending merge to master
 - Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
 - Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
+- Menu scraper (`inbound/menus/`) — **live**. FitFuel + Jones Salad direct fetch; WongNai direct delivery HTML via `curl_cffi`; Leanlicious macros enriched from LINE Shopping product pages. Writes to `external_data.menu_items`; query current menu via the `external_data.menu_current` view. Weekly Cloud Scheduler job pending setup.
 
-**Stub/minimal:** expense (`/spend` command exists, no persistence), general ask, data query.
+**Stub/minimal:** expense, general ask, data query.
+
+**Slash commands:** stripped back to admin actions only. `/refresh_menus` triggers a full scrape across all restaurant sources and reports back via Telegram. Free-form text still goes through the LLM classifier as before.
 
 ## Scope
 
 **In:** Telegram as the interface. B sends messages; the bot replies and will eventually take actions on B's behalf.
 
-**Out for now:** Oura, scrapers. Multi-user anything.
+**Out for now:** Oura. Multi-user anything.
 
 ## Stack
 
@@ -37,7 +40,7 @@
 
 ## Schemas
 
-`b` · `nutrition` · `finances` · `system` · `external` · `exercise` · `data_visualisation` — all Postgres.
+`b` · `nutrition` · `finances` · `system` · `external_data` · `exercise` · `data_visualisation` — all Postgres.
 
 `data_visualisation` holds snapshot tables refreshed by Cloud Scheduler for external read APIs.
 Analytics views go in a `marts` schema when there is something worth visualizing. Not yet.
