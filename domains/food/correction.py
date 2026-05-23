@@ -133,7 +133,7 @@ fields — the system will re-estimate them from the new quantity
 - "pre workout", "pre-workout", "post workout", "post-workout" always refer to meal_type changes — \
 they are meal timing labels, NOT food item names; never rename food_item based on these words
 - candidate_letter: set when the user references a letter from the candidate list shown \
-(e.g. "go with b" → "b", "try c" → "c"). If no candidate pick, set to null.
+(e.g. "go with b" → "b", "try c" → "c", or a bare single letter like "g" → "g"). If no candidate pick, set to null.
 - skip_structured_source: set to true only when user explicitly wants LLM instead of USDA/OFF
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
 """
@@ -365,15 +365,18 @@ def _apply_candidate_action(
                 }
             else:
                 db_updates[col] = None  # explicit NULL — prevents stale values from prior source
-        # Cross-source was the only untried source — no new untried, so LLM is next option.
+        # After cross-source switch, offer the previous source as the new untried option
+        # so the user can switch back if the new source doesn't satisfy them.
+        previous_source = macro_meta.get("structured_source")
+        new_untried = previous_source if previous_source and previous_source != source_key else None
         new_macro_meta = {
             **macro_meta,
             "candidate_name": candidate_name,
             "structured_source": source_key,
             "field_sources": field_sources,
             "source_candidates": new_candidates,
-            "candidate_letter_map": build_letter_map(new_candidates, None),
-            "untried_source": None,
+            "candidate_letter_map": build_letter_map(new_candidates, new_untried),
+            "untried_source": new_untried,
             "correction_update_id": update_id,
         }
         db_updates["macro_meta"] = psycopg2.extras.Json(new_macro_meta)

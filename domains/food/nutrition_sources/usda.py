@@ -35,7 +35,7 @@ Functions:
   lookup(food_item, grams, update_id, food_meta) — returns (macro dict, all_candidates list) or (None, []) if no match
 
 Internal helpers:
-  _pinned_fdc_id(food_item)                     — returns a pinned fdcId or None
+  pinned_fdc_id(food_item)                      — returns a pinned fdcId or None
   _fetch_detail_as_candidate(fdc_id, ...)       — fetches detail endpoint and normalises to search-format candidate dict
   _search(food_item, api_key, update_id)        — queries USDA search endpoint, returns raw candidate list
   _select_candidate(food_item, grams, ...)      — LLM selects best candidate; returns (selected, all_candidates)
@@ -103,7 +103,8 @@ USDA candidates (all values per 100g):
 Rules:
 - Choose the candidate that best matches the food logged — same preparation method matters \
 (e.g. "cooked" vs "raw", "grilled" vs "fried").
-- Prefer Foundation over SR Legacy when both match — Foundation has more measured values.
+- Prefer the candidate with the most complete nutrient data (more non-null fields shown).
+- If completeness is equal, prefer Foundation over SR Legacy.
 - Return null if no candidate is a good match (e.g. USDA returned "apple juice" for "apple").
 
 Return JSON only:
@@ -130,8 +131,10 @@ Return JSON only: {{"index": <int or null>}}\
 
 
 # Returns the pinned fdcId for a food_item, or None if not pinned.
+# Returns the pinned fdcId for a food_item, or None if not pinned.
+# Public so router.py can check pins before deciding source chain order.
 # Normalises food_item: lowercase, collapse whitespace, strip punctuation for fuzzy matching.
-def _pinned_fdc_id(food_item: str) -> int | None:
+def pinned_fdc_id(food_item: str) -> int | None:
     normalised = re.sub(r"[^a-z0-9 ]", " ", food_item.lower())
     normalised = re.sub(r"\s+", " ", normalised).strip()
     return _PINNED_ITEMS.get(normalised)
@@ -214,7 +217,7 @@ def lookup(food_item: str, grams: float | None, update_id: int | None = None, *,
         return None, []
 
     # Pinned item path: skip search + LLM selection, go straight to detail fetch → scale.
-    pinned_id = _pinned_fdc_id(food_item)
+    pinned_id = pinned_fdc_id(food_item)
     if pinned_id is not None:
         log_event(logger, logging.INFO, "usda_pinned_item_matched",
                   update_id=update_id, food_item=food_item, fdc_id=pinned_id)
@@ -323,10 +326,12 @@ def _select_candidate(
         protein = nutrients.get(1003)
         fat = nutrients.get(1004)
         carbs = nutrients.get(1005)
+        fibre = nutrients.get(1079)
         macro_str = ", ".join(
             f"{v:.0f}{unit}"
             for v, unit in [
-                (kcal, "kcal"), (protein, "g prot"), (fat, "g fat"), (carbs, "g carb")
+                (kcal, "kcal"), (protein, "g prot"), (fat, "g fat"), (carbs, "g carb"),
+                (fibre, "g fibre"),
             ]
             if v is not None
         )

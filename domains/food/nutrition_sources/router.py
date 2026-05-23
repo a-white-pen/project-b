@@ -174,7 +174,14 @@ def enrich_item(item: dict, update_id: int | None = None) -> dict:
         return item
 
     # Try sources in chain order.
+    # Pinned USDA items bypass food-type source ordering — always try USDA first.
+    # A pinned item (e.g. "mixed nuts") may be classified as packaged_good (chain: OFF → USDA),
+    # but the known-good USDA fdcId should win. We reorder so USDA leads, then the rest follow.
     source_chain = _SOURCE_CHAINS.get(food_type, [])
+    if usda.pinned_fdc_id(food_item) is not None:
+        source_chain = [("usda", usda.lookup)] + [e for e in source_chain if e[0] != "usda"]
+        log_event(logger, logging.INFO, "structured_source_pinned_usda_first",
+                  update_id=update_id, food_item=food_item, food_type=food_type)
     tried_sources: list[str] = []
     for source_key, lookup_fn in source_chain:
         tried_sources.append(source_key)
