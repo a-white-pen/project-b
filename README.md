@@ -20,7 +20,7 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 | Weight | Logs weight from text or voice. Range validation. |
 | Sleep/wake | Logs sleep and wake events. Slash commands and voice phrases ("night night", "good morning"). |
 | Location | Stores location updates. Used to resolve timezone for all other domains. |
-| Attention | Starts and finishes attention sessions. Auto-closes previous open session on new start. Quoted-reply corrections supported. |
+| Attention | Starts and finishes attention sessions on a 2-level taxonomy (8 main × 24 subcategories — see `domains/attention/TAXONOMY.md`). Auto-closes previous open session on new start. Compound "finish X and start Y" messages produce two reply bubbles. Per-end-block footer shows the day's total per main category in local timezone. Co-categorisation (e.g. tennis = exercise + social) stored in notes and surfaced in the bubble. Quoted-reply corrections scoped per session. "Wake up" mid-nap closes the nap instead of writing a sleep event. |
 | Exercise | Strava webhook: receives activity events, saves cardio runs/rides/swims/walks to `exercise` schema, sends proactive Telegram notifications. Handles create, update, and delete. Strength sessions (WeightTraining/Workout/Crossfit) trigger a Garmin Connect fetch; exercise sets + HR are parsed and saved to `exercise.strength_sessions` / `exercise.strength_sets` with a per-exercise set notification. |
 
 **In progress:** nutrition data quality (USDA + Open Food Facts integration), expense logging.

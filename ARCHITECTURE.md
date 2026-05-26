@@ -118,6 +118,29 @@ GET /api/data-visualisation/nutrition
 
 ---
 
+## Cross-domain coordination
+
+Some events naturally cross domain boundaries — finishing an attention session when B says "night night", or auto-inferring a wake event when B's first attention message of the day arrives with no recent `/wake`. The pattern is:
+
+- **Each domain owns its own tables.** Sleep owns `b.sleep_wake_events`. Attention owns `b.attention_sessions`. No domain writes to another domain's tables directly.
+- **Public cross-domain APIs** (no underscore prefix) live in the table-owning domain's `service.py`. Currently:
+  - `domains/attention/service.py::close_open_sessions_externally(msg, ended_at, reason)` — closes any open attention session. Called by `domains/sleep/service.py::handle_sleep_log` so going to bed without manually finishing a session still produces a clean end record.
+  - `domains/sleep/service.py::ensure_recent_wake_logged(now_utc, msg, trigger)` — idempotently inserts an `auto_inferred=true` wake event when none exists in the last 24h. Called by `domains/attention/service.py::_handle_start` to emit a quote-correctable reminder bubble when B's first attention activity of the day arrives without a logged wake.
+- **The caller decides when to trigger; the callee owns the write.** Attention does not insert sleep events; sleep does not close attention sessions on its own.
+- **Top-level circular imports are avoided by direction:** `domains/sleep/` imports from `domains/attention/` at module top; `domains/attention/` imports from `domains/sleep/` inside the function body where needed.
+
+## Shared helpers in `system/`
+
+When two or more domains need the same piece of plumbing, it moves to `system/` rather than being copied or cross-imported. Current shared helpers used across domains:
+
+- `system/timezone.py::get_timezone(as_of)` — resolves B's timezone at an event timestamp from `b.location` (point-in-time), with `b.latest_location` and Asia/Singapore as fallbacks. Used by attention, sleep, and food.
+- `system/db.py::get_connection()` — single Postgres connection factory.
+- `system/llm.py::generate_text(...)` — single LLM call path.
+- `system/messages.py::InboundMessage` — normalized message dataclass passed to every domain handler.
+- `system/conversation_state.py` — quote-reply correction threading.
+
+---
+
 ## LLM usage
 
 All LLM calls go through `system/llm.py`. Model constants:

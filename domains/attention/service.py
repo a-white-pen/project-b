@@ -1,35 +1,59 @@
 """
 Attention logging domain — handles log_attention intent.
 
-Functions:
-  handle_attention_log(msg)       — parses an attention start/finish message and persists it
-  _extract_attention_event(...)   — asks the LLM to classify the attention lifecycle action
-  _handle_start(...)              — starts a session and auto-closes the previous open one
-  _handle_finish(...)             — closes the current open attention session
-  _handle_completed(...)          — inserts a completed past session from one message
-  _get_open_session(cur)          — fetches the current open attention session, if one exists
-  _insert_session(...)            — inserts a new b.attention_sessions row
-  _close_session(...)             — closes an open b.attention_sessions row
-  _get_overlapping_sessions(...)  — fetches sessions that overlap a proposed interval
-  _row_to_session(row)            — converts a DB row into a session dict
-  _format_log_reply(...)          — formats the attention acknowledgement sent back to B
-  _format_session_summary(...)    — formats one attention session for replies
-  _format_closed_time_lines(...)  — formats ended/duration rows for closed sessions
-  _format_duration(...)           — formats a duration in minutes/hours
-  _format_field(...)              — formats an escaped labelled field
-  _format_optional_value(...)     — formats nullable values as text, using none when empty
-  _format_open_session_for_llm(...) — formats the open session for extraction context
-  _clean_optional_text(value)     — normalizes nullable model text fields
-  _parse_optional_datetime(value) — parses optional ISO timestamp values from the LLM
-  _get_timezone(...)              — resolves B's timezone as of an event timestamp
-  _local_time_str(...)            — returns B's local time for LLM context
-  _parse_json(raw)                — parses JSON from an LLM response
+Public functions:
+  handle_attention_log(msg)              — parses an attention start/finish message and persists it
+  try_handle_wake_as_nap_end(msg)        — when B says "wake up" with an open rest session, close the nap instead of logging a wake event; returns None to fall through to sleep/wake
+  close_open_sessions_externally(...)    — cross-domain API: closes any open attention session on behalf of another domain (e.g. sleep handler when B says "night night" without finishing first). Returns end-block replies; empty list when nothing open
+  build_attention_state(...)             — constructs the conversation_state dict for one session reply; canonical state schema source so service.py and correction.py don't drift
+
+Internal handlers:
+  _extract_attention_event(...)          — asks the LLM to classify the attention lifecycle action
+  _handle_start(...)                     — starts a session and auto-closes the previous open one; also emits the auto-wake reminder bubble when no recent wake exists
+  _handle_finish(...)                    — closes the current open attention session
+  _handle_completed(...)                 — inserts a completed past session from one message
+
+DB access:
+  _get_open_session(cur)                 — fetches the most recent open attention session, if one exists
+  _get_all_open_sessions(cur)            — fetches ALL open sessions DESC by started_at; used by start/finish for sweep-close semantics
+  _lock_attention_writes(cur)            — acquires a transaction-scoped advisory lock that serializes all attention writes
+  _insert_session(...)                   — inserts a new b.attention_sessions row
+  _close_session(...)                    — closes an open b.attention_sessions row
+  _get_overlapping_sessions(...)         — fetches sessions that overlap a proposed interval
+  _row_to_session(row)                   — converts a DB row into a session dict
+  _get_daily_total_minutes(...)          — sums minutes for a main category over a UTC day-window; powers the "today · 1h 12m work" footer
+  _get_wake_day_window_utc(...)          — computes [day_start, day_end) for the daily total, anchored to B's most recent morning wake (local-4am fallback)
+  _get_most_recent_morning_wake_utc(...) — looks up the most recent wake-after-sleep in the last 24h
+
+Rendering / formatting:
+  _format_session_block(...)             — single-blockquote formatter for "activity <verb>" replies. Header + one combined blockquote (category, project, also lines, description, time(s)) + italic day-total footer (closed only) + blank line + expandable Categories menu (suppressed for "removed"). Shared with correction.py for "activity updated" / "activity removed"
+  _format_change_category_menu()         — renders the <blockquote expandable> labelled "Categories:" listing every (main, [subs]) taxonomy row. Attached to every reply except "removed"
+  _build_session_reply(...)              — builds the (reply, state) tuple for one session block; state scopes the correction to that single session
+  _format_category_label(...)            — "🟦 <b>work : deep_work</b>" — emoji-by-main-category + bold "main : sub" label (space-colon-space)
+  _parse_co_categories(notes)            — extracts "+ main : sub" (or legacy "+ main / sub") markers from notes
+  _strip_co_category_marker(...)         — removes a "+ main : sub" marker from notes; used by correction.py for co-category removal/editing
+  _format_time_12h(dt_local)             — formats a tz-aware datetime as 12-hour "9:54 AM"
+  _format_date_footer(...)               — "today" / "yesterday" / weekday / "24 May" for the end-reply footer
+  _duration_minutes(...)                 — interval → whole minutes
+  _format_duration_short(...)            — minutes → "1h 35m" / "45m" / "2h"
+
+Helpers / utilities:
+  _is_valid_pair / _resolve_pair         — taxonomy pair validators mirroring the DB CHECK
+  _format_open_session_for_llm(...)      — formats the open session for extraction context
+  _clean_optional_text(value)            — normalizes nullable model text fields
+  _parse_optional_datetime(value)        — parses optional ISO timestamp values from the LLM
+  _local_time_str(...)                   — returns B's local time for LLM context
+  _parse_json(raw)                       — parses JSON from an LLM response
+
+Imported (not defined here):
+  get_timezone(as_of)                    — from system.timezone; resolves B's timezone as of an event timestamp
+  ensure_recent_wake_logged(...)         — from domains.sleep.service; called inside _handle_start (local import to avoid top-level circular)
 """
 
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -39,30 +63,76 @@ from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage
+from system.timezone import get_timezone
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_TZ = ZoneInfo("Asia/Singapore")
+# v3 taxonomy: 8 main categories × 24 subcategories, strict pair validation.
+# Mirrors the DB CHECK constraint attention_sessions_taxonomy_check and the table in
+# domains/attention/TAXONOMY.md. When changing, edit the .md first, then propose the
+# matching ALTER TABLE, wait for B to apply, then update this dict + the prompts.
+_TAXONOMY: dict[str, list[str]] = {
+    "work":      ["deep_work", "shallow_work", "meetings", "learning", "planning"],
+    "social":    ["social_in_person", "social_messaging", "social_broadcast"],
+    "self_care": ["exercise", "personal_care", "meditation"],
+    "eat":       ["food_prep", "food_collection", "eating"],
+    "downtime":  ["rest", "entertainment"],
+    "admin":     ["shopping_online", "shopping_in_store", "errands", "life_admin", "health_admin"],
+    "transit":   ["commute", "travel"],
+    "other":     ["other"],
+}
 
-_VALID_CATEGORIES = {
-    "deep_work",
-    "shallow_work",
-    "planning",
-    "learning",
-    "exercise",
-    "cooking",
-    "eating",
-    "commute",
-    "life_admin",
-    "personal_care",
-    "social",
-    "entertainment",
-    "rest",
-    "meditation",
-    "other",
+# Flattened set of valid (main, sub) tuples — 24 pairs in v3. Used by _is_valid_pair
+# / _resolve_pair in this file, and by correction.py's pair check on the same import.
+_VALID_PAIRS: set[tuple[str, str]] = {
+    (main, sub) for main, subs in _TAXONOMY.items() for sub in subs
 }
 
 _VALID_ACTIONS = {"start_session", "finish_session", "log_completed"}
+
+# Colored square per main category, matching B's hand-tuned legend within Telegram's
+# 7-square palette (plus ⬛/⬜). The emoji is now keyed by MAIN category since
+# subcategories share a colour with their main.
+_CATEGORY_EMOJI: dict[str, str] = {
+    "work":      "🟦",
+    "social":    "🟪",
+    "self_care": "🟩",
+    "eat":       "🟧",
+    "downtime":  "🟨",
+    "admin":     "🟫",
+    "transit":   "⬜",
+    "other":     "⬛",
+}
+
+
+# Returns True when (category, subcategory) is a valid v3 taxonomy pair.
+# Mirrors the DB-level pair CHECK so app code can fail fast with a useful message
+# instead of letting Postgres reject the INSERT/UPDATE.
+def _is_valid_pair(category: str | None, subcategory: str | None) -> bool:
+    if category is None or subcategory is None:
+        return False
+    return (category, subcategory) in _VALID_PAIRS
+
+
+# Normalises an (extracted_category, extracted_subcategory) pair to a guaranteed-valid
+# (category, subcategory) tuple. Returns ('other', 'other') when the input is missing
+# or invalid — used by extraction handlers so a hallucinated/invalid pair from the LLM
+# does not break the DB CHECK or crash the request.
+def _resolve_pair(category: str | None, subcategory: str | None) -> tuple[str, str]:
+    if _is_valid_pair(category, subcategory):
+        return (category, subcategory)
+    return ("other", "other")
+
+
+# Matches a "co-category" marker line in the notes field. Format: "+ main_category : subcategory"
+# on its own line, e.g. "+ social : social". Multiple lines allowed. Used to surface
+# user-requested additional categorisations of a single activity (e.g. tennis = exercise + social)
+# in the Telegram bubble body. See _parse_co_categories.
+#
+# The separator accepts BOTH ":" (current write format, matches display) and "/" (legacy
+# write format used in an earlier iteration of this session). Existing rows with the slash
+# form are still recognised and rendered correctly.
+_CO_CATEGORY_RE = re.compile(r"^\+\s*([a-z_]+)\s*[:/]\s*([a-z_]+)\s*$", re.MULTILINE)
 
 _EXTRACT_PROMPT = """\
 You are extracting an attention log event for B's personal attention tracker.
@@ -81,7 +151,8 @@ Message from B: {text}
 Return a JSON object with this exact structure:
 {{
   "action": "<start_session, finish_session, or log_completed>",
-  "category": "<one of: deep_work, shallow_work, planning, learning, exercise, cooking, eating, commute, life_admin, personal_care, social, entertainment, rest, meditation, other>",
+  "category": "<one main category — see taxonomy below>",
+  "subcategory": "<one subcategory under that main category — see taxonomy below>",
   "description": "<short plain description of the activity>",
   "project": "<project/context tag or null>",
   "notes": "<optional note or null>",
@@ -89,21 +160,54 @@ Return a JSON object with this exact structure:
   "ended_at": "<ISO 8601 timestamp with timezone, only for log_completed; otherwise null>"
 }}
 
+Taxonomy — pick exactly ONE main category AND ONE subcategory from the same row:
+- work / deep_work, shallow_work, meetings, learning, planning
+- social / social_in_person, social_messaging, social_broadcast
+- self_care / exercise, personal_care, meditation
+- eat / food_prep, food_collection, eating
+- downtime / rest, entertainment
+- admin / shopping_online, shopping_in_store, errands, life_admin, health_admin
+- transit / commute, travel
+- other / other
+
+Subcategory examples (use these to disambiguate):
+- deep_work: coding, writing, debugging, analysis, focused building (incl. with Codex)
+- shallow_work: email, Slack, low-focus admin within work, routine coordination
+- meetings: meeting, standup, catch-up call with manager/colleague, interview
+- learning: watching tutorial video, reading textbook, DataCamp lesson, course
+- planning: planning gym session, planning day, plan travel, plan trip
+- social_in_person: lunch/dinner with friends, run with friends, racket sports with friends, AI meetup, hanging out with real people physically
+- social_messaging: reply messages to friends, email friends, phone call with friends, video call / FaceTime / Zoom with friends, catch-up call. ANY call counts as messaging — synchronous communication through a device, not in person.
+- social_broadcast: update IG story, update Strava, post to friends story, public-facing post on personal accounts
+- exercise: gym, run, weight training, any workout
+- personal_care: shower ("pong pong"), brush teeth, wash face, grooming, massage, physio, poop, pee
+- meditation: meditate, breathing exercise
+- food_prep: prep breakfast/dinner, heat up food, wash dishes, make protein shake, wash fruit. Anything where B is preparing food at home or cleaning up after.
+- food_collection: collect lunch from downstairs, order food on Grab/Lineman/Robinhood, picking up a Grab order. The acquisition step, not the preparation.
+- eating: eat breakfast/lunch/dinner ("mum mum"), post-workout snack, drinking protein shake
+- rest: nap, taking a break, resting, coffee break (unless logging the drink as nutrition)
+- entertainment: watching tv, scrolling Instagram/TikTok
+- shopping_online: Shopee/Lazada order, researching products online, comparing items online, searching for flights
+- shopping_in_store: shopping at Tops, in-store grocery, 7-11 run (when buying things), walk-in browsing
+- errands: laundry, throw rubbish, change toilet light bulb, collect parcel (NOT shopping — a 7-11 run for purchases is shopping_in_store)
+- life_admin: update finances, renew passport, track delivery
+- health_admin: doctor visit, dentist, therapy session, pharmacy
+- commute: MRT, Grab/taxi to nearby, bus, car to office
+- travel: flight, overnight train, long drive between cities
+- other: anything that genuinely doesn't fit
+
 Rules:
+- Pick the PRIMARY category. Co-activities (e.g., "tennis with friends" = both exercise and social) are NOT extracted here — only the primary one. B will explicitly say "also add X" via a correction if a secondary applies.
 - Use log_completed when B says they finished/done/completed an activity and also gives a past start time in the same message, e.g. "Finish pooping, I started at around 7am". Set started_at to that past local time and ended_at to the message/current time.
-- Use finish_session for messages like "finish lunch", "finish mum mum", "done with Project B", "just finished and pushed to git", "stop watching", "finish poop", "finish pong pong".
-- Use start_session for messages like "working on Project B", "prep breakfast", "eat lunch", "go mum mum", "watching Succession", "scrolling TikTok", "learning about RAG", "go poop", "go pong pong".
-- Actual night sleep is not an attention session. If B says she is sleeping, still choose the closest action only if the router already sent it here, but use category "rest" and description "sleep mention routed to attention".
-- Naps are allowed as category "rest".
-- Coding, writing, analysis, debugging, and building with Codex are deep_work.
-- Meetings, email, admin, Slack, and routine coordination are shallow_work.
-- Cooking, meal prep, cooking dinner, chopping/prepping ingredients, and making food are "cooking".
-- Eating, breakfast/lunch/dinner as an eating activity, and "mum mum" are "eating".
-- Coffee break is "rest" unless B is logging the specific drink as nutrition.
-- Ordering food is "life_admin".
-- "pong pong" means shower/bathe; use category "personal_care" and description "shower".
-- Washing dishes, laundry, tidying, cleaning, trash, and chores are "life_admin".
-- Showering, brushing teeth, cutting fingernails, grooming, and poop/pee breaks are "personal_care".
+- Use finish_session ONLY when the message is purely about ending the current activity with NO new activity mentioned, e.g. "finish lunch", "done with Project B", "stop watching", "finish poop".
+- Use start_session whenever the message mentions a NEW activity, even if it also mentions finishing the current one. The system auto-closes the prior open session at the new start time, so a compound "finish X and do Y" message should resolve to start_session for Y. Examples:
+  - "finish lunch and start coding" → start_session, category=work, subcategory=deep_work, description="coding"
+  - "done with project b, going to get thai massage now" → start_session, category=self_care, subcategory=personal_care, description="thai massage"
+  - "finish breakfast, go work on nutrition module" → start_session, category=work, subcategory=deep_work, description="work on nutrition module"
+- Pure-start messages also use start_session: "working on Project B", "prep breakfast", "eat lunch", "go mum mum", "watching Succession", "scrolling TikTok", "learning about RAG", "go poop", "go pong pong".
+- Actual night sleep is not an attention session. If B says she is sleeping, still choose the closest action only if the router already sent it here, but use category "downtime" subcategory "rest" and description "sleep mention routed to attention".
+- Naps are downtime / rest.
+- "pong pong" means shower/bathe; use self_care / personal_care with description "shower".
 - Keep description concise but specific. Preserve Chinese characters if B used them.
 - Do not invent a project. Use null when there is no clear project/context.
 - Return valid JSON only. No explanation, no markdown, no code blocks.\
@@ -112,11 +216,15 @@ Rules:
 
 # Handles an attention logging request from B.
 # Inputs: InboundMessage with text/caption describing an attention start or finish.
-# Outputs: (reply string, pending_state dict | None). pending_state is used for quoted correction.
-def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) tuples — one Telegram message per session block. A
+# pure start gives one entry; a "finish X and start Y" message gives two (end block
+# first, start block second); errors return a single (error_text, None) entry. Each
+# state.context.attention_session_ids holds ONLY the session ID for that block so
+# quoting any reply scopes the correction to that block.
+def handle_attention_log(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     text = msg.text or msg.caption
     if not text:
-        return ("What are we logging? Give me the thing your attention is on.", None)
+        return [("What are we logging? Give me the thing your attention is on.", None)]
 
     occurred_at = msg.timestamp if msg.timestamp is not None else datetime.now(timezone.utc)
 
@@ -130,7 +238,7 @@ def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
             conn.close()
     except Exception as e:
         log_failure(logger, logging.ERROR, "attention_open_session_fetch_failed", e, update_id=msg.update_id)
-        return ("Couldn't check the current attention session — try again.", None)
+        return [("Couldn't check the current attention session — try again.", None)]
     log_event(
         logger,
         logging.INFO,
@@ -144,18 +252,28 @@ def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
         extracted = _extract_attention_event(text, occurred_at, open_session)
     except Exception as e:
         log_failure(logger, logging.ERROR, "attention_extract_failed", e, update_id=msg.update_id)
-        return ("Couldn't parse that attention update — rephrase it for me?", None)
+        return [("Couldn't parse that attention update — rephrase it for me?", None)]
 
     action = extracted.get("action")
     if action not in _VALID_ACTIONS:
         log_event(logger, logging.WARNING, "attention_invalid_action", update_id=msg.update_id, action=action)
-        return ("I couldn't tell if that starts or finishes something. Say it a bit more bluntly.", None)
+        return [("I couldn't tell if that starts or finishes something. Say it a bit more bluntly.", None)]
 
-    category = extracted.get("category")
-    if category not in _VALID_CATEGORIES:
-        log_event(logger, logging.WARNING, "attention_invalid_category", update_id=msg.update_id, category=category)
-        extracted = {**extracted, "category": "other"}
-        category = "other"
+    # Resolve (category, subcategory) to a guaranteed-valid pair; LLM hallucinations
+    # fall back to (other, other) with a warning rather than failing the DB CHECK.
+    raw_category = extracted.get("category")
+    raw_subcategory = extracted.get("subcategory")
+    category, subcategory = _resolve_pair(raw_category, raw_subcategory)
+    if (category, subcategory) != (raw_category, raw_subcategory):
+        log_event(
+            logger,
+            logging.WARNING,
+            "attention_invalid_taxonomy_pair",
+            update_id=msg.update_id,
+            raw_category=raw_category,
+            raw_subcategory=raw_subcategory,
+        )
+    extracted = {**extracted, "category": category, "subcategory": subcategory}
 
     log_event(
         logger,
@@ -164,6 +282,7 @@ def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
         update_id=msg.update_id,
         action=action,
         category=category,
+        subcategory=subcategory,
         has_project=bool(extracted.get("project")),
         open_session_id=open_session["attention_session_id"] if open_session else None,
     )
@@ -173,6 +292,112 @@ def handle_attention_log(msg: InboundMessage) -> tuple[str, dict | None]:
     if action == "log_completed":
         return _handle_completed(msg, occurred_at, extracted)
     return _handle_start(msg, occurred_at, extracted)
+
+
+# Closes an open category=rest attention session when B says "wake up" mid-nap.
+# Inputs: InboundMessage arriving at the LOG_WAKE dispatch path in telegram/router.py.
+# Outputs: list of (reply, state) tuples when a rest session was just closed (single
+# end block); None when no rest session is open so the caller falls through to normal
+# sleep/wake logging in domains/sleep/.
+#
+# This exists because "B wake up" said during an open nap should end the nap, not write
+# a sleep_wake_events row. The router calls this before handle_wake_log; if it returns
+# a list, that's the reply set, otherwise normal wake routing proceeds.
+#
+# The check + close run in a SINGLE locked transaction. An earlier version did an
+# unlocked peek, then delegated to _handle_finish which closed whatever was open after
+# acquiring its own lock — that allowed a racing message to swap the open session in
+# between, ending a non-rest activity by mistake and suppressing the real wake log.
+def try_handle_wake_as_nap_end(msg: InboundMessage) -> list[tuple[str, dict | None]] | None:
+    ended_at = msg.timestamp if msg.timestamp is not None else datetime.now(timezone.utc)
+    # Three possible return modes:
+    #   None              — no open rest session, OR a pre-nap-check infra failure
+    #                       (couldn't connect at all). Router falls through to
+    #                       handle_wake_log as it always did.
+    #   [(error, None)]   — a rest session WAS observed but we couldn't close it
+    #                       (bad timing, DB error mid-transaction, etc.). Router
+    #                       MUST NOT fall through to handle_wake_log — that would
+    #                       write a spurious wake event while the nap stays open.
+    #   [(reply, state)]  — nap closed successfully.
+    nap_was_present = False
+    closed_session: dict | None = None
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # Acquire the attention write lock BEFORE reading the open session
+                    # so the check and the close see a consistent view.
+                    _lock_attention_writes(cur)
+                    open_session = _get_open_session(cur, for_update=True)
+                    # Naps live at (category=downtime, subcategory=rest).
+                    # NOTE: only the MOST RECENT open session is inspected. If a stale
+                    # older rest session sits behind a newer non-rest open, falling
+                    # through to handle_wake_log is correct — "wake up" semantically
+                    # targets the current activity, not a forgotten earlier nap. The
+                    # partial unique index makes multi-open the abnormal case anyway.
+                    if open_session is None or open_session.get("subcategory") != "rest":
+                        return None
+                    # Past this point: nap exists, we are committed to closing it.
+                    nap_was_present = True
+                    if open_session["started_at"] >= ended_at:
+                        # Wake message timestamp lands before the nap started — should
+                        # be impossible from a real Telegram update. We can't close
+                        # (would produce a negative-duration session) but we also can't
+                        # let a wake event write with the nap still open.
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "attention_wake_nap_end_skipped_bad_timing",
+                            update_id=msg.update_id,
+                            open_session_id=open_session["attention_session_id"],
+                        )
+                        return [(
+                            "Found an open nap but the timing is off — its start time "
+                            "is after your wake message. Quote the nap and fix its start, "
+                            "then try again.",
+                            None,
+                        )]
+                    closed_session = _close_session(
+                        cur=cur,
+                        session=open_session,
+                        ended_at=ended_at,
+                        end_meta={
+                            "source": "telegram",
+                            "self_reported": True,
+                            "reason": "wake_ended_nap",
+                            "telegram_update_id": msg.update_id,
+                        },
+                    )
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "attention_nap_end_save_failed", e, update_id=msg.update_id)
+        if nap_was_present:
+            # Confirmed nap, then mid-transaction failure. Hold back the wake event.
+            return [(
+                "Found an open nap but couldn't close it. Try saying 'wake up' again. "
+                "Not logging a wake event because the nap is still open.",
+                None,
+            )]
+        # Pre-nap-check infra failure (e.g. can't open connection): we never confirmed
+        # a nap, so the safe behavior is to fall through to normal wake routing — same
+        # as the prior code, which the router and existing wake test rely on.
+        return None
+
+    if closed_session is None:
+        # Defensive: should be unreachable. All paths above either return early or
+        # populate closed_session. Fall through to avoid leaving the user with no reply.
+        return None
+
+    log_event(
+        logger,
+        logging.INFO,
+        "attention_wake_redirected_to_nap_end",
+        update_id=msg.update_id,
+        closed_session_id=closed_session["attention_session_id"],
+    )
+    return [_build_session_reply("end", closed_session, now_utc=ended_at)]
 
 
 # Extracts action/category/description/project from B's message using the LLM.
@@ -192,13 +417,17 @@ def _extract_attention_event(text: str, occurred_at: datetime, open_session: dic
 
 # Starts a new attention session, auto-closing the current open session when needed.
 # Inputs: inbound message, start timestamp, and parsed LLM extraction.
-# Outputs: (reply string, pending_state dict | None).
-def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) tuples — one per session block. When a session was
+# auto-closed, the first entry is its end block; the final entry is always the new
+# session's start block. Each reply carries state pointing only to its own session ID
+# so quoting any block scopes the correction to just that session.
+def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) -> list[tuple[str, dict | None]]:
     description = (extracted.get("description") or "").strip()
     if not description:
-        return ("I caught the intent, not the activity. What are you doing?", None)
+        return [("I caught the intent, not the activity. What are you doing?", None)]
 
-    category = extracted.get("category") if extracted.get("category") in _VALID_CATEGORIES else "other"
+    # extracted's category/subcategory are already validated in handle_attention_log.
+    category, subcategory = _resolve_pair(extracted.get("category"), extracted.get("subcategory"))
     project = _clean_optional_text(extracted.get("project"))
     notes = _clean_optional_text(extracted.get("notes"))
     start_meta = {
@@ -218,6 +447,9 @@ def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) ->
         try:
             with conn:
                 with conn.cursor() as cur:
+                    # Serialize all attention writes — concurrent handlers queue here
+                    # rather than racing to violate the one-open-session invariant.
+                    _lock_attention_writes(cur)
                     # Close ALL open sessions, not just one. Under normal operation there
                     # is at most one, but a race or manual edit could leave extras; closing
                     # all of them restores the invariant in the same transaction.
@@ -232,13 +464,26 @@ def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) ->
                         )
                     # Guard before the loop, not inside it. Sessions are ordered DESC so
                     # open_sessions[0] is the most recently started one. If it started before
-                    # our new session, all others did too — the check covers all rows.
+                    # our new session, all others did too — the check covers all rows under
+                    # the DESC ordering invariant. The explicit filter is defense-in-depth
+                    # against non-DESC ordering (data corruption, schema drift, etc.) and
+                    # mirrors the safe-skip pattern used in close_open_sessions_externally.
                     # Checking inside the loop would risk committing partial closes if a
                     # mid-loop row triggered the guard (return inside `with conn:` commits).
-                    if open_sessions and open_sessions[0]["started_at"] >= started_at:
-                        return ("Timing got weird — an open session starts after this update. I didn't save a duplicate.", None)
+                    skipped = [s for s in open_sessions if s["started_at"] >= started_at]
+                    closeable = [s for s in open_sessions if s["started_at"] < started_at]
+                    if skipped:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "attention_start_blocked_by_future_open_session",
+                            update_id=msg.update_id,
+                            new_started_at=started_at.isoformat(),
+                            blocking_session_ids=[s["attention_session_id"] for s in skipped],
+                        )
+                        return [("Timing got weird — an open session starts after this update. I didn't save a duplicate.", None)]
                     closed_sessions = []
-                    for open_session in open_sessions:
+                    for open_session in closeable:
                         closed_sessions.append(
                             _close_session(
                                 cur=cur,
@@ -255,6 +500,7 @@ def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) ->
                     new_session = _insert_session(
                         cur=cur,
                         category=category,
+                        subcategory=subcategory,
                         description=description,
                         project=project,
                         started_at=started_at,
@@ -265,10 +511,8 @@ def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) ->
             conn.close()
     except Exception as e:
         log_failure(logger, logging.ERROR, "attention_start_save_failed", e, update_id=msg.update_id)
-        return ("Couldn't save that attention session — try again.", None)
+        return [("Couldn't save that attention session — try again.", None)]
 
-    # Use the most-recently-started closed session for the reply (what B was doing before).
-    closed_session = closed_sessions[0] if closed_sessions else None
     log_event(
         logger,
         logging.INFO,
@@ -278,29 +522,145 @@ def _handle_start(msg: InboundMessage, started_at: datetime, extracted: dict) ->
         auto_closed_session_ids=[s["attention_session_id"] for s in closed_sessions],
         category=category,
     )
-    reply = _format_log_reply(closed_session=closed_session, opened_session=new_session)
-    session_ids = [new_session["attention_session_id"]]
-    for s in closed_sessions:
-        session_ids.append(s["attention_session_id"])
-    state = {
-        "domain": "attention",
-        "context": {"attention_session_ids": session_ids},
-    }
-    return (reply, state)
+    # One reply per session block. closed_sessions arrives DESC (most recent first); we
+    # reverse for chronological order so older auto-closed sessions appear above newer
+    # ones in the chat, with the new start last. Each reply carries state pointing only
+    # to its own session ID so quoting any block scopes the correction to that one.
+    # now_utc = started_at because the close timestamp IS this message's arrival time;
+    # the today/yesterday footer is anchored to when the user logged this update.
+    now_utc = started_at
+    results: list[tuple[str, dict | None]] = []
+    for closed in reversed(closed_sessions):
+        results.append(_build_session_reply("end", closed, now_utc))
+    results.append(_build_session_reply("start", new_session, now_utc))
+    # Auto-wake reminder: if no wake event in the last 24h, the sleep domain
+    # inserts one at now-5min and we append a second reply pointing at it so B
+    # can quote-correct the time. Runs only on start blocks ("only do something
+    # when awake") and dedups across same-day starts (existing wake in window
+    # → no insert). All sleep/wake row writes live in domains/sleep — attention
+    # only owns the decision to trigger.
+    from domains.sleep.service import ensure_recent_wake_logged
+    auto_wake = ensure_recent_wake_logged(
+        now_utc, msg, trigger="attention_start_with_no_recent_wake"
+    )
+    if auto_wake is not None:
+        wake_event_id, wake_at_utc = auto_wake
+        tz = get_timezone(wake_at_utc)
+        wake_at_local = wake_at_utc.astimezone(tz)
+        reminder_text = (
+            "⚠️ No wake event logged in the last 24h — I auto-logged your wake "
+            f"at <b>{escape(_format_time_12h(wake_at_local))}</b>.\n"
+            "Quote this to correct the time, or say <i>delete</i> to remove."
+        )
+        reminder_state = {
+            "domain": "sleep_wake",
+            "context": {
+                "sleep_wake_event_ids": [wake_event_id],
+                "event_type": "wake",
+                "auto_inferred": True,
+            },
+        }
+        results.append((reminder_text, reminder_state))
+    return results
 
 
-# Finishes the current open attention session.
-# Inputs: inbound message, finish timestamp, and parsed LLM extraction.
-# Outputs: (reply string, pending_state dict | None).
-def _handle_finish(msg: InboundMessage, ended_at: datetime, extracted: dict) -> tuple[str, dict | None]:
+# Closes any open attention session(s) on behalf of an external trigger (e.g. the
+# sleep handler when B logs "night night" without first finishing the current
+# session). Inputs: inbound message that caused the close, the timestamp to close
+# at, and a short reason string recorded in end_meta. Outputs: a list of end-block
+# (reply, state) tuples — empty when no open sessions existed. Never raises;
+# DB failures log + return [] so the caller can still send its own reply.
+#
+# Behaviour parallels _handle_finish but:
+#   - No "no open session" error reply — silently returns [] (this is opportunistic)
+#   - No started_at >= ended_at guard — sleep arrival timestamp is treated as truth
+#   - end_meta marks source=system and includes the supplied reason
+def close_open_sessions_externally(
+    msg: InboundMessage,
+    ended_at: datetime,
+    reason: str,
+) -> list[tuple[str, dict | None]]:
     try:
         conn = get_connection()
         try:
             with conn:
                 with conn.cursor() as cur:
+                    _lock_attention_writes(cur)
                     open_sessions = _get_all_open_sessions(cur, for_update=True)
                     if not open_sessions:
-                        return ("No open attention session to close. Tiny clerical void.", None)
+                        return []
+                    # Skip rows whose started_at would produce a negative duration —
+                    # leave them open rather than corrupt the timeline. Logged so the
+                    # condition is debuggable.
+                    closeable = [s for s in open_sessions if s["started_at"] < ended_at]
+                    skipped = [s for s in open_sessions if s["started_at"] >= ended_at]
+                    if skipped:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "attention_external_close_skipped_future_starts",
+                            update_id=msg.update_id,
+                            reason=reason,
+                            skipped_ids=[s["attention_session_id"] for s in skipped],
+                        )
+                    closed_sessions = [
+                        _close_session(
+                            cur=cur,
+                            session=open_session,
+                            ended_at=ended_at,
+                            end_meta={
+                                "source": "system",
+                                "self_reported": False,
+                                "reason": reason,
+                                "triggering_telegram_update_id": msg.update_id,
+                            },
+                        )
+                        for open_session in closeable
+                    ]
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "attention_external_close_failed",
+            e,
+            update_id=msg.update_id,
+            reason=reason,
+        )
+        return []
+
+    if not closed_sessions:
+        return []
+    log_event(
+        logger,
+        logging.INFO,
+        "attention_external_close_succeeded",
+        update_id=msg.update_id,
+        reason=reason,
+        closed_ids=[s["attention_session_id"] for s in closed_sessions],
+    )
+    # Reverse to chronological order (oldest end first) so output ordering matches
+    # _handle_start's auto-close path.
+    return [_build_session_reply("end", closed, ended_at) for closed in reversed(closed_sessions)]
+
+
+# Finishes the current open attention session.
+# Inputs: inbound message, finish timestamp, and parsed LLM extraction.
+# Outputs: list of (reply, state) tuples — single end block on success; single error
+# tuple on validation/save failure. List shape matches _handle_start so the caller
+# (handle_attention_log and try_handle_wake_as_nap_end) can return uniformly.
+def _handle_finish(msg: InboundMessage, ended_at: datetime, extracted: dict) -> list[tuple[str, dict | None]]:
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    # Serialize all attention writes — see _lock_attention_writes.
+                    _lock_attention_writes(cur)
+                    open_sessions = _get_all_open_sessions(cur, for_update=True)
+                    if not open_sessions:
+                        return [("No open attention session to close. Tiny clerical void.", None)]
                     if len(open_sessions) > 1:
                         log_event(
                             logger,
@@ -309,26 +669,53 @@ def _handle_finish(msg: InboundMessage, ended_at: datetime, extracted: dict) -> 
                             update_id=msg.update_id,
                             open_session_ids=[s["attention_session_id"] for s in open_sessions],
                         )
-                    # Close the most recently started open session (first in DESC order).
-                    open_session = open_sessions[0]
-                    if open_session["started_at"] >= ended_at:
-                        return ("That finish time lands before the session started. I left it alone.", None)
-                    closed_session = _close_session(
-                        cur=cur,
-                        session=open_session,
-                        ended_at=ended_at,
-                        end_meta={
-                            "source": "telegram",
-                            "self_reported": True,
-                            "reason": "explicit_finish",
-                            "telegram_update_id": msg.update_id,
-                        },
-                    )
+                    # Reject the operation if any open session has started_at >= ended_at.
+                    # Under DESC ordering, checking open_sessions[0] would catch all rows
+                    # since older sessions necessarily started earlier — but the explicit
+                    # filter is defense-in-depth against non-DESC ordering (data corruption,
+                    # schema drift) and mirrors the safe-skip pattern used in
+                    # close_open_sessions_externally. Protects against producing
+                    # negative-duration rows.
+                    skipped = [s for s in open_sessions if s["started_at"] >= ended_at]
+                    closeable = [s for s in open_sessions if s["started_at"] < ended_at]
+                    if skipped:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "attention_finish_blocked_by_future_open_session",
+                            update_id=msg.update_id,
+                            new_ended_at=ended_at.isoformat(),
+                            blocking_session_ids=[s["attention_session_id"] for s in skipped],
+                        )
+                        return [("That finish time lands before the session started. I left it alone.", None)]
+                    # Close ALL closeable open sessions, not just the most recent. The
+                    # partial unique index normally prevents multiple opens, but defensive
+                    # cleanup matches _handle_start: if stale opens exist (manual edit,
+                    # dropped index, etc.), this restores the invariant in the same
+                    # transaction. closed_sessions[0] is the newest one — that's the
+                    # one B's "finish" message is semantically about, and it drives the
+                    # reply. Older ones are auto-closed silently with a system-source
+                    # meta.end so they don't pollute the user-facing message.
+                    closed_sessions = [
+                        _close_session(
+                            cur=cur,
+                            session=open_session,
+                            ended_at=ended_at,
+                            end_meta={
+                                "source": "telegram" if i == 0 else "system",
+                                "self_reported": i == 0,
+                                "reason": "explicit_finish" if i == 0 else "stale_open_swept_on_finish",
+                                "telegram_update_id": msg.update_id,
+                            },
+                        )
+                        for i, open_session in enumerate(closeable)
+                    ]
+                    closed_session = closed_sessions[0]
         finally:
             conn.close()
     except Exception as e:
         log_failure(logger, logging.ERROR, "attention_finish_save_failed", e, update_id=msg.update_id)
-        return ("Couldn't close the attention session — try again.", None)
+        return [("Couldn't close the attention session — try again.", None)]
 
     log_event(
         logger,
@@ -337,35 +724,33 @@ def _handle_finish(msg: InboundMessage, ended_at: datetime, extracted: dict) -> 
         update_id=msg.update_id,
         session_id=closed_session["attention_session_id"],
         category=closed_session["category"],
+        also_swept_stale_open_ids=[s["attention_session_id"] for s in closed_sessions[1:]],
     )
-    reply = _format_log_reply(closed_session=closed_session, opened_session=None)
-    state = {
-        "domain": "attention",
-        "context": {"attention_session_ids": [closed_session["attention_session_id"]]},
-    }
-    return (reply, state)
+    return [_build_session_reply("end", closed_session, now_utc=ended_at)]
 
 
 # Inserts a completed attention session from one message.
 # Inputs: inbound message, fallback end timestamp, and parsed LLM extraction with started_at.
-# Outputs: (reply string, pending_state dict | None).
-def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) -> tuple[str, dict | None]:
+# Outputs: list of (reply, state) tuples — single end block on success; single error
+# tuple on validation/save failure. List shape matches _handle_start / _handle_finish.
+def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) -> list[tuple[str, dict | None]]:
     description = (extracted.get("description") or "").strip()
     if not description:
-        return ("I caught that it finished, not what finished. Annoying little blank.", None)
+        return [("I caught that it finished, not what finished. Annoying little blank.", None)]
 
     try:
         started_at = _parse_optional_datetime(extracted.get("started_at"))
         completed_at = _parse_optional_datetime(extracted.get("ended_at")) or ended_at
     except (ValueError, TypeError) as e:
         log_failure(logger, logging.WARNING, "attention_completed_timestamp_parse_failed", e, update_id=msg.update_id)
-        return ("Couldn't parse the timestamps — make sure you include when it started.", None)
+        return [("Couldn't parse the timestamps — make sure you include when it started.", None)]
     if started_at is None:
-        return ("I can log the finished thing if you include when it started.", None)
+        return [("I can log the finished thing if you include when it started.", None)]
     if started_at >= completed_at:
-        return ("That completed session would end before it starts. Time did a little backflip.", None)
+        return [("That completed session would end before it starts. Time did a little backflip.", None)]
 
-    category = extracted.get("category") if extracted.get("category") in _VALID_CATEGORIES else "other"
+    # extracted's category/subcategory are already validated in handle_attention_log.
+    category, subcategory = _resolve_pair(extracted.get("category"), extracted.get("subcategory"))
     project = _clean_optional_text(extracted.get("project"))
     notes = _clean_optional_text(extracted.get("notes"))
     meta = {
@@ -391,6 +776,8 @@ def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) 
         try:
             with conn:
                 with conn.cursor() as cur:
+                    # Serialize all attention writes — see _lock_attention_writes.
+                    _lock_attention_writes(cur)
                     overlapping_sessions = _get_overlapping_sessions(
                         cur=cur,
                         started_at=started_at,
@@ -409,14 +796,15 @@ def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) 
                             started_at=started_at.isoformat(),
                             ended_at=completed_at.isoformat(),
                         )
-                        return (
+                        return [(
                             "That overlaps an existing attention session. Fix the existing row first; "
                             "time bookkeeping is already spicy enough.",
                             None,
-                        )
+                        )]
                     completed_session = _insert_session(
                         cur=cur,
                         category=category,
+                        subcategory=subcategory,
                         description=description,
                         project=project,
                         started_at=started_at,
@@ -428,7 +816,7 @@ def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) 
             conn.close()
     except Exception as e:
         log_failure(logger, logging.ERROR, "attention_completed_save_failed", e, update_id=msg.update_id)
-        return ("Couldn't save that completed attention session — try again.", None)
+        return [("Couldn't save that completed attention session — try again.", None)]
 
     log_event(
         logger,
@@ -440,12 +828,10 @@ def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) 
         started_at=started_at.isoformat(),
         ended_at=completed_at.isoformat(),
     )
-    reply = _format_log_reply(closed_session=completed_session, opened_session=None)
-    state = {
-        "domain": "attention",
-        "context": {"attention_session_ids": [completed_session["attention_session_id"]]},
-    }
-    return (reply, state)
+    # now_utc = message arrival time (ended_at function arg), NOT the parsed completed_at
+    # which may be far in the past — the footer's today/yesterday is relative to when B
+    # is sending the log, not when the session itself ended.
+    return [_build_session_reply("end", completed_session, now_utc=ended_at)]
 
 
 # Fetches ALL open attention sessions (ended_at IS NULL).
@@ -458,12 +844,12 @@ def _handle_completed(msg: InboundMessage, ended_at: datetime, extracted: dict) 
 # session. The lock covers all returned rows so no concurrent writer can sneak a new
 # open session between our fetch and our inserts.
 #
-# Note: a DB partial unique index (CREATE UNIQUE INDEX ON b.attention_sessions ((true))
-# WHERE ended_at IS NULL) would enforce the invariant at the schema level, but adding
-# that index requires bringing the proxy up and running a migration — left as a follow-up.
+# The invariant is also enforced at the schema level by the partial unique index
+# `b.one_open_attention_session` (CREATE UNIQUE INDEX ON b.attention_sessions ((true))
+# WHERE ended_at IS NULL) — see _lock_attention_writes for the full defense-in-depth story.
 def _get_all_open_sessions(cur, for_update: bool = False) -> list[dict]:
     sql = """
-        SELECT attention_session_id, category, description, project,
+        SELECT attention_session_id, category, subcategory, description, project,
                started_at, ended_at, notes, meta
         FROM b.attention_sessions
         WHERE ended_at IS NULL
@@ -483,35 +869,64 @@ def _get_open_session(cur, for_update: bool = False) -> dict | None:
     return rows[0] if rows else None
 
 
-# Fetches attention sessions that overlap a proposed closed interval.
-# Inputs: DB cursor, proposed started_at/ended_at, and whether rows should be locked.
+# Acquires a transaction-scoped advisory lock that serializes all attention writes.
+# Inputs: an open DB cursor inside a transaction.
+# Outputs: none — the call blocks (couple of ms typical) until any other attention write
+# transaction commits, then returns with the lock held.
+#
+# Call as the FIRST statement inside every write transaction in this module and in
+# correction.py. The lock auto-releases on COMMIT or ROLLBACK; no manual release needed.
+# Together with the partial unique index `b.one_open_attention_session`, this guarantees
+# that at most one attention session is open at any time — concurrent handlers queue
+# at the lock rather than racing to violate the invariant.
+def _lock_attention_writes(cur) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext('b.attention_sessions'))")
+
+
+# Fetches attention sessions that overlap a proposed interval.
+# Inputs:
+#   started_at         — proposed interval start.
+#   ended_at           — proposed interval end, or None for an open-ended (reopen)
+#                        proposal which is treated as +infinity. Matters because a
+#                        reopened session at 9:00 with ended_at=None overlaps every
+#                        later session, not just sessions concurrent at 9:00.
+#   for_update         — apply FOR UPDATE row lock so concurrent writers wait.
+#   exclude_session_id — optional id to exclude (the row being edited itself).
 # Outputs: list of overlapping session dicts.
 def _get_overlapping_sessions(
     cur,
     started_at: datetime,
-    ended_at: datetime,
+    ended_at: datetime | None,
     for_update: bool = False,
+    exclude_session_id: int | None = None,
 ) -> list[dict]:
     sql = """
-        SELECT attention_session_id, category, description, project,
+        SELECT attention_session_id, category, subcategory, description, project,
                started_at, ended_at, notes, meta
         FROM b.attention_sessions
-        WHERE started_at < %s
+        WHERE started_at < COALESCE(%s, 'infinity'::timestamptz)
           AND COALESCE(ended_at, 'infinity'::timestamptz) > %s
-        ORDER BY started_at, attention_session_id
     """
+    params: list = [ended_at, started_at]
+    if exclude_session_id is not None:
+        sql += " AND attention_session_id != %s"
+        params.append(exclude_session_id)
+    sql += " ORDER BY started_at, attention_session_id"
     if for_update:
         sql += " FOR UPDATE"
-    cur.execute(sql, (ended_at, started_at))
+    cur.execute(sql, tuple(params))
     return [_row_to_session(row) for row in cur.fetchall()]
 
 
 # Inserts a new b.attention_sessions row.
-# Inputs: DB cursor plus normalized session fields.
+# Inputs: DB cursor plus normalized session fields. (category, subcategory) must form
+# a valid pair under _TAXONOMY — the DB CHECK constraint rejects bad pairs as a safety
+# net but callers should resolve via _resolve_pair() first.
 # Outputs: inserted session dict.
 def _insert_session(
     cur,
     category: str,
+    subcategory: str,
     description: str,
     project: str | None,
     started_at: datetime,
@@ -522,13 +937,14 @@ def _insert_session(
     cur.execute(
         """
         INSERT INTO b.attention_sessions
-            (category, description, project, started_at, ended_at, notes, meta)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING attention_session_id, category, description, project,
+            (category, subcategory, description, project, started_at, ended_at, notes, meta)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING attention_session_id, category, subcategory, description, project,
                   started_at, ended_at, notes, meta
         """,
         (
             category,
+            subcategory,
             description,
             project,
             started_at,
@@ -553,7 +969,7 @@ def _close_session(cur, session: dict, ended_at: datetime, end_meta: dict) -> di
             meta = %s,
             updated_at = now()
         WHERE attention_session_id = %s
-        RETURNING attention_session_id, category, description, project,
+        RETURNING attention_session_id, category, subcategory, description, project,
                   started_at, ended_at, notes, meta
         """,
         (
@@ -572,100 +988,375 @@ def _row_to_session(row) -> dict:
     return {
         "attention_session_id": row[0],
         "category": row[1],
-        "description": row[2],
-        "project": row[3],
-        "started_at": row[4],
-        "ended_at": row[5],
-        "notes": row[6],
-        "meta": row[7] or {},
+        "subcategory": row[2],
+        "description": row[3],
+        "project": row[4],
+        "started_at": row[5],
+        "ended_at": row[6],
+        "notes": row[7],
+        "meta": row[8] or {},
     }
 
 
-# Formats the attention acknowledgement reply.
-# Inputs: optional closed session and optional newly opened session.
-# Outputs: Telegram reply text.
-def _format_log_reply(closed_session: dict | None, opened_session: dict | None) -> str:
-    lines: list[str] = []
-    if closed_session is not None:
-        lines.append("<b>Attention end</b>")
-        lines.append("")
-        lines.extend(_format_session_summary(closed_session, include_end=True))
-    if opened_session is not None:
-        if lines:
-            lines.append("")
-        lines.append("<b>Attention start</b>")
-        lines.append("")
-        lines.extend(_format_session_summary(opened_session, include_end=False))
-    lines.append("")
-    lines.append("Quote to fix.")
-    return "\n".join(lines)
-
-
-# Formats one attention session for replies.
-# Inputs: session dict and whether to include start/end/duration.
-# Outputs: readable escaped field lines.
-def _format_session_summary(session: dict, include_end: bool) -> list[str]:
+# Formats one session block. Layout depends on whether the session is closed.
+# Inputs:
+#   verb     — appears in "activity <verb>" header. Values: "ended" (log finish or
+#              auto-close), "started" (log new open), "updated" (correction confirmation),
+#              "removed" (correction deletion confirmation).
+#   session  — attention session dict (must include category, subcategory).
+#   now_utc  — message arrival time in UTC; used for the today/yesterday footer label
+#              and as the anchor day for the daily-total query. Ignored when the
+#              session is open (no footer in that case).
+# Outputs: Telegram HTML reply text.
+#
+# Closed session layout (single combined blockquote, italic footer, then Categories menu):
+#   activity <verb>                          ← bold header on its own line
+#   ┃ 🟧 eat : eating                        ← category : subcategory
+#   ┃ project: Project B                     ← when present
+#   ┃ also: social : social_in_person        ← one line per co-cat marker in notes
+#   ┃ "description"                          ← description (italic + quotes)
+#   ┃ 9:40 AM → 9:54 AM · 14m                ← time range + duration on the SAME line
+#   <i>Today: 1h 12m in eat</i>              ← italic footer (no blockquote, closed only)
+#   ┃ <b>Categories:</b> ▾                   ← expandable menu (suppressed for "removed")
+#
+# Open session layout (same body order; no time range, no duration, no footer):
+#   activity <verb>
+#   ┃ 🟦 work : deep_work
+#   ┃ project: Project B                     ← when present
+#   ┃ also: social : social_in_person        ← when present
+#   ┃ "description"
+#   ┃ 12:43 PM
+#   ┃ <b>Categories:</b> ▾
+def _format_session_block(verb: str, session: dict, now_utc: datetime) -> str:
     started_at = session["started_at"]
     ended_at = session.get("ended_at")
-    tz = _get_timezone(ended_at or started_at)
-    lines = [
-        _format_field("Description", session["description"]),
-        _format_field("Category", session["category"].replace("_", " ")),
-        _format_field("Project", session.get("project")),
-        _format_field("Started", started_at.astimezone(tz).strftime("%H:%M")),
-    ]
-    if include_end:
-        lines.extend(_format_closed_time_lines(session, tz))
-    return lines
+    tz = get_timezone(ended_at or started_at)
+    started_local = started_at.astimezone(tz)
+    is_closed = ended_at is not None
+
+    category = session["category"]
+    subcategory = session.get("subcategory") or "other"
+    description = escape(session.get("description") or "(no description)")
+    project = session.get("project")
+    co_cats = _parse_co_categories(session.get("notes"))
+    menu = _format_change_category_menu() if verb != "removed" else ""
+
+    header = f"<b>activity {escape(verb)}</b>"
+
+    # Single combined blockquote body. Order:
+    #   category : subcategory
+    #   project: X            (when present)
+    #   also: X : Y           (one line per co-cat marker)
+    #   "description"         (italic + quotes)
+    #   start [→ end · duration]   (single time for open; range + duration on the
+    #                               SAME line for closed — no separate category-line dot)
+    lines = [_format_category_label(category, subcategory)]
+    if project:
+        lines.append(f"project: {escape(str(project))}")
+    for co_cat, co_sub in co_cats:
+        lines.append(f"also: {escape(co_cat)} : {escape(co_sub)}")
+    lines.append(f'<i>"{description}"</i>')
+    if is_closed:
+        ended_local = ended_at.astimezone(tz)
+        duration_str = _format_duration_short(_duration_minutes(started_at, ended_at))
+        lines.append(
+            f"{_format_time_12h(started_local)} → {_format_time_12h(ended_local)}"
+            f" · {escape(duration_str)}"
+        )
+    else:
+        lines.append(_format_time_12h(started_local))
+    body = "<blockquote>" + "\n".join(lines) + "</blockquote>"
+
+    # Open sessions have no italic footer — only closed blocks carry "Today: ... in <main>".
+    # When the Categories menu is present, prepend a blank line for breathing room
+    # (\n\n produces one empty line of visual separation in Telegram).
+    if not is_closed:
+        return f"{header}\n{body}\n\n{menu}" if menu else f"{header}\n{body}"
+
+    # Footer: "Today: 1h 12m in eat" — daily total for this main category, anchored to
+    # B's most recent "morning wake" (the wake event whose immediately preceding
+    # sleep/wake row is a sleep — nap-end wakes are excluded). When no qualifying wake
+    # is found in the last 24h, falls back to local 4am cutoff so the footer still
+    # shows something sensible.
+    now_local = now_utc.astimezone(tz)
+    ended_local = ended_at.astimezone(tz)
+    date_label = _format_date_footer(ended_local, now_local)
+    main_text = escape(category.replace("_", " "))
+    day_start_utc, day_end_utc = _get_wake_day_window_utc(ended_at, tz)
+    daily_minutes = _get_daily_total_minutes(
+        category=category,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
+    )
+    daily_str = _format_duration_short(daily_minutes)
+    footer = f"<i>{escape(date_label)}: {escape(daily_str)} in {main_text}</i>"
+
+    parts = [header, body, footer]
+    if menu:
+        # Empty string in the parts list becomes a blank line via "\n".join — gives the
+        # Categories blockquote visual breathing room from the footer above.
+        parts.append("")
+        parts.append(menu)
+    return "\n".join(parts)
 
 
-# Formats ended/duration rows for a closed attention session.
-# Inputs: session dict and timezone for local display.
-# Outputs: list of escaped field lines.
-def _format_closed_time_lines(session: dict, tz: ZoneInfo) -> list[str]:
-    started_at = session["started_at"]
-    ended_at = session.get("ended_at")
-    if ended_at is None:
-        return [
-            _format_field("Ended", None),
-            _format_field("Duration", None),
-        ]
-    return [
-        _format_field("Ended", ended_at.astimezone(tz).strftime("%H:%M")),
-        _format_field("Duration", _format_duration(started_at, ended_at)),
-    ]
+# Renders the "change category" expandable blockquote attached to the bottom of every
+# started/ended/updated reply. Uses Telegram's <blockquote expandable> attribute so
+# the menu collapses to a short preview with a "▾" caret; tapping expands the full
+# 8-main-categories listing. No callbacks involved — the menu is purely a reference;
+# B changes a category by quoting the reply and saying the new sub (e.g. "shallow_work"),
+# which routes through the existing correction flow.
+#
+# Returns the HTML fragment to append to the reply. Does NOT include a leading newline
+# — caller is responsible for the separator.
+def _format_change_category_menu() -> str:
+    # Leading blank line inside the blockquote gives "Categories:" breathing room
+    # above so the first colored emoji square doesn't visually crowd the heading.
+    # NB: Telegram strips a pure-empty leading line inside <blockquote>, so we use
+    # a non-breaking space (U+00A0) to force a visible empty line.
+    lines = [" ", "<b>Categories:</b>", ""]
+    for main, subs in _TAXONOMY.items():
+        emoji = _CATEGORY_EMOJI.get(main, "⬜")
+        main_label = escape(main.replace("_", " "))
+        sub_list = escape(" ".join(subs))
+        lines.append(f"{emoji} <b>{main_label}</b>")
+        lines.append(f"<code>{sub_list}</code>")
+    return "<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
 
 
-# Formats elapsed time as minutes or hours/minutes.
+# Builds the conversation_state dict for one attention session reply.
+# Inputs: the session id this reply is about, and (optionally) the parent telegram reply
+# message id when this reply is itself the result of a quoted correction.
+# Outputs: state dict with the canonical attention shape. Single source of truth for the
+# state schema so service.py and correction.py don't drift.
+def build_attention_state(session_id: int, parent_telegram_reply_message_id: int | None = None) -> dict:
+    state: dict = {
+        "domain": "attention",
+        "context": {"attention_session_ids": [session_id]},
+    }
+    if parent_telegram_reply_message_id is not None:
+        state["parent_telegram_reply_message_id"] = parent_telegram_reply_message_id
+    return state
+
+
+# Builds the per-session (reply, state) tuple used by every attention write handler.
+# Inputs: kind ("end" or "start"), the session dict, and message arrival time in UTC.
+# Outputs: (reply_text, state) where state.context.attention_session_ids holds ONLY this
+# session's ID so quoting the reply routes the correction to just this session.
+def _build_session_reply(kind: str, session: dict, now_utc: datetime) -> tuple[str, dict]:
+    verb = {"end": "ended", "start": "started"}.get(kind)
+    if verb is None:
+        raise ValueError(f"unknown reply kind: {kind}")
+    reply = _format_session_block(verb, session, now_utc)
+    return (reply, build_attention_state(session["attention_session_id"]))
+
+
+# Formats a (main category, subcategory) pair as "🟦 <b>work : deep_work</b>" — emoji
+# prefix keyed by main category, plus the bolded "main : sub" label with space-colon-space
+# separator. Underscores in the main category are converted to spaces for display (e.g.
+# self_care → "self care"); subcategory is shown verbatim with underscores preserved
+# (matches the mockup pills).
+def _format_category_label(category: str, subcategory: str) -> str:
+    emoji = _CATEGORY_EMOJI.get(category, "⬜")
+    main_label = escape(category.replace("_", " "))
+    sub_label = escape(subcategory)
+    return f"{emoji} <b>{main_label} : {sub_label}</b>"
+
+
+# Extracts co-category markers from a notes field. A co-category marker is a line of
+# the form "+ main_category : subcategory" (e.g. "+ social : social_in_person").
+# Legacy "/" separator is still accepted by the regex for backward compat with rows
+# written before the v3 separator change. Multiple lines allowed. Only valid taxonomy
+# pairs are returned — bogus markers are silently dropped.
+# Inputs: notes text (or None for no notes).
+# Outputs: list of (category, subcategory) tuples, in source-order.
+def _parse_co_categories(notes: str | None) -> list[tuple[str, str]]:
+    if not notes:
+        return []
+    out: list[tuple[str, str]] = []
+    for match in _CO_CATEGORY_RE.finditer(notes):
+        pair = (match.group(1), match.group(2))
+        if pair in _VALID_PAIRS:
+            out.append(pair)
+    return out
+
+
+# Removes a "+ category / subcategory" marker line from notes. Used by the correction
+# handler when B asks to remove a co-categorisation. Idempotent — calling on notes that
+# don't contain the marker returns the input unchanged. Returns None when removal leaves
+# notes empty/whitespace so the DB column flips back to NULL (cleaner than empty string).
+# Matches on the structured marker only — free-form note lines that happen to start with
+# "+ " are not stripped unless they match _CO_CATEGORY_RE shape exactly.
+def _strip_co_category_marker(notes: str | None, category: str, subcategory: str) -> str | None:
+    if not notes:
+        return None
+    kept: list[str] = []
+    for line in notes.split("\n"):
+        match = _CO_CATEGORY_RE.match(line)
+        if match and match.group(1) == category and match.group(2) == subcategory:
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    return cleaned if cleaned else None
+
+
+# Sums durations (in whole minutes) of CLOSED b.attention_sessions rows that share the
+# given main category and whose ended_at falls within the UTC half-open range
+# [day_start_utc, day_end_utc). Used to render "today · 1h 12m work" in the footer of
+# end blocks. Opens its own connection (same pattern as get_timezone). Returns 0 on
+# any DB failure — degraded fallback so the reply still sends even if the count is missing.
+#
+# Midnight-spanning semantics: each session is attributed in full to its ended_at day;
+# durations are NEVER split across day boundaries. A 3-hour deep-work block that started
+# at 11pm and ended at 2am counts entirely in the "ended_at" day's total. This matches
+# the wake-day anchoring used by the caller — totals attach to the day in which work
+# concluded, not the day it began.
+def _get_daily_total_minutes(category: str, day_start_utc: datetime, day_end_utc: datetime) -> int:
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (ended_at - started_at)) / 60.0), 0)::int
+                        FROM b.attention_sessions
+                        WHERE category = %s
+                          AND ended_at IS NOT NULL
+                          AND ended_at >= %s
+                          AND ended_at < %s
+                        """,
+                        (category, day_start_utc, day_end_utc),
+                    )
+                    row = cur.fetchone()
+                    return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.WARNING,
+            "attention_daily_total_failed",
+            e,
+            category=category,
+            day_start_utc=day_start_utc.isoformat(),
+        )
+        return 0
+
+
+# Returns (day_start_utc, day_end_utc) for the "wake-day" total window anchored to
+# B's most recent morning-wake at or before `anchor_utc`. A morning wake is a wake
+# row whose immediately-preceding sleep_wake_events row is a sleep (filters nap-end
+# wakes). Window is [wake, wake + 24h). Fallback when no qualifying wake in the
+# last 24h: local 4am cutoff (today's 4am if anchor is after 4am, else yesterday's).
+# Read-only — never inserts. Auto-insert lives in _ensure_morning_wake_logged.
+def _get_wake_day_window_utc(anchor_utc: datetime, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    wake_utc = _get_most_recent_morning_wake_utc(anchor_utc)
+    if wake_utc is None:
+        anchor_local = anchor_utc.astimezone(tz)
+        four_am_today = anchor_local.replace(hour=4, minute=0, second=0, microsecond=0)
+        if anchor_local < four_am_today:
+            four_am_today -= timedelta(days=1)
+        day_start_utc = four_am_today.astimezone(timezone.utc)
+    else:
+        day_start_utc = wake_utc
+    return (day_start_utc, day_start_utc + timedelta(days=1))
+
+
+# Looks up the most recent "morning wake" in b.sleep_wake_events at or before
+# anchor_utc, within a 24h lookback window. A morning wake = wake row whose
+# immediately preceding row (by occurred_at, across all rows) is a sleep — so
+# nap-end wakes (which write a wake without a preceding sleep) are excluded.
+# Returns the wake's occurred_at as UTC, or None when nothing qualifies. Returns
+# None on any DB failure (degraded fallback so the footer still renders).
+def _get_most_recent_morning_wake_utc(anchor_utc: datetime) -> datetime | None:
+    lookback_start = anchor_utc - timedelta(hours=24)
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT w.occurred_at
+                        FROM b.sleep_wake_events w
+                        WHERE w.event_type = 'wake'
+                          AND w.occurred_at >= %s
+                          AND w.occurred_at <= %s
+                          AND (
+                            SELECT s.event_type
+                            FROM b.sleep_wake_events s
+                            WHERE s.occurred_at < w.occurred_at
+                            ORDER BY s.occurred_at DESC
+                            LIMIT 1
+                          ) = 'sleep'
+                        ORDER BY w.occurred_at DESC
+                        LIMIT 1
+                        """,
+                        (lookback_start, anchor_utc),
+                    )
+                    row = cur.fetchone()
+                    return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.WARNING,
+            "attention_morning_wake_lookup_failed",
+            e,
+            anchor_utc=anchor_utc.isoformat(),
+        )
+        return None
+
+
+# Formats a timezone-aware datetime as 12-hour "9:54 AM" / "12:43 PM".
+# Inputs: a tz-aware datetime already converted to the display timezone.
+# Outputs: zero-stripped hour, two-digit minute, uppercase meridiem.
+def _format_time_12h(dt_local: datetime) -> str:
+    hour = dt_local.hour % 12 or 12
+    meridiem = "AM" if dt_local.hour < 12 else "PM"
+    return f"{hour}:{dt_local.minute:02d} {meridiem}"
+
+
+# Formats the date prefix shown in the "today · 14 min cooking" footer line.
+# Inputs: the session event's local datetime and "now" in the same local timezone.
+# Outputs:
+#   "today" / "yesterday" — same/previous calendar day
+#   "Mon" / "Tue" / ...   — within the last week (2-6 days back)
+#   "24 May" / "3 Jan"    — older than a week
+# Future-dated events fall through to the date format.
+def _format_date_footer(event_local: datetime, now_local: datetime) -> str:
+    delta_days = (now_local.date() - event_local.date()).days
+    if delta_days == 0:
+        return "Today"
+    if delta_days == 1:
+        return "Yesterday"
+    if 2 <= delta_days <= 6:
+        return event_local.strftime("%a")  # Mon/Tue/... already capitalised
+    # %-d strips the leading zero on day-of-month; Linux/macOS only — Cloud Run is Linux.
+    return event_local.strftime("%-d %b")
+
+
+# Computes elapsed time between two timestamps in whole minutes (rounded), clamped at 0.
 # Inputs: start and end timestamps.
-# Outputs: compact human-readable duration.
-def _format_duration(started_at: datetime, ended_at: datetime) -> str:
-    total_minutes = max(0, round((ended_at - started_at).total_seconds() / 60))
+# Outputs: minutes as int.
+def _duration_minutes(started_at: datetime, ended_at: datetime) -> int:
+    return max(0, round((ended_at - started_at).total_seconds() / 60))
+
+
+# Formats an integer minute count as "1h 35m" / "45m" / "2h".
+# Inputs: whole minutes.
+# Outputs: compact short-form duration string.
+def _format_duration_short(total_minutes: int) -> str:
     if total_minutes < 60:
-        return f"{total_minutes} min"
+        return f"{total_minutes}m"
     hours, minutes = divmod(total_minutes, 60)
     if minutes == 0:
-        return f"{hours} hr"
-    return f"{hours} hr {minutes} min"
+        return f"{hours}h"
+    return f"{hours}h {minutes}m"
 
 
-# Formats one escaped labelled reply field.
-# Inputs: label and value from a session row.
-# Outputs: "Label: value" with empty values shown as none.
-def _format_field(label: str, value) -> str:
-    return f"{label}: {escape(_format_optional_value(value))}"
-
-
-# Formats nullable values for attention replies.
-# Inputs: arbitrary value from a session row.
-# Outputs: string value, or "none" when empty.
-def _format_optional_value(value) -> str:
-    if value is None:
-        return "none"
-    cleaned = str(value).strip()
-    if not cleaned:
-        return "none"
-    return cleaned
 
 
 # Formats the open session for the LLM prompt.
@@ -677,6 +1368,7 @@ def _format_open_session_for_llm(open_session: dict | None) -> str:
     parts = [
         f"id={open_session['attention_session_id']}",
         f"category={open_session['category']}",
+        f"subcategory={open_session.get('subcategory')}",
         f"description={open_session['description']}",
         f"started_at={open_session['started_at'].isoformat()}",
     ]
@@ -716,65 +1408,11 @@ def _parse_optional_datetime(value) -> datetime | None:
     return parsed
 
 
-# Returns B's timezone as-of a given event timestamp, falling back to Asia/Singapore.
-# Inputs: event timestamp or None.
-# Outputs: ZoneInfo instance.
-#
-# Fallback chain (in order):
-#   1. Most recent b.location row at or before as_of  (correct as-of lookup)
-#   2. Most recent b.location row regardless of time  (handles no prior-to-event row)
-#   3. Asia/Singapore hardcoded                       (no location ever shared)
-def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
-    try:
-        conn = get_connection()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    if as_of is not None:
-                        cur.execute(
-                            "SELECT timezone FROM b.location"
-                            " WHERE created_at <= %s ORDER BY created_at DESC LIMIT 1",
-                            (as_of,),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            log_event(logger, logging.INFO, "attention_timezone_resolved",
-                                      source="as_of", timezone=row[0], as_of=as_of.isoformat())
-                        else:
-                            # No location at-or-before this event — use the most recent one anyway.
-                            log_event(logger, logging.WARNING, "attention_timezone_as_of_miss",
-                                      as_of=as_of.isoformat(), as_of_tzinfo=str(as_of.tzinfo))
-                            cur.execute("SELECT timezone FROM b.latest_location")
-                            row = cur.fetchone()
-                            if row:
-                                log_event(logger, logging.INFO, "attention_timezone_resolved",
-                                          source="latest_location", timezone=row[0])
-                    else:
-                        cur.execute("SELECT timezone FROM b.latest_location")
-                        row = cur.fetchone()
-                        if row:
-                            log_event(logger, logging.INFO, "attention_timezone_resolved",
-                                      source="latest_location_no_as_of", timezone=row[0])
-                    if row:
-                        return ZoneInfo(row[0])
-        finally:
-            conn.close()
-    except Exception as e:
-        log_failure(
-            logger,
-            logging.WARNING,
-            "attention_timezone_lookup_failed",
-            e,
-            as_of=as_of.isoformat() if as_of else None,
-        )
-    return _FALLBACK_TZ
-
-
 # Returns B's local time at the given event timestamp for the LLM prompt.
 # Inputs: event timestamp or None.
 # Outputs: readable time string.
 def _local_time_str(as_of: datetime | None = None) -> str:
-    tz = _get_timezone(as_of)
+    tz = get_timezone(as_of)
     if as_of is not None:
         local_now = as_of.astimezone(tz)
     else:

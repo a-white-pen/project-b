@@ -3,7 +3,6 @@
 ## ⚡ Pick Up When Free
 
 - **Correction support for sleep/wake** — quoting a wrong sleep/wake bot reply falls through to normal LLM routing instead of deleting the bad event. Observed: voice message misclassified as sleep; B quoted the reply to correct it; sleep event was NOT deleted, only a new attention log was created. Need delete + optional replacement flow.
-- **"Wake up" routing when nap attention session is active** — if B says "wake up" / "B wake up" while a `category=rest` attention session is open, the intent classifier routes to sleep/wake instead of ending the attention session. Fix: router should check for an open rest session and redirect to attention end. Observed: "B wake up" logged a sleep/wake event instead of closing the nap session.
 - **Prompt cleanup** — review all prompts for efficiency, accuracy, and token usage; affects cost and response speed
 - **Polish sleep/wake replies** — currently terse ("🌙 Sleep time logged."); use LLM to make replies warmer and more varied
 - **Polish weight reply** — acknowledge trend, not just echo the number back
@@ -95,6 +94,22 @@ Public API endpoint for friends to query the external meals table — look up ma
 ## ✅ Done
 
 *(latest first)*
+
+**25 May — Attention v3 + sleep/wake auto-coordination**
+- v3 taxonomy — expanded to 8 main × 24 subcategories: added `eat / food_collection`; split `social` into 3 (`social_in_person`, `social_messaging`, `social_broadcast`); split `admin / shopping` into `shopping_online` + `shopping_in_store`; reclassified 7-11 from errands to shopping; added "poop" example to `personal_care`; DB CHECK constraint updated to enforce new pairs (see `domains/attention/TAXONOMY.md` as source of truth)
+- Display refactor — single combined blockquote per session bubble with order: `category : subcategory` → `project:` → `also:` → `"description"` (italic+quoted) → time(+duration); separator changed from `/` to `:` everywhere user-facing; co-cat markers stored as `+ main : sub` in notes; italic day-total footer for closed sessions; expandable `<blockquote expandable>Categories:</blockquote>` menu attached below every reply
+- Wake-day anchored daily total — footer "Today: …" now sums from B's most recent morning-wake event (wake immediately preceded by a sleep, filters nap-ends), with local-4am fallback when no qualifying wake found in 24h
+- Auto-wake on attention start — first attention activity of the day with no wake in last 24h auto-inserts a placeholder wake event (`meta.auto_inferred=true`, 5 min before now) and emits a reminder bubble; quote-replying with a time (`7am`, `6:30 pm`) updates the row's `occurred_at` and flips `auto_inferred=false`
+- Sleep auto-closes open attention — `/sleep`, "night night", "orh orh" now close any open attention session first (reason `auto_closed_on_sleep`) and emit the end block above the sleep reply
+- Shared timezone resolver — `_get_timezone` moved from `domains/attention/service.py` to `system/timezone.py` as `get_timezone` so cross-domain callers don't reach across domain boundaries
+
+**24 May — Attention v2 (superseded by v3 on 25 May)**
+- v2 taxonomy migration — split flat `category` into `(category, subcategory)` with 8 main × 21 sub pairs; strict DB CHECK constraint enforces valid pairs; backfilled existing rows
+- Initial visual reply format — per-block one-bubble-per-session; header `🟦 work / deep_work · 1h 35m`; blockquote body with italic `project · X` and optional `also · 🟪 X / Y` lines (`/` separator, later changed to `:` in v3); italic footer with day's total per main category
+- Compound finish-and-start messages — extraction prompt updated so "finish X and do Y" resolves to `start_session` for Y (auto-close handles X), producing two separate bubbles
+- Co-categorisation support — `+ main / sub` markers in notes (later changed to `+ main : sub` in v3); rendered as `also · 🟪 main / sub` in the bubble body; concurrent activities not allowed
+- Wake-as-nap-end — "wake up" mid-nap (open downtime/rest session) closes the nap in a single locked transaction instead of writing a sleep_wake event
+- Correction hardening — per-session reply scope, overlap check on edits including reopen, advisory lock + Postgres partial unique index `b.one_open_attention_session` for one-open-session invariant, HTML escape in overlap conflict message, multi-session legacy state rejected with clear error
 
 **15 May**
 - Code review fixes: ON CONFLICT now updates `sport_type`, `activity_category`, `is_treadmill`, `started_at`, `timezone` on Strava edit; Strava delete events handled (`delete_cardio_activity` + `process_delete_event`); `awaiting_quantity` preserves original caption when re-running label extraction; `_build_splits` guards against `KeyError` on missing `split` key and skips laps missing NOT NULL fields; correction scope uses `meal_food_log_ids` as the allowlist so non-quoted meal items can be corrected; stale `nutrition_sources` test files removed; `OVERVIEW.md`, `README.md`, `pyproject.toml` updated

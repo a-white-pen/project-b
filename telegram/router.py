@@ -15,7 +15,7 @@ from enum import Enum
 
 from domains.menus.service import handle_refresh_menus
 from domains.attention.correction import handle_attention_correction
-from domains.attention.service import handle_attention_log
+from domains.attention.service import handle_attention_log, try_handle_wake_as_nap_end
 from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
 from domains.food.service import handle_food_log
@@ -89,7 +89,11 @@ Respond with only the intent name. Nothing else."""
 # Voice is transcribed before the correction check so that a quoted voice note works as a
 # correction — handle_food_correction reads msg.text, which would be None for an untranscribed voice.
 # Inputs: InboundMessage from normalizer.
-# Outputs: list of (reply_text, pending_state) — one per food item for food intents, one otherwise.
+# Outputs: list of (reply_text, pending_state). Multi-entry lists when the domain
+#   genuinely produces more than one bubble: food logging (one per food item), food
+#   correction (per item), attention logging (one per session block — "finish X and
+#   start Y" yields two), attention correction (one per affected session). All other
+#   domains return a single-entry list.
 #   pending_state keys: domain, context, [parent_telegram_reply_message_id].
 def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     log_event(
@@ -275,7 +279,7 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
     if domain == "food":
         return handle_food_correction(msg, state)  # already returns list
     if domain == "attention":
-        return [handle_attention_correction(msg, state)]
+        return handle_attention_correction(msg, state)  # already returns list — one entry per affected session
     if domain == "sleep_wake":
         return [handle_sleep_wake_correction(msg, state)]
     if domain == "weight":
@@ -292,21 +296,29 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
 
 
 # Dispatches to the right domain handler.
-# Food logging returns a list of (reply, state) — one per item.
-# All other handlers return a single (reply, state) wrapped in a list.
+# Food logging and attention logging return a list of (reply, state) — one per food item
+# or one per attention session block (end/start). All other handlers return a single
+# (reply, state) wrapped in a list.
 def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | None]]:
     if intent == Intent.LOG_FOOD:
         return handle_food_log(msg)  # already returns list
     if intent == Intent.LOG_WEIGHT:
         return [handle_weight_log(msg)]
     if intent == Intent.LOG_SLEEP:
-        return [handle_sleep_log(msg)]
+        return handle_sleep_log(msg)  # already returns list — may include attention end blocks
     if intent == Intent.LOG_WAKE:
-        return [handle_wake_log(msg)]
+        # "Wake up" mid-nap should close the open rest attention session, not log a
+        # wake event. try_handle_wake_as_nap_end returns None when no rest session is
+        # open so we fall through to normal sleep/wake routing; when it returns, it's
+        # already a list[(reply, state)] so no wrapping needed.
+        nap_end = try_handle_wake_as_nap_end(msg)
+        if nap_end is not None:
+            return nap_end
+        return handle_wake_log(msg)  # already returns list
     if intent == Intent.LOG_EXPENSE:
         return [handle_expense_log(msg)]
     if intent == Intent.LOG_ATTENTION:
-        return [handle_attention_log(msg)]
+        return handle_attention_log(msg)  # already returns list — one entry per session block
     if intent == Intent.QUERY_DATA:
         return [handle_query_data(msg)]
     if intent == Intent.ASK_GENERAL:
