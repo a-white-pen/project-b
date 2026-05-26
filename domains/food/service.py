@@ -26,7 +26,7 @@ Functions:
   _gap_fill_macros(item, update_id)         — fills null macro fields anchored to known values
   _check_label_backstops(item)              — validates nutrition_label item: partial read + row-shift
   _apply_zero_from_label(item)              — zeros missing secondary fields when all core fields present
-  _get_timezone(as_of)                      — looks up B's timezone as-of a given timestamp
+  get_timezone(as_of)                       — imported from system.timezone; resolves B's tz as-of a timestamp
   _local_time_str(as_of)                    — formats B's local time for LLM prompts
   _parse_json(raw)                          — strips code fences and parses JSON
   _to_float(val)                            — safely coerces a macro value to float
@@ -40,7 +40,6 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 import psycopg2.extras
 
@@ -48,12 +47,11 @@ from system.db import get_connection
 from system.llm import MODEL_FLASH, generate_text, generate_with_image
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
+from system.timezone import get_timezone
 from telegram.files import get_file_bytes
 from domains.food.nutrition_sources.router import enrich_item
 
 logger = logging.getLogger(__name__)
-
-_FALLBACK_TZ = ZoneInfo("Asia/Singapore")  # used when b.latest_location has no rows
 
 _VALID_MEAL_TYPES = {
     "breakfast", "brunch", "lunch", "snack",
@@ -950,54 +948,10 @@ def _handle_food_image_photo(msg: InboundMessage, image_bytes: bytes) -> list[tu
 # to wherever B actually was when the message was sent — not where she is right now.
 # This handles delayed messages, Telegram retries, and travel between meals correctly.
 #
-# Fallback chain (in order):
-#   1. Most recent b.location row at or before as_of  (correct as-of lookup)
-#   2. Most recent b.location row regardless of time  (handles no prior-to-event row)
-#   3. Asia/Singapore hardcoded                       (no location ever shared)
-def _get_timezone(as_of: datetime | None = None) -> ZoneInfo:
-    try:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                if as_of is not None:
-                    cur.execute(
-                        "SELECT timezone FROM b.location"
-                        " WHERE created_at <= %s ORDER BY created_at DESC LIMIT 1",
-                        (as_of,),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        log_event(logger, logging.INFO, "food_timezone_resolved",
-                                  source="as_of", timezone=row[0], as_of=as_of.isoformat())
-                    else:
-                        # No location at-or-before this event — use the most recent one anyway.
-                        log_event(logger, logging.WARNING, "food_timezone_as_of_miss",
-                                  as_of=as_of.isoformat(), as_of_tzinfo=str(as_of.tzinfo))
-                        cur.execute("SELECT timezone FROM b.latest_location")
-                        row = cur.fetchone()
-                        if row:
-                            log_event(logger, logging.INFO, "food_timezone_resolved",
-                                      source="latest_location", timezone=row[0])
-                else:
-                    cur.execute("SELECT timezone FROM b.latest_location")
-                    row = cur.fetchone()
-                    if row:
-                        log_event(logger, logging.INFO, "food_timezone_resolved",
-                                  source="latest_location_no_as_of", timezone=row[0])
-                if row:
-                    return ZoneInfo(row[0])
-        finally:
-            conn.close()
-    except Exception as e:
-        log_failure(logger, logging.WARNING, "food_timezone_lookup_failed", e)
-    log_event(logger, logging.INFO, "food_timezone_fallback_used", timezone=str(_FALLBACK_TZ))
-    return _FALLBACK_TZ
-
-
 # Returns B's local time at the given event timestamp as a readable string for the LLM prompt.
 # Resolves timezone as-of the event so meal_type inference is correct for delayed messages.
 def _local_time_str(as_of: datetime | None = None) -> str:
-    tz = _get_timezone(as_of)
+    tz = get_timezone(as_of)
     # Use the event's own timestamp if available; otherwise use current time in that zone.
     if as_of is not None:
         local_now = as_of.astimezone(tz)
@@ -1006,10 +960,20 @@ def _local_time_str(as_of: datetime | None = None) -> str:
     return local_now.strftime("%H:%M on %A")  # e.g. "08:30 on Monday"
 
 
-# Strips markdown code fences if the LLM wraps its response, then parses JSON.
+# Strips markdown code fences and parses the FIRST valid JSON value from the LLM
+# response, ignoring any trailing content. The LLM occasionally returns two
+# top-level JSON values back-to-back (e.g. `{...}\n{...}` or `null\nnull`) — strict
+# json.loads would reject the whole response with "Extra data: line 2 column 1".
+# raw_decode tolerates this by consuming the first value and leaving the rest.
+# Caller still sees clean dict output for the common single-value case.
 def _parse_json(raw: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-    return json.loads(cleaned)
+    obj, _end = json.JSONDecoder().raw_decode(cleaned)
+    if not isinstance(obj, dict):
+        # Some LLM mishaps emit `null` or a bare list as the first value. Treat
+        # those as parse failures so the caller's existing error path runs.
+        raise ValueError(f"expected JSON object, got {type(obj).__name__}")
+    return obj
 
 
 # Safely coerces a macro value to float. Returns None if missing or not numeric.
@@ -1116,19 +1080,36 @@ def _gap_fill_macros(item: dict, update_id: int | None) -> None:
 
     known_lines = "\n".join(f"  {f}: {v}" for f, v in known.items())
     missing_list = ", ".join(missing)
+    prompt = _GAP_FILL_PROMPT.format(
+        food_item=item.get("food_item", "unknown food"),
+        known_lines=known_lines,
+        missing_list=missing_list,
+    )
 
-    try:
-        raw = generate_text(
-            _GAP_FILL_PROMPT.format(
-                food_item=item.get("food_item", "unknown food"),
-                known_lines=known_lines,
-                missing_list=missing_list,
-            ),
-            model=MODEL_FLASH,
-        )
-        filled = _parse_json(raw)
-    except Exception as e:
-        log_failure(logger, logging.WARNING, "food_gap_fill_failed", e, update_id=update_id)
+    # Try once; on parse/LLM failure retry once before giving up. The gap-fill
+    # LLM occasionally emits malformed JSON for short responses (two top-level
+    # values, bare null, etc.); a fresh call almost always succeeds. _parse_json
+    # is already tolerant of trailing values, so this retry only fires on the
+    # rarer cases that survive raw_decode.
+    filled = None
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            raw = generate_text(prompt, model=MODEL_FLASH)
+            filled = _parse_json(raw)
+            break
+        except Exception as e:
+            last_error = e
+            log_event(
+                logger,
+                logging.INFO,
+                "food_gap_fill_attempt_failed",
+                update_id=update_id,
+                attempt=attempt,
+                error_type=type(e).__name__,
+            )
+    if filled is None:
+        log_failure(logger, logging.WARNING, "food_gap_fill_failed", last_error, update_id=update_id)
         return
 
     # Apply only the fields that were requested and returned as valid numbers.

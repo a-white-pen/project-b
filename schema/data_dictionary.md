@@ -9,7 +9,7 @@ One row per continuous primary-attention interval for B. Grain: one activity ses
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
 | `attention_session_id` | `integer` | no | nextval('b.attention_sessions_attention_session_id_seq'::regclass) | Surrogate primary key. |
-| `category` | `text` | no |  | Coarse activity category. Values: deep_work, shallow_work, planning, learning, exercise, cooking, eating, commute, life_admin, personal_care, social, entertainment, rest, meditation, other. Sleep is intentionally excluded; naps may be logged as rest. |
+| `category` | `text` | no |  | Top-level activity category. Values: work, social, self_care, eat, downtime, admin, transit, other. Combined with subcategory to form a valid pair — see attention_sessions_taxonomy_check. |
 | `description` | `text` | no |  | Human-readable description of what B was doing, preserving B's wording where useful. Examples: working on attention module, prep breakfast, watching Succession. |
 | `project` | `text` | yes |  | Optional project or context tag, e.g. project-b, work, Codex, a book title, or a show title. |
 | `started_at` | `timestamp with time zone` | no |  | When the attention session started. Primary start time dimension for attention analysis. For Telegram rows, usually the Telegram message timestamp. |
@@ -18,9 +18,10 @@ One row per continuous primary-attention interval for B. Grain: one activity ses
 | `meta` | `jsonb` | no | '{}'::jsonb | Source provenance, lifecycle details, and classifier metadata. Expected shape: {"start":{"source":"telegram","self_reported":true,"telegram_update_id":123},"end":{"source":"telegram\|system\|calendar\|reminder","self_reported":true\|false,"reason":"explicit_finish\|superseded_by_new_start\|manual_correction\|source_reported","telegram_update_id":124},"classification":{"model":"gemini-2.5-flash","action":"start_session"}}. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use started_at and ended_at for time-series and duration analysis. |
 | `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp, set by application code when a session is ended or corrected. NULL for rows that have not been changed after insert. |
+| `subcategory` | `text` | no |  | Specific activity within category. Valid (category, subcategory) pairs: work / {deep_work, shallow_work, meetings, learning, planning}; social / {social_in_person, social_messaging, social_broadcast}; self_care / {exercise, personal_care, meditation}; eat / {food_prep, food_collection, eating}; downtime / {rest, entertainment}; admin / {shopping_online, shopping_in_store, errands, life_admin, health_admin}; transit / {commute, travel}; other / {other}. |
 
 ### View: `b.latest_location`
-Most recent location B has shared. Used by domain services to get the active timezone for local time-of-day inference. Falls back to Asia/Bangkok if no rows exist.
+Most recent location B has shared. Used by domain services to get the active timezone for local time-of-day inference. Application code falls back to Asia/Singapore if no rows exist.
 
 **View definition:**
 ```sql
@@ -47,7 +48,7 @@ SELECT location_id,
 | `created_at` | `timestamp with time zone` | yes |  |  |
 
 ### Table: `b.location`
-Log of every location B shares via Telegram. One row per LOCATION message. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API) and is immutable after insert. location_name is backfilled in a single UPDATE after the row is committed — Nominatim (OpenStreetMap, free, no API key) is called best-effort and may leave location_name NULL on geocoding failure; no other columns are ever changed. Application code falls back to Asia/Bangkok if this table has no rows. Use b.latest_location view to get the active timezone.
+Log of every location B shares via Telegram. One row per LOCATION message. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API) and is immutable after insert. location_name is backfilled in a single UPDATE after the row is committed — Nominatim (OpenStreetMap, free, no API key) is called best-effort and may leave location_name NULL on geocoding failure; no other columns are ever changed. Application code falls back to Asia/Singapore if this table has no rows. Use b.latest_location view to get the active timezone.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|

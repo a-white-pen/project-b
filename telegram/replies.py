@@ -123,7 +123,8 @@ def store_outbound(message_id: int, payload: dict) -> None:
 
 
 # Detects whether a reply uses Telegram-compatible HTML tags and sets parse_mode="HTML".
-# Currently only the attention domain uses HTML tags (<b>Attention end</b> etc.).
+# Currently used by the attention domain (activity ended/started/updated/removed replies)
+# and the food domain (per-item replies).
 #
 # CONTRACT: any domain that produces replies with HTML formatting tags MUST ensure that
 # all user-provided or LLM-provided content is passed through html.escape() before being
@@ -131,8 +132,10 @@ def store_outbound(message_id: int, payload: dict) -> None:
 # Telegram with parse_mode="HTML", Telegram returns a 400 and the reply is never delivered —
 # the user sees nothing and the outbound message_id is never saved (breaking correction threading).
 #
-# The attention service satisfies this contract via html.escape() in _format_field().
-# Any new domain adding HTML-formatted replies must do the same.
+# The attention service satisfies this contract by calling html.escape() on all user/LLM
+# content inside _format_session_block() (the shared formatter in domains/attention/service.py)
+# and inside _format_overlap_conflict() (in domains/attention/correction.py). Any new domain
+# adding HTML-formatted replies must do the same.
 #
 # Inputs: reply text string.
 # Outputs: "HTML" when known safe formatting tags are present, otherwise None.

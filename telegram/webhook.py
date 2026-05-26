@@ -146,9 +146,11 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
         results = await asyncio.to_thread(route, msg)
         last_sent_message_id = None
         last_pending_state = None
-        # Send one Telegram message per (reply, state) pair. Food logging produces one per item;
-        # all other domains produce a single-item list. Each message is stored and state saved
-        # independently so B can quote any individual item to correct it.
+        # Send one Telegram message per (reply, state) pair. Food logging produces one per
+        # food item; attention logging produces one per session block (e.g. "finish X and
+        # start Y" yields two bubbles); attention correction produces one per affected
+        # session. Other domains produce a single-item list. Each message is stored and
+        # state saved independently so B can quote any individual item to correct it.
         for reply_text, pending_state in results:
             sent_message_id, sent_payload = await asyncio.to_thread(
                 send_reply, chat_id, reply_text, message_id
