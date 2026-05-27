@@ -1,13 +1,29 @@
 """
-One-off script to fully sync all Strava activities into exercise.cardio_activities
-and exercise.cardio_splits.
+One-off script to fully sync all Strava activities into the exercise schema.
+Uses the same save_strava_activity dispatcher as the live webhook so backfill
+behaviour stays in sync — cardio → exercise.cardio_activities + splits,
+strength is noted but NOT Garmin-fetched (avoids hammering Garmin during a
+bulk run; strength sessions are best repaired via the live webhook),
+everything else → exercise.other_exercises.
 
 Usage:
     python3 inbound/strava/backfill.py
 
 Requires DATABASE_URL and Strava env vars to be set (or a .env file in the project root).
+
+Functions:
+  main()                                 — entry point; orchestrates all five phases
+                                           (token, list IDs, sentinel FK, fetch+save loop,
+                                           stale handling — gated behind --delete-stale)
+  _exchange_token()                      — refreshes Strava access token from stored refresh token
+  _fetch_all_activity_ids(access_token)  — paginates /athlete/activities for every activity id
+  _fetch_activity_detail(token, id)      — fetches one full activity detail payload
+  _get_or_create_backfill_inbound_id()   — synthetic sentinel row in system.strava_inbound to FK to
+  _count_stale_activities(seen_ids)      — counts rows that WOULD be deleted, per table (dry-run)
+  _delete_stale_activities(seen_ids)     — sweeps rows whose strava_activity_id is no longer on Strava
 """
 
+import argparse
 import os
 import sys
 import time
@@ -29,13 +45,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from system.config import get_strava_config
 from system.db import get_connection
-from domains.exercise.service import save_cardio_activity
+from domains.exercise.service import save_strava_activity
 
 _STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 _STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
 _STRAVA_ACTIVITY_URL = "https://www.strava.com/api/v3/activities/{activity_id}"
 
 
+# Refreshes the Strava access token using the stored refresh token. Returns the
+# short-lived access token used for subsequent API calls.
 def _exchange_token() -> str:
     cfg = get_strava_config()
     response = httpx.post(
@@ -52,8 +70,10 @@ def _exchange_token() -> str:
     return response.json()["access_token"]
 
 
+# Paginates through Strava's /athlete/activities endpoint and returns every
+# activity ID the athlete has ever logged. 200 per page (Strava max), keeps
+# fetching until an empty page comes back.
 def _fetch_all_activity_ids(access_token: str) -> list[int]:
-    """Paginates through /athlete/activities and returns all activity IDs."""
     ids = []
     page = 1
     while True:
@@ -74,6 +94,9 @@ def _fetch_all_activity_ids(access_token: str) -> list[int]:
     return ids
 
 
+# Fetches the full Strava activity detail (laps, splits_metric, gear, etc.).
+# Same payload shape that the live webhook receives, so save_strava_activity
+# treats backfill rows identically to live ones.
 def _fetch_activity_detail(access_token: str, activity_id: int) -> dict:
     url = _STRAVA_ACTIVITY_URL.format(activity_id=activity_id)
     response = httpx.get(
@@ -85,12 +108,11 @@ def _fetch_activity_detail(access_token: str, activity_id: int) -> dict:
     return response.json()
 
 
+# Returns a strava_inbound_id to use as the FK for all backfilled rows. The
+# real strava_inbound rows correspond to live webhook events — backfill rows
+# don't have one, so we INSERT a synthetic sentinel (object_id=0, payload
+# marked source=backfill_script) and reuse it on subsequent backfill runs.
 def _get_or_create_backfill_inbound_id() -> int:
-    """
-    Returns a strava_inbound_id to use as the FK for all backfilled rows.
-    Inserts a synthetic sentinel row into system.strava_inbound if one doesn't exist.
-    The sentinel row has object_id=0 and a recognisable payload.
-    """
     conn = get_connection()
     try:
         with conn:
@@ -114,41 +136,106 @@ def _get_or_create_backfill_inbound_id() -> int:
         conn.close()
 
 
-def _delete_stale_activities(seen_ids: list[int]) -> int:
-    """Deletes cardio_activities rows whose strava_activity_id is not in seen_ids."""
+# Counts rows that WOULD be deleted by the stale-sweep, per table, without
+# actually deleting. Used when the script runs in dry-run mode so B can see
+# the blast radius before opting in. Strength rows with NULL strava_activity_id
+# (e.g. future manual entries) are preserved because `!= ALL(seen_ids)` never
+# matches NULL.
+def _count_stale_activities(seen_ids: list[int]) -> dict[str, int]:
+    counts = {
+        "exercise.cardio_activities": 0,
+        "exercise.strength_sessions": 0,
+        "exercise.other_exercises": 0,
+    }
     if not seen_ids:
-        return 0
+        return counts
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM exercise.cardio_activities "
-                    "WHERE strava_activity_id != ALL(%s)",
-                    (seen_ids,),
-                )
-                return cur.rowcount
+                for table in counts:
+                    cur.execute(
+                        f"SELECT count(*) FROM {table} WHERE strava_activity_id != ALL(%s)",
+                        (seen_ids,),
+                    )
+                    counts[table] = cur.fetchone()[0]
+        return counts
     finally:
         conn.close()
 
 
-def main() -> None:
-    print("=== Strava backfill script ===")
+# Deletes rows from all three exercise tables whose strava_activity_id is not
+# in seen_ids — i.e. activities B has removed in the Strava app since last sync.
+# Covers cardio_activities (+ splits via CASCADE), strength_sessions (+ sets via
+# CASCADE), and other_exercises. Returns total rows deleted. Strength rows with
+# no strava_activity_id (NULL — e.g. manual entries) are preserved because
+# `!= ALL(seen_ids)` never matches NULL.
+# Gated behind --delete-stale CLI flag (default is dry-run print only).
+def _delete_stale_activities(seen_ids: list[int]) -> int:
+    if not seen_ids:
+        return 0
+    total = 0
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for table in (
+                    "exercise.cardio_activities",
+                    "exercise.strength_sessions",
+                    "exercise.other_exercises",
+                ):
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE strava_activity_id != ALL(%s)",
+                        (seen_ids,),
+                    )
+                    total += cur.rowcount
+        return total
+    finally:
+        conn.close()
 
-    print("\n[1/4] Exchanging token...")
+
+# Entry point. Five phases: (1) refresh token, (2) list-all-IDs from Strava,
+# (3) get-or-create sentinel FK row, (4) fetch+save each activity (rate-limit
+# paused), (5) stale-row handling. Stale-handling is gated: by default the
+# script prints candidate counts only and does NOT delete (per repo
+# DELETE-approval rule and to guard against pagination glitches making the
+# script believe everything is stale). Pass --delete-stale to actually remove
+# rows missing from the fetched Strava list.
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Backfill all Strava activities into exercise.*",
+    )
+    parser.add_argument(
+        "--delete-stale",
+        action="store_true",
+        help=(
+            "Delete DB rows whose strava_activity_id is no longer on Strava. "
+            "Default is DRY-RUN — counts only, no deletion. Use only when you "
+            "trust the full Strava activity list was fetched without truncation."
+        ),
+    )
+    args = parser.parse_args()
+
+    print("=== Strava backfill script ===")
+    if not args.delete_stale:
+        print("  Stale-delete: DRY RUN (counts only). Pass --delete-stale to delete.")
+    else:
+        print("  Stale-delete: ENABLED (rows missing from Strava will be DELETED).")
+
+    print("\n[1/5] Exchanging token...")
     access_token = _exchange_token()
     print("  Token acquired.")
 
-    print("\n[2/4] Fetching all activity IDs from Strava...")
+    print("\n[2/5] Fetching all activity IDs from Strava...")
     all_ids = _fetch_all_activity_ids(access_token)
     total = len(all_ids)
     print(f"  Found {total} activities on Strava.")
 
-    print("\n[3/4] Getting/creating backfill inbound row...")
+    print("\n[3/5] Getting/creating backfill inbound row...")
     inbound_id = _get_or_create_backfill_inbound_id()
     print(f"  Using strava_inbound_id={inbound_id}")
 
-    print(f"\n[4/4] Fetching details and upserting {total} activities...")
+    print(f"\n[4/5] Fetching details and upserting {total} activities...")
     upserted = 0
     skipped = 0
     errors = 0
@@ -161,26 +248,48 @@ def main() -> None:
             activity = _fetch_activity_detail(access_token, activity_id)
             sport_type = activity.get("sport_type", "?")
             print(f"  [{i}/{total}] Fetching activity {activity_id} ({sport_type})...", end=" ")
-            saved, category = save_cardio_activity(inbound_id, activity)
+            saved, category = save_strava_activity(inbound_id, activity)
             if saved:
                 upserted += 1
                 print(f"saved as {category}")
+            elif category == "strength":
+                # Strength sessions need a Garmin Connect fetch, which we
+                # intentionally skip in backfill — re-saving historical strength
+                # sessions one-by-one would hammer Garmin and produce duplicate
+                # rows. Re-trigger from Strava live (edit + revert) if you want
+                # an individual historical strength session repaired.
+                skipped += 1
+                print("skipped (strength — needs live webhook for Garmin fetch)")
             else:
                 skipped += 1
-                print("skipped")
+                print("skipped (save failed)")
         except Exception as e:
             errors += 1
             print(f"ERROR: {e}")
 
-    print("\n[5/5] Deleting stale rows...")
-    deleted = _delete_stale_activities(all_ids)
-    print(f"  Deleted {deleted} stale row(s) no longer on Strava.")
+    print("\n[5/5] Stale-row handling...")
+    stale_counts = _count_stale_activities(all_ids)
+    stale_total = sum(stale_counts.values())
+    for table, count in stale_counts.items():
+        print(f"  {table}: {count} candidate(s)")
+    if stale_total == 0:
+        print("  Nothing to delete.")
+        deleted = 0
+    elif args.delete_stale:
+        deleted = _delete_stale_activities(all_ids)
+        print(f"  Deleted {deleted} stale row(s) across all three tables.")
+    else:
+        deleted = 0
+        print(f"  DRY RUN — would delete {stale_total} row(s). Re-run with --delete-stale to commit.")
 
     print("\n=== Summary ===")
     print(f"  Total fetched : {total}")
     print(f"  Upserted      : {upserted}")
-    print(f"  Skipped       : {skipped} (non-cardio or errors={errors})")
-    print(f"  Deleted (stale): {deleted}")
+    print(f"  Skipped       : {skipped} (strength or errors={errors})")
+    if args.delete_stale:
+        print(f"  Deleted (stale): {deleted}")
+    else:
+        print(f"  Stale (dry-run): {stale_total} candidate(s) — not deleted")
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 | `b` | B's personal measurements — weight, sleep/wake events, attention sessions, body metrics, location |
 | `nutrition` | Food logs and meal data |
 | `finances` | Spend and transactions |
-| `exercise` | Cardio and strength activities |
+| `exercise` | Cardio activities (run/walk/ride/swim), strength sessions (WeightTraining/Workout/Crossfit), and other_exercises (yoga, pilates, climbing, etc.). Unified read via the `exercise.activities` view. |
 | `external_data` | Raw reference data from external sources (menus, scraped data) |
 | `system` | Internal state — Telegram raw payloads, outbound log, conversation state, OAuth tokens |
 | `marts` | Read-only analytics views — never written by the app |

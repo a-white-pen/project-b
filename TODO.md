@@ -2,7 +2,6 @@
 
 ## ⚡ Pick Up When Free
 
-- **Correction support for sleep/wake** — quoting a wrong sleep/wake bot reply falls through to normal LLM routing instead of deleting the bad event. Observed: voice message misclassified as sleep; B quoted the reply to correct it; sleep event was NOT deleted, only a new attention log was created. Need delete + optional replacement flow.
 - **Prompt cleanup** — review all prompts for efficiency, accuracy, and token usage; affects cost and response speed
 - **Polish sleep/wake replies** — currently terse ("🌙 Sleep time logged."); use LLM to make replies warmer and more varied
 - **Polish weight reply** — acknowledge trend, not just echo the number back
@@ -86,14 +85,21 @@ Public API endpoint for friends to query the external meals table — look up ma
 ## 🔜 Later
 
 - **`handle_query_data`** — natural language → SQL → plain-English summary; needs more data in the warehouse first before this is useful
-- **Nap support** — sleep/wake module assumes a clean cycle; needs to handle naps separately
-- **Correction support for weight** — currently falls through to unknown
 
 ---
 
 ## ✅ Done
 
 *(latest first)*
+
+**26 May — Exercise module: other_exercises + unified view + dispatcher hardening**
+- `exercise.other_exercises` table (live) — captures yoga, pilates, climbing, and any unknown future Strava `sport_type` that's not cardio or strength. Source-agnostic shape (same provenance columns as `strength_sessions`) for future non-Strava ingestion. Curated Strava extras packed in `meta` (distance/HR/cadence/elevation/etc. for cardio-ish "other" types) so analytics aren't lossy.
+- Classifier overhaul — `_classify_activity` default catch-all changed from `other_cardio` → `"other"`; `_SKIP_TYPES` removed entirely (yoga/pilates/climbing no longer dropped at the door). Legacy `other_cardio` rows preserved in `cardio_activities` with column COMMENT marking it as historical.
+- Unified read view `exercise.activities` — UNION ALL across cardio_activities, strength_sessions, other_exercises. Narrow common header + JSONB `details` for kind-specific extras. Two filter levels (`kind` ∈ cardio/strength/movement; `category` for the specific type). Built for agentic consumption.
+- `save_strava_activity` single dispatcher — used by both live webhook and backfill. Write-then-sweep ordering (failed write leaves old sibling row intact); per-table try/except on sibling sweep so transient delete errors don't suppress notifications; per-activity `pg_advisory_lock` keyed on `strava_activity_id` so concurrent edits to the same activity can't race-delete each other's rows.
+- Strength re-tag safety — if B edits Run → WeightTraining in Strava, the sibling sweep only runs after the strength row is confirmed via `strength_session_exists`. Failed Garmin save leaves old cardio/other row in place.
+- Strava-side strength updates — benign UPDATE events (rename, RPE tweak, calories refinement) propagate to existing strength rows via `update_strength_session_strava_fields` without re-fetching Garmin. Key-presence semantics: Strava sending null clears the column; key absent leaves untouched.
+- Backfill safety — `--delete-stale` opt-in flag; default behaviour prints per-table candidate counts but does not delete (guards against pagination glitches wiping the DB).
 
 **25 May — Attention v3 + sleep/wake auto-coordination**
 - v3 taxonomy — expanded to 8 main × 24 subcategories: added `eat / food_collection`; split `social` into 3 (`social_in_person`, `social_messaging`, `social_broadcast`); split `admin / shopping` into `shopping_online` + `shopping_in_store`; reclassified 7-11 from errands to shopping; added "poop" example to `personal_care`; DB CHECK constraint updated to enforce new pairs (see `domains/attention/TAXONOMY.md` as source of truth)
@@ -113,7 +119,7 @@ Public API endpoint for friends to query the external meals table — look up ma
 
 **15 May**
 - Code review fixes: ON CONFLICT now updates `sport_type`, `activity_category`, `is_treadmill`, `started_at`, `timezone` on Strava edit; Strava delete events handled (`delete_cardio_activity` + `process_delete_event`); `awaiting_quantity` preserves original caption when re-running label extraction; `_build_splits` guards against `KeyError` on missing `split` key and skips laps missing NOT NULL fields; correction scope uses `meal_food_log_ids` as the allowlist so non-quoted meal items can be corrected; stale `nutrition_sources` test files removed; `OVERVIEW.md`, `README.md`, `pyproject.toml` updated
-- Phase 2 exercise module — Strava webhook saves cardio activities and per-km splits to `exercise.cardio_activities` + `exercise.cardio_splits`; proactive HTML notifications on create/update; sport_type classification (run/walk/ride/swim/other_cardio)
+- Phase 2 exercise module — Strava webhook saves cardio activities and per-km splits to `exercise.cardio_activities` + `exercise.cardio_splits`; proactive HTML notifications on create/update; sport_type classification (run/walk/ride/swim/other_cardio — `other_cardio` later retired on 26 May, see entry below)
 - Garmin strength module — WeightTraining/Workout/Crossfit events trigger a Garmin Connect fetch; exercise sets + HR parsed into `exercise.strength_sessions` + `exercise.strength_sets`; per-exercise set notifications sent via Telegram; full historical backfill via `inbound/garmin/backfill.py`
 - Food A3: three-way photo routing — classifier call (nutrition_label / macro_screenshot / food_image) dispatches to path-specific extraction prompts; nutrition label path applies backstops, zero_from_label, and awaiting_quantity/awaiting_clearer_photo flows; macro_screenshot path reads printed values and gap-fills; food image path estimates from vision
 - One reply per food item — each logged item gets its own Telegram message so B can quote exactly the item to correct; `_build_item_results` centralises (reply, state) pair generation across insert and correction paths

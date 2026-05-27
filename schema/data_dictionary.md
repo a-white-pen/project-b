@@ -105,54 +105,90 @@ Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud S
 ## Schema: `exercise`
 
 ### View: `exercise.activities`
-Unified read model across all exercise tables. Currently covers cardio only. Weight training rows will be unioned in when exercise.weight_training_sessions is created in Phase 3.
+Unified read model at SESSION grain across cardio_activities, strength_sessions, and other_exercises. Columns: kind (cardio/strength/movement) and category (run/walk/ride/swim for cardio; strength for strength; yoga/pilates/climbing/etc. for movement) give two filter levels — agent queries either bucket. Common header columns are present on every row; kind-specific extras (distance_m, total_active_sets, etc.) live in the details JSONB. Drill into per-km splits via source_table=cardio_activities + source_id → exercise.cardio_splits; per-set detail via source_table=strength_sessions + source_id → exercise.strength_sets. Built for agentic consumption — narrow shape minimises NULL noise. For dashboards/ad-hoc SQL, consider querying source tables directly.
 
 **View definition:**
 ```sql
-SELECT 'cardio_activities'::text AS activity_source_table,
-    cardio_activity_id AS activity_source_id,
-    activity_category,
-    sport_type,
-    activity_name,
-    is_treadmill,
-    started_at,
-    duration_seconds,
-    moving_seconds,
-    distance_m,
-    elevation_gain_m,
-    calories_kcal,
-    average_heartrate,
-    max_heartrate,
-    average_cadence,
-    gear_name,
-    strava_activity_id AS source_reference,
-    created_at
-   FROM exercise.cardio_activities;
+SELECT 'cardio'::text AS kind,
+    cardio_activities.activity_category AS category,
+    cardio_activities.started_at,
+    cardio_activities.timezone,
+    cardio_activities.duration_seconds,
+    cardio_activities.average_heartrate AS avg_hr,
+    cardio_activities.max_heartrate AS max_hr,
+    cardio_activities.calories_kcal,
+    cardio_activities.perceived_exertion,
+    cardio_activities.device_name,
+    'strava'::text AS source_app,
+    cardio_activities.strava_activity_id::text AS source_reference,
+    jsonb_strip_nulls(jsonb_build_object('activity_name', cardio_activities.activity_name, 'sport_type', cardio_activities.sport_type, 'is_treadmill', cardio_activities.is_treadmill, 'moving_seconds', cardio_activities.moving_seconds, 'distance_m', cardio_activities.distance_m, 'elevation_gain_m', cardio_activities.elevation_gain_m, 'average_speed_mps', cardio_activities.average_speed_mps, 'max_speed_mps', cardio_activities.max_speed_mps, 'average_cadence', cardio_activities.average_cadence, 'gear_name', cardio_activities.gear_name)) AS details,
+    'cardio_activities'::text AS source_table,
+    cardio_activities.cardio_activity_id AS source_id,
+    cardio_activities.created_at,
+    cardio_activities.updated_at
+   FROM exercise.cardio_activities
+UNION ALL
+ SELECT 'strength'::text AS kind,
+    'strength'::text AS category,
+    strength_sessions.started_at,
+    NULL::text AS timezone,
+    strength_sessions.duration_seconds,
+    strength_sessions.avg_hr,
+    strength_sessions.max_hr,
+    strength_sessions.calories_kcal,
+    strength_sessions.perceived_exertion,
+    strength_sessions.device_name,
+    strength_sessions.source_app,
+    COALESCE(strength_sessions.strava_activity_id::text, strength_sessions.source_activity_id) AS source_reference,
+    jsonb_strip_nulls(jsonb_build_object('activity_name', strength_sessions.activity_name, 'total_active_sets', strength_sessions.total_active_sets, 'total_exercises', strength_sessions.total_exercises)) AS details,
+    'strength_sessions'::text AS source_table,
+    strength_sessions.strength_session_id AS source_id,
+    strength_sessions.created_at,
+    strength_sessions.updated_at
+   FROM exercise.strength_sessions
+UNION ALL
+ SELECT 'movement'::text AS kind,
+    other_exercises.activity_type AS category,
+    other_exercises.started_at,
+    other_exercises.timezone,
+    other_exercises.duration_seconds,
+    other_exercises.avg_hr,
+    other_exercises.max_hr,
+    other_exercises.calories_kcal,
+    other_exercises.perceived_exertion,
+    other_exercises.device_name,
+    other_exercises.source_app,
+    COALESCE(other_exercises.strava_activity_id::text, other_exercises.source_activity_id) AS source_reference,
+    jsonb_strip_nulls(jsonb_build_object('activity_name', other_exercises.activity_name)) AS details,
+    'other_exercises'::text AS source_table,
+    other_exercises.other_exercise_id AS source_id,
+    other_exercises.created_at,
+    other_exercises.updated_at
+   FROM exercise.other_exercises;
 ```
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `activity_source_table` | `text` | yes |  |  |
-| `activity_source_id` | `integer` | yes |  |  |
-| `activity_category` | `text` | yes |  |  |
-| `sport_type` | `text` | yes |  |  |
-| `activity_name` | `text` | yes |  |  |
-| `is_treadmill` | `boolean` | yes |  |  |
+| `kind` | `text` | yes |  |  |
+| `category` | `text` | yes |  |  |
 | `started_at` | `timestamp with time zone` | yes |  |  |
+| `timezone` | `text` | yes |  |  |
 | `duration_seconds` | `integer` | yes |  |  |
-| `moving_seconds` | `integer` | yes |  |  |
-| `distance_m` | `numeric(10,2)` | yes |  |  |
-| `elevation_gain_m` | `numeric(8,2)` | yes |  |  |
+| `avg_hr` | `numeric(5,1)` | yes |  |  |
+| `max_hr` | `numeric(5,1)` | yes |  |  |
 | `calories_kcal` | `integer` | yes |  |  |
-| `average_heartrate` | `numeric(5,1)` | yes |  |  |
-| `max_heartrate` | `numeric(5,1)` | yes |  |  |
-| `average_cadence` | `numeric(5,1)` | yes |  |  |
-| `gear_name` | `text` | yes |  |  |
-| `source_reference` | `bigint` | yes |  |  |
+| `perceived_exertion` | `integer` | yes |  |  |
+| `device_name` | `text` | yes |  |  |
+| `source_app` | `text` | yes |  |  |
+| `source_reference` | `text` | yes |  |  |
+| `details` | `jsonb` | yes |  |  |
+| `source_table` | `text` | yes |  |  |
+| `source_id` | `integer` | yes |  |  |
 | `created_at` | `timestamp with time zone` | yes |  |  |
+| `updated_at` | `timestamp with time zone` | yes |  |  |
 
 ### Table: `exercise.cardio_activities`
-One row per completed cardio activity synced from Strava. Covers runs, walks, hikes, rides, and other cardio. Grain: one activity. Source payload is in system.strava_inbound.
+One row per completed cardio activity synced from Strava. Covers runs, walks, hikes, rides, and swims. Non-distance activities (yoga, pilates, climbing, etc.) live in exercise.other_exercises; strength sessions live in exercise.strength_sessions. Grain: one activity. Source payload is in system.strava_inbound.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -161,7 +197,7 @@ One row per completed cardio activity synced from Strava. Covers runs, walks, hi
 | `strava_activity_id` | `bigint` | no |  | Strava activity ID. Unique — update events overwrite via application upsert logic, not new rows. |
 | `activity_name` | `text` | no |  |  |
 | `sport_type` | `text` | no |  | Raw Strava sport_type string, e.g. Run, Walk, Ride, TrailRun, VirtualRun, Hike. |
-| `activity_category` | `text` | no |  | Normalised Project B category. Values: run, walk, ride, swim, other_cardio. |
+| `activity_category` | `text` | no |  | Normalised Project B category. Values for rows written on/after 2026-05-26: run, walk, ride, swim. Legacy value: other_cardio (historical rows from before non-distance activities were routed to exercise.other_exercises — never produced by the current classifier). |
 | `is_treadmill` | `boolean` | no | false | True when Strava trainer=true, indicating a treadmill or indoor trainer session. No GPS data. |
 | `started_at` | `timestamp with time zone` | no |  |  |
 | `timezone` | `text` | no |  |  |
@@ -208,6 +244,31 @@ Per-km lap data for each cardio activity. One row per Garmin auto-lap (typically
 | `grade_adjusted_speed_mps` | `numeric(6,3)` | yes |  | Speed adjusted for gradient — normalises uphill effort to flat equivalent. From splits_metric.average_grade_adjusted_speed. |
 | `pace_zone` | `integer` | yes |  | Strava pace zone (1–5) for this lap. Null for walks and some outdoor activities. |
 | `created_at` | `timestamp with time zone` | no | now() |  |
+
+### Table: `exercise.other_exercises`
+One row per completed activity that is neither distance-based cardio (run/walk/ride/swim) nor strength training. Catches yoga, pilates, rock climbing, and any future Strava sport_type that does not match an explicit cardio or strength bucket. Source-agnostic: source_app + source_activity_id identify the origin platform; same shape as exercise.strength_sessions for cross-source ingestion. No splits or sets sub-table — grain is one session, with type-specific fields in meta.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `other_exercise_id` | `integer` | no | nextval('exercise.other_exercises_other_exercise_id_seq'::regclass) | Surrogate primary key. |
+| `strava_inbound_id` | `integer` | yes |  | Loose FK to system.strava_inbound row that triggered this save. NULL when the row did not originate from a Strava webhook (e.g. manual entry or future direct-source ingestion). |
+| `strava_activity_id` | `bigint` | yes |  | Strava activity ID. NULL when not Strava-triggered. Unique when present — update events overwrite via application upsert logic, not new rows. |
+| `source_app` | `text` | no | 'strava'::text | Platform that recorded the session. strava = Strava webhook (today). Future: garmin (direct Garmin Connect ingest), apple_health, manual. |
+| `inbound_row_id` | `integer` | yes |  | Loose FK into the relevant raw inbound table — strava_inbound_id when source_app=strava. No PG foreign key because the target table varies by source. |
+| `source_activity_id` | `text` | yes |  | Activity ID in the source platform. TEXT to accommodate non-integer IDs from future sources. |
+| `activity_type` | `text` | no |  | Normalised activity type. Examples: yoga, pilates, climbing. Free-form text validated in app code only (no CHECK constraint) so new types can be added without a migration. |
+| `activity_name` | `text` | yes |  | Session name as recorded in the source platform, e.g. "Lunchtime Vinyasa" or the raw Strava activity name. |
+| `started_at` | `timestamp with time zone` | no |  | UTC timestamp when the session began. |
+| `timezone` | `text` | yes |  | IANA timezone string at the time of the activity, e.g. Asia/Bangkok. From the source platform when available. |
+| `duration_seconds` | `integer` | yes |  | Total elapsed session duration in seconds, as reported by the source platform. |
+| `avg_hr` | `numeric(5,1)` | yes |  | Average heart rate across the full session, in bpm, from the source platform summary. |
+| `max_hr` | `numeric(5,1)` | yes |  | Peak heart rate recorded during the session, in bpm. |
+| `calories_kcal` | `integer` | yes |  | Active calories burned as reported by the source platform. NULL when not available. |
+| `perceived_exertion` | `integer` | yes |  | RPE 1–10, B-reported via Telegram. NULL until reported. Not device-recorded. |
+| `device_name` | `text` | yes |  | Name of the recording device, e.g. Garmin Forerunner 265. NULL when not available from source. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific and type-specific fields not promoted to dedicated columns. Examples — climbing: {"hardest_grade": "V4", "route_count": 8}; yoga: {"style": "vinyasa", "instructor": "..."}; strava provenance: {"external_id": "garmin_ping_..."}. Keeps schema stable as new activity types arrive. |
+| `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp (UTC). |
+| `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp (UTC). Set on any correction or re-sync. |
 
 ### Table: `exercise.strength_sessions`
 One row per strength training session. Source-agnostic: source_app + source_activity_id identify the origin platform. inbound_row_id is a loose FK into whichever raw inbound table applies (system.garmin_inbound today).

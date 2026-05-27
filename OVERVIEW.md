@@ -2,7 +2,7 @@
 
 ## Status
 
-**Live domains:** food logging, weight, sleep/wake, location, attention, exercise (Strava cardio).
+**Live domains:** food logging, weight, sleep/wake, location, attention, exercise (Strava cardio + Garmin strength + other).
 
 - Food: text, voice, and photo (nutrition label + visual estimation). Quoted-reply corrections supported.
 - Weight: text and voice, regex extraction, range validation.
@@ -11,9 +11,9 @@
 - Attention: starts/finishes `b.attention_sessions` via text or voice using v3 taxonomy — 8 main categories × 24 subcategories with strict DB-enforced pair check (see `domains/attention/TAXONOMY.md`). Starting auto-closes the previous open session; compound "finish X and start Y" messages split into two Telegram bubbles. Quoted-reply corrections scoped to a single session. Co-categorisation of the same activity (e.g. tennis = exercise + social) stored as `+ main : sub` markers in notes and surfaced as `also: main : sub` line in the bubble body; concurrent activities not allowed. End-block footer shows the day's running total per main category, anchored to B's most recent morning-wake event (local-4am fallback when no wake in 24h) in B's current-location timezone. "Wake up" mid-nap closes the open downtime/rest session instead of writing a sleep event. First attention activity of the day with no recent wake auto-inserts a placeholder wake and sends a quote-correctable reminder. `/sleep` closes any open attention session before logging sleep. One-open-session invariant enforced by Postgres partial unique index + advisory lock in app code.
 - Exercise (Strava cardio): webhook receiver; proactive Telegram notifications on create/update/delete; saves to `exercise.cardio_activities` + `exercise.cardio_splits`.
 - Exercise (Garmin strength — live): `WeightTraining`, `Workout`, `Crossfit` from Strava trigger a Garmin Connect fetch. Raw payload stored in `system.garmin_inbound`; parsed into `exercise.strength_sessions` + `exercise.strength_sets`; Telegram notification sent with per-exercise set tables and per-set HR.
+- Exercise (other): everything that isn't cardio or strength — yoga, pilates, climbing, plus any unknown future Strava `sport_type` — saves to `exercise.other_exercises`. Source-agnostic shape (same `source_app` / `source_activity_id` pattern as `strength_sessions`) for future non-Strava ingestion. No splits/sets sub-table; type-specific extras land in `meta`. Telegram notification reuses the cardio format (duration + HR + calories, no distance line).
 
 **In progress:**
-- Exercise strength module (`exercise/strength`) — live; pending merge to master
 - Nutrition data quality (`feat/nutrition-improvements`) — USDA integration, Open Food Facts, food type classifier, mixed photo+caption bug fix
 - Expense logging (`feat/expense-logging`, Codex) — text and photo receipt logging to `finances` schema
 - Menu scraper (`inbound/menus/`) — **live**. FitFuel + Jones Salad direct fetch; WongNai direct delivery HTML via `curl_cffi`; Leanlicious macros enriched from LINE Shopping product pages. Writes to `external_data.menu_items`; query current menu via the `external_data.menu_current` view. Weekly Cloud Scheduler job pending setup.

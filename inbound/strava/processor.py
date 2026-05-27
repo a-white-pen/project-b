@@ -4,9 +4,12 @@ and sends proactive Telegram notifications.
 
 Functions:
   process_activity_event(strava_inbound_id, activity_id, aspect_type) — fetches Strava activity,
-      saves to exercise.cardio_activities + cardio_splits (cardio), or routes to Garmin
-      processor (strength); sends Telegram notification for cardio only
-  process_delete_event(strava_inbound_id, activity_id) — deletes a cardio activity row and notifies B
+      then dispatches by classified category: cardio → exercise.cardio_activities + cardio_splits,
+      strength → Garmin processor (which writes strength_sessions/strength_sets), other →
+      exercise.other_exercises. Sends Telegram notification for cardio and other; Garmin processor
+      handles its own notification for strength.
+  process_delete_event(strava_inbound_id, activity_id) — deletes from cardio_activities,
+      strength_sessions, and other_exercises (we don't know which family); notifies B
   _exchange_token()                                      — exchanges refresh token for access token
   _fetch_activity(access_token, activity_id)             — fetches full activity detail from Strava API
   _activity_label(sport_type, category, is_treadmill)          — maps sport_type to readable label
@@ -22,8 +25,18 @@ import re
 
 import httpx
 
-from domains.exercise.service import delete_cardio_activity, save_cardio_activity
-from domains.exercise.strength_service import delete_strength_session
+from domains.exercise.service import (
+    delete_cardio_activity,
+    delete_other_exercise,
+    ensure_single_exercise_family,
+    save_strava_activity,
+    strava_activity_lock,
+)
+from domains.exercise.strength_service import (
+    delete_strength_session,
+    strength_session_exists,
+    update_strength_session_strava_fields,
+)
 from inbound.garmin.processor import process_strength_event
 from system.config import get_strava_config
 from system.db import get_connection
@@ -50,25 +63,72 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
                   activity_id=activity_id,
                   sport_type=activity.get("sport_type"))
 
-        saved, activity_category = save_cardio_activity(strava_inbound_id, activity)
+        # save_strava_activity is the single dispatcher: classifies, writes
+        # cardio / other, and sweeps sibling tables on successful write. For
+        # strength it returns (False, "strength") WITHOUT writing or sweeping
+        # so the strength branch below can distinguish a benign update from a
+        # re-tag (only this code has the aspect_type context).
+        saved, activity_category = save_strava_activity(strava_inbound_id, activity)
 
         if activity_category == "strength":
-            # Only process on create — update events for the same activity would
-            # insert duplicate strength_sessions rows. Garmin data doesn't change
-            # meaningfully on Strava updates, so safe to skip.
-            if aspect_type != "create":
-                log_event(logger, logging.INFO, "strava_strength_update_skipped",
+            # Hold the per-activity advisory lock for the duration of the
+            # strength orchestration so concurrent edits (e.g. WT → Yoga → WT)
+            # can't race save_other_exercise's sweep against this branch's
+            # ensure_single_exercise_family call. save_strava_activity itself
+            # already returned without acquiring the lock for the strength
+            # path — orchestration lives here.
+            with strava_activity_lock(activity_id):
+                # Two distinct UPDATE cases:
+                #   (a) Update of an existing strength activity (e.g. B renamed
+                #       it or tweaked RPE in Strava). Garmin data is unchanged
+                #       on the Strava side; re-fetching would create duplicate
+                #       raw inbound rows and burn Garmin API quota. Skip the
+                #       Garmin fetch but DO propagate Strava-owned fields.
+                #   (b) Update that's actually a RE-TAG from another family
+                #       (Run → WeightTraining): no strength row exists yet for
+                #       this activity_id. MUST proceed: trigger the Garmin
+                #       fetch so the strength row gets created. Sibling sweep
+                #       happens AFTER the strength row is confirmed to exist.
+                already_exists = strength_session_exists(activity_id)
+                if aspect_type != "create" and already_exists:
+                    # Benign Strava-side edit. No Garmin re-fetch (data
+                    # unchanged there) but propagate Strava-owned fields B may
+                    # have tweaked: activity name, perceived_exertion, calories.
+                    update_strength_session_strava_fields(activity_id, activity)
+                    log_event(logger, logging.INFO, "strava_strength_update_skipped",
+                              strava_inbound_id=strava_inbound_id,
+                              activity_id=activity_id,
+                              aspect_type=aspect_type)
+                    return
+                # CREATE OR re-tag → hand off to Garmin. The Garmin processor
+                # has its own retry/save flow with no return value, so we
+                # re-check strength_session_exists afterwards to decide whether
+                # to sweep siblings. If Garmin matching fails, sets are empty,
+                # or save fails for any reason, the old cardio/other sibling
+                # row stays in place — better a duplicate than data loss, since
+                # Strava has already received 200 OK and will not retry.
+                log_event(logger, logging.INFO, "strava_strength_handed_to_garmin",
                           strava_inbound_id=strava_inbound_id,
                           activity_id=activity_id,
-                          aspect_type=aspect_type)
+                          aspect_type=aspect_type,
+                          was_retag=(not already_exists and aspect_type != "create"))
+                process_strength_event(strava_inbound_id, activity)
+
+                # Post-fetch sweep: only sweep if a strength row now exists
+                # for this activity_id. The strength_session_exists lookup is
+                # cheap (single SELECT 1) and is correct for both the create
+                # and re-tag paths — newly-saved rows return True, failed
+                # saves return False.
+                if strength_session_exists(activity_id):
+                    ensure_single_exercise_family(activity_id, keep="strength")
+                else:
+                    log_event(logger, logging.WARNING,
+                              "strava_strength_save_failed_siblings_preserved",
+                              strava_inbound_id=strava_inbound_id,
+                              activity_id=activity_id,
+                              aspect_type=aspect_type,
+                              was_retag=(not already_exists and aspect_type != "create"))
                 return
-            # Hand off to Garmin processor — it owns the fetch, storage, and
-            # notification for strength sessions. No Telegram message sent from here.
-            log_event(logger, logging.INFO, "strava_strength_handed_to_garmin",
-                      strava_inbound_id=strava_inbound_id,
-                      activity_id=activity_id)
-            process_strength_event(strava_inbound_id, activity)
-            return
 
         chat_id = get_latest_chat_id()
         if chat_id is None:
@@ -97,10 +157,32 @@ def process_delete_event(strava_inbound_id: int, activity_id: int) -> None:
     log_event(logger, logging.INFO, "strava_delete_started",
               strava_inbound_id=strava_inbound_id, activity_id=activity_id)
     try:
-        # Try both table families — we don't know from the delete event which type it was.
-        cardio_deleted = delete_cardio_activity(activity_id)
-        strength_deleted = delete_strength_session(activity_id)
-        deleted = cardio_deleted or strength_deleted
+        # Try all three table families — we don't know from the delete event
+        # which type the activity was. Per-table try/except so a transient DB
+        # error on an empty/non-owning table can't block the delete on the
+        # actual owning table. Holding the per-activity advisory lock keeps
+        # concurrent saves of the same activity_id from racing this cleanup.
+        deleted_tables: list[str] = []
+        with strava_activity_lock(activity_id):
+            for label, fn in (
+                ("cardio_activities", delete_cardio_activity),
+                ("strength_sessions", delete_strength_session),
+                ("other_exercises", delete_other_exercise),
+            ):
+                try:
+                    if fn(activity_id):
+                        deleted_tables.append(label)
+                except Exception as e:
+                    log_failure(
+                        logger,
+                        logging.WARNING,
+                        "strava_delete_table_failed",
+                        e,
+                        strava_inbound_id=strava_inbound_id,
+                        activity_id=activity_id,
+                        failed_table=label,
+                    )
+        deleted = bool(deleted_tables)
 
         chat_id = get_latest_chat_id()
         if chat_id is None:
@@ -117,7 +199,8 @@ def process_delete_event(strava_inbound_id: int, activity_id: int) -> None:
         if message_id is not None:
             store_outbound(message_id, sent_payload)
         log_event(logger, logging.INFO, "strava_delete_notification_sent",
-                  strava_inbound_id=strava_inbound_id, activity_id=activity_id, deleted=deleted)
+                  strava_inbound_id=strava_inbound_id, activity_id=activity_id,
+                  deleted=deleted, deleted_tables=deleted_tables)
 
     except Exception as e:
         log_failure(logger, logging.ERROR, "strava_delete_failed", e,
@@ -201,7 +284,7 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
     has_distance = (
         distance_m is not None
         and distance_m > 0
-        and activity_category in ("run", "walk", "ride", "swim", "other_cardio")
+        and activity_category in ("run", "walk", "ride", "swim")
     )
 
     # Line 1: activity name (bold) — type label
@@ -230,7 +313,7 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
         stat3_parts.append(f"❤️ {int(avg_hr)} avg")
     if calories:
         stat3_parts.append(f"🔥 {int(calories)} kcal")
-    if cadence and activity_category in ("run", "walk", "ride", "swim", "other_cardio"):
+    if cadence and activity_category in ("run", "walk", "ride", "swim"):
         stat3_parts.append(f"👟 {int(cadence)} spm")
     if stat3_parts:
         lines.append(" · ".join(stat3_parts))
@@ -238,9 +321,11 @@ def _format_notification(activity: dict, aspect_type: str, saved: bool, activity
     if not saved:
         lines.append("<i>Not yet saved.</i>")
 
-    # Per-km splits block
+    # Per-km splits block — only cardio rows have splits in exercise.cardio_splits.
+    # Strength is handled out-of-band by the Garmin processor, and other_exercises
+    # has no splits sub-table. Skip the DB call for non-cardio categories.
     strava_activity_id = activity.get("id")
-    if strava_activity_id:
+    if strava_activity_id and activity_category in ("run", "walk", "ride", "swim"):
         splits = _fetch_splits(strava_activity_id)
         if splits:
             lines.append("")

@@ -37,13 +37,29 @@ Telegram servers
 
 **Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food`, `attention`, `sleep_wake`, and `weight`.
 
-### Flow 2 — Strava strength activity (WeightTraining / Workout / Crossfit)
+### Flow 2 — Strava activity dispatch (three destinations)
+
+`inbound/strava/processor.process_activity_event` calls `domains.exercise.service.save_strava_activity` — the single dispatcher used by both the live webhook and the historical backfill. It classifies the Strava `sport_type` and writes to the right table (cardio or other), then sweeps sibling exercise tables AFTER the successful save so the activity lives in exactly one family (handles Strava re-tag scenarios). For `strength`, it returns without writing or sweeping — the processor itself handles the Garmin orchestration because only the processor has the `aspect_type` context needed to distinguish a benign update from a re-tag.
+
+| sport_type | Category returned | Destination | Sweep timing |
+|---|---|---|---|
+| Run / TrailRun / VirtualRun / Treadmill | `run` | `exercise.cardio_activities` + `exercise.cardio_splits` | post-save in `save_strava_activity` |
+| Walk / Hike | `walk` | same | post-save |
+| Ride / VirtualRide / EBikeRide / MountainBikeRide / GravelRide / Velomobile | `ride` | same | post-save |
+| Swim / OpenWaterSwim | `swim` | same | post-save |
+| WeightTraining / Workout / Crossfit | `strength` | handed off to Garmin (see below); no row written from `save_strava_activity` itself | post-fetch in `process_activity_event`, only if `strength_session_exists` returns True afterwards |
+| Everything else (Yoga, Pilates, RockClimbing, future Strava types) | `other` | `exercise.other_exercises` | post-save |
+
+**Sweep-after-save discipline:** sibling sweeps run only after the destination row is confirmed to exist. A save failure (DB error, Garmin no-match, empty exercise sets) leaves the pre-existing row in the old sibling table untouched — better a recoverable duplicate than data loss, since the Strava webhook returns 200 OK before this code runs and Strava will not retry.
+
+**Strength sub-flow:** when category is `strength`, the processor first checks `strength_session_exists(activity_id)`. If the row already exists AND `aspect_type` is `update`, this is a benign Strava-side edit (name, RPE) — skip the Garmin re-fetch to avoid duplicate raw inbound rows. Otherwise (CREATE or re-tag from another family) hand off to Garmin, then re-check `strength_session_exists` after the call. Sibling sweep runs only on the post-fetch check.
 
 ```
-Strava webhook (existing)
-  → POST /strava/webhook (existing)
+Strava webhook
+  → POST /strava/webhook
   → inbound/strava/processor.py
-      → save_cardio_activity() returns (False, "strength") — no cardio row written
+      → save_strava_activity() returns (False, "strength") — no row written, no sweep
+      → if aspect_type=update AND strength_session_exists → log + return (benign update)
       → inbound/garmin/processor.process_strength_event() [background, same thread]
           → inbound/garmin/client.get_garmin_client()
               → system.garmin_tokens          hydrate session (or login fresh + persist)
@@ -53,9 +69,15 @@ Strava webhook (existing)
           → retries at +90s / +240s / +600s  if Garmin hasn't synced yet
           → exercise.strength_sessions + exercise.strength_sets  if exercise_sets non-empty
           → telegram/replies.py    proactive notification with per-exercise set tables + per-set HR
+      → if strength_session_exists post-fetch → ensure_single_exercise_family(keep="strength")
+          (re-tag cleanup; failed Garmin save leaves old cardio/other row in place)
 ```
 
 No new webhook route needed — Garmin is polled in response to the Strava trigger.
+
+**Other sub-flow:** when category is `other`, `save_strava_activity` calls `save_other_exercise` (idempotent upsert via UNIQUE on `strava_activity_id`); on successful save, sweeps sibling tables; then the processor falls through to the same cardio notification path. No splits/sets sub-table; type-specific extras live in `meta`. The table is source-agnostic (same shape as `strength_sessions`) so future non-Strava ingestion plugs in without schema change.
+
+**Delete dispatch:** `process_delete_event` tries `delete_cardio_activity`, `delete_strength_session`, and `delete_other_exercise` — whichever finds a row deletes it. Strava doesn't tell us which family the deleted activity belonged to.
 
 ### Flow 3 — A reminder fires *(not yet implemented)*
 

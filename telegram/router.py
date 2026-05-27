@@ -64,7 +64,7 @@ The user is one person tracking nutrition, body metrics, training, expenses, and
 Classify the message into exactly one of these intents:
 - log_food: logging specific food items, meals consumed, or nutrition/macros (text description or photo of food/nutrition label)
 - log_weight: logging body weight or body measurements — a bare number like "57.1" or "57.1 kg" always means weight in this context
-- log_sleep: user is explicitly logging that they are going to sleep — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", "orh orh", "orh orh kun", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange.
+- log_sleep: user is explicitly logging that they are going to NIGHT-SLEEP — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", "orh orh", "orh orh kun", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange. Naps are NOT log_sleep — see the nap rule below under Disambiguation.
 - log_wake: user is explicitly logging that they just woke up — strong signals: "just woke up", "woke up", "wakey wakey", "rise and shine", sunrise emoji alone (🌅). A standalone "good morning" or "morning" with no conversational context may qualify. Do NOT classify as log_wake if the message is clearly a conversational greeting opening a chat.
 - log_expense: logging money spent or a receipt (text or photo)
 - log_attention: logging an attention/activity session start or finish — what the user is doing, working on, reading, watching, eating, cooking, commuting, resting, grooming/showering, or spending time on. Examples: "working on Project B", "I go cook dinner now", "finish lunch", "prep breakfast", "coffee break", "order food", "go poop", "go mum mum" (eat), "go pong pong" (shower/bathe), "done with attention module", "watching Succession"
@@ -79,7 +79,8 @@ Caption: {caption}
 Disambiguation:
 - "ate chicken rice", "had eggs", a dish name, a food photo, or nutrition numbers = log_food.
 - "go cook dinner", "prep breakfast", "eat lunch", "finish lunch", "coffee break", "order food", "go mum mum", "finish mum mum", "cooking", or meal words used as time/activity boundaries without specific food items = log_attention.
-- Baby-talk terms may arrive literally from voice transcription: "orh orh" or "orh orh kun" = log_sleep; "mum mum" = eating activity; "pong pong" = shower/bathe activity.
+- Naps are log_attention (downtime/rest), NOT log_sleep. Signals: "nap nap", "napping", "taking a nap", "having a nap", "power nap", "lie down for a bit". log_sleep is reserved for going to bed for night sleep.
+- Baby-talk terms may arrive literally from voice transcription: "orh orh" or "orh orh kun" = log_sleep; "mum mum" = eating activity; "pong pong" = shower/bathe activity; "nap nap" = nap (log_attention, downtime/rest).
 
 Respond with only the intent name. Nothing else."""
 

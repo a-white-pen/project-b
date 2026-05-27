@@ -11,6 +11,12 @@ Functions:
       enforces this at the database level too.
   delete_strength_session(strava_activity_id) — deletes a strength session (and its sets
       via CASCADE) by Strava activity ID; returns True if a row was deleted.
+  strength_session_exists(strava_activity_id) — True if a row exists for this Strava
+      activity ID; used by the Strava processor to distinguish benign updates from
+      re-tag cases (Run/Yoga → WeightTraining).
+  update_strength_session_strava_fields(strava_activity_id, activity) — updates
+      Strava-owned columns (name, RPE, calories) on an existing strength row
+      without re-fetching Garmin. Used by the processor on benign Strava UPDATEs.
   parse_active_sets(exercise_sets, hr_samples, session_start_str) — converts raw Garmin
       set list to normalised dicts; REST rows are folded into rest_seconds_after on the
       preceding active set.
@@ -424,6 +430,111 @@ def save_strength_session(
         return None, [], False
     finally:
         conn.close()
+
+
+# Updates Strava-owned fields on an existing strength_sessions row without
+# re-fetching Garmin. Called by the Strava processor on UPDATE events for an
+# activity that already has a strength row — B may have renamed it, tweaked
+# perceived_exertion, or cleared RPE in the Strava UI. Garmin-owned fields
+# (sets, HR samples, durations parsed from exercise_sets) are NOT touched.
+#
+# Semantics — key-presence wins over null-coalesce:
+#   - Key PRESENT in the activity dict (value can be a number, string, OR None)
+#     → write that value, including overwriting to NULL when Strava explicitly
+#     sent null (e.g. B cleared RPE in Strava).
+#   - Key ABSENT from the activity dict → don't touch the column.
+# This preserves user intent: an explicit clear must propagate.
+#
+# Inputs: strava_activity_id from the webhook; fresh Strava activity dict.
+# Outputs: True if a row was updated, False if no row matched, no field
+# applicable, or on DB failure.
+def update_strength_session_strava_fields(strava_activity_id: int, activity: dict) -> bool:
+    # Strava → DB column mapping for fields B can edit on the Strava side.
+    # "name" is keyed differently between Strava and our schema.
+    set_clauses: list[str] = []
+    params: list = []
+
+    if "name" in activity:
+        set_clauses.append("activity_name = %s")
+        params.append(activity["name"])
+    if "perceived_exertion" in activity:
+        set_clauses.append("perceived_exertion = %s")
+        params.append(activity["perceived_exertion"])
+    if "calories" in activity:
+        # Strava reports calories as float; our column is integer. Round when
+        # present, write NULL when Strava explicitly cleared it.
+        cal = activity["calories"]
+        params.append(int(cal) if cal is not None else None)
+        set_clauses.append("calories_kcal = %s")
+
+    if not set_clauses:
+        # No Strava-owned fields present in this payload — nothing to do.
+        return False
+
+    set_clauses.append("updated_at = now()")
+    sql = (
+        f"UPDATE exercise.strength_sessions SET {', '.join(set_clauses)} "
+        "WHERE strava_activity_id = %s"
+    )
+    params.append(strava_activity_id)
+
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    updated = cur.rowcount > 0
+            if updated:
+                log_event(
+                    logger, logging.INFO, "strength_session_strava_fields_updated",
+                    strava_activity_id=strava_activity_id,
+                    # Log which fields actually went into the UPDATE (regardless
+                    # of whether values were null/cleared or set).
+                    fields_written=[c.split(" =", 1)[0] for c in set_clauses if c != "updated_at = now()"],
+                )
+            return updated
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(
+            logger, logging.WARNING, "strength_session_strava_update_failed", e,
+            strava_activity_id=strava_activity_id,
+        )
+        return False
+
+
+# Returns True if a strength_sessions row exists for this Strava activity ID.
+# Used by the Strava processor to distinguish two cases for UPDATE webhooks
+# whose sport_type is WeightTraining/Workout/Crossfit:
+#   - row already exists → benign Strava-side update (e.g. name/RPE tweak),
+#     skip the Garmin re-fetch to avoid duplicate raw inbound rows
+#   - row missing → this is a re-tag from another sport_type (e.g. Run → WT),
+#     proceed with the sibling sweep + Garmin fetch so the new strength row
+#     gets created
+# Inputs: strava_activity_id from the webhook payload.
+# Outputs: True/False. Returns False on DB failure (caller treats as "unknown"
+# and proceeds with the fetch — safer than silently skipping a re-tag).
+def strength_session_exists(strava_activity_id: int) -> bool:
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM exercise.strength_sessions"
+                        " WHERE strava_activity_id = %s LIMIT 1",
+                        (strava_activity_id,),
+                    )
+                    return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(
+            logger, logging.WARNING, "strength_session_exists_lookup_failed", e,
+            strava_activity_id=strava_activity_id,
+        )
+        return False
 
 
 # Deletes a strength session and its sets (via CASCADE) by Strava activity ID.

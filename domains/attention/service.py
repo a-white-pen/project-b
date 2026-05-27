@@ -204,9 +204,9 @@ Rules:
   - "finish lunch and start coding" → start_session, category=work, subcategory=deep_work, description="coding"
   - "done with project b, going to get thai massage now" → start_session, category=self_care, subcategory=personal_care, description="thai massage"
   - "finish breakfast, go work on nutrition module" → start_session, category=work, subcategory=deep_work, description="work on nutrition module"
-- Pure-start messages also use start_session: "working on Project B", "prep breakfast", "eat lunch", "go mum mum", "watching Succession", "scrolling TikTok", "learning about RAG", "go poop", "go pong pong".
+- Pure-start messages also use start_session: "working on Project B", "prep breakfast", "eat lunch", "go mum mum", "watching Succession", "scrolling TikTok", "learning about RAG", "go poop", "go pong pong", "nap nap" / "taking a nap" / "napping".
 - Actual night sleep is not an attention session. If B says she is sleeping, still choose the closest action only if the router already sent it here, but use category "downtime" subcategory "rest" and description "sleep mention routed to attention".
-- Naps are downtime / rest.
+- Naps are downtime / rest. Examples: "nap nap" → start_session, category=downtime, subcategory=rest, description="nap"; "taking a power nap" → same with description="power nap".
 - "pong pong" means shower/bathe; use self_care / personal_care with description "shower".
 - Keep description concise but specific. Preserve Chinese characters if B used them.
 - Do not invent a project. Use null when there is no clear project/context.
@@ -1054,7 +1054,10 @@ def _format_session_block(verb: str, session: dict, now_utc: datetime) -> str:
     if project:
         lines.append(f"project: {escape(str(project))}")
     for co_cat, co_sub in co_cats:
-        lines.append(f"also: {escape(co_cat)} : {escape(co_sub)}")
+        # Reuse _format_category_label so the also line carries the same colour
+        # block + bold "main : sub" treatment as the primary category. The
+        # "also: " prefix keeps the visual subordination clear.
+        lines.append(f"also: {_format_category_label(co_cat, co_sub)}")
     lines.append(f'<i>"{description}"</i>')
     if is_closed:
         ended_local = ended_at.astimezone(tz)
