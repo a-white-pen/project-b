@@ -23,7 +23,7 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 | Attention | Starts and finishes attention sessions on a 2-level taxonomy (8 main × 24 subcategories — see `domains/attention/TAXONOMY.md`). Auto-closes previous open session on new start. Compound "finish X and start Y" messages produce two reply bubbles. Per-end-block footer shows the day's total per main category in local timezone. Co-categorisation (e.g. tennis = exercise + social) stored in notes and surfaced in the bubble. Quoted-reply corrections scoped per session. "Wake up" mid-nap closes the nap instead of writing a sleep event. |
 | Exercise | Strava webhook: receives activity events, saves cardio runs/rides/swims/walks to `exercise.cardio_activities`, sends proactive Telegram notifications. Handles create, update, and delete. Strength sessions (WeightTraining/Workout/Crossfit) trigger a Garmin Connect fetch; exercise sets + HR are parsed and saved to `exercise.strength_sessions` / `exercise.strength_sets` with a per-exercise set notification. Everything else (yoga, pilates, climbing, plus unknown future Strava sport_types) lands in `exercise.other_exercises` with its own notification. |
 
-**In progress:** nutrition data quality (USDA + Open Food Facts integration), expense logging.
+**In progress:** aligner / Invisalign (`feat/aligner-module`, not yet merged) — IN/OUT tracking via a persistent `🦷 IN` / `🍽️ OUT` reply keyboard writing `b.aligner_wear_events`, per-arch tray tracking in `b.aligner_tray_changes` (spawned/reconciled from quoted IN/OUT corrections), `/aligner_status` read command; nutrition data quality (USDA + Open Food Facts integration); expense logging.
 
 **Stub:** general ask, data query.
 

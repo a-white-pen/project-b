@@ -28,7 +28,7 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 
 | Schema | Owns |
 |---|---|
-| `b` | B's personal measurements — weight, sleep/wake events, attention sessions, body metrics, location |
+| `b` | B's personal measurements — weight, sleep/wake events, attention sessions, aligner wear events + tray changes, body metrics, location |
 | `nutrition` | Food logs and meal data |
 | `finances` | Spend and transactions |
 | `exercise` | Cardio activities (run/walk/ride/swim), strength sessions (WeightTraining/Workout/Crossfit), and other_exercises (yoga, pilates, climbing, etc.). Unified read via the `exercise.activities` view. |
@@ -70,7 +70,7 @@ Every table should have:
 
 All timestamps stored as `TIMESTAMPTZ` (UTC internally; Postgres handles conversion).
 
-Date derivation uses B's reported location (stored in `b` schema) to determine local timezone — do not hardcode a timezone. Retrieve B's current location and compute the timezone from it.
+Date derivation uses B's reported location (stored in `b` schema) to determine local timezone — do not hardcode a timezone. Resolve the timezone **point-in-time** via `system/timezone.py::get_timezone(as_of)` — the location B was in *as of the event's timestamp*, not her present location — so historical rows and corrections made after travel use the correct offset (falls back to `b.latest_location`, then Asia/Singapore). See ARCHITECTURE.md.
 
 ---
 
@@ -89,13 +89,13 @@ WHERE scraped_at = (SELECT max(scraped_at) FROM ...)
 
 ## `system.conversation_state` domain constraint
 
-The `domain` column in `system.conversation_state` is protected by a DB-level `CHECK` constraint. **Any domain that saves correction state must be added to this constraint before deploy.** Current allowed values: `food`, `attention`, `weight`, `sleep_wake`, `expense`, `query`.
+The `domain` column in `system.conversation_state` is protected by a DB-level `CHECK` constraint. **Any domain that saves correction state must be added to this constraint before deploy.** Current allowed values: `food`, `attention`, `aligner`, `weight`, `sleep_wake`, `expense`, `query`.
 
 To add a new domain value, propose this SQL to B before writing code:
 ```sql
 ALTER TABLE system.conversation_state DROP CONSTRAINT conversation_state_domain_check;
 ALTER TABLE system.conversation_state ADD CONSTRAINT conversation_state_domain_check
-  CHECK (domain IN ('food', 'attention', 'weight', 'sleep_wake', 'expense', 'query', '<new_domain>'));
+  CHECK (domain IN ('food', 'attention', 'aligner', 'weight', 'sleep_wake', 'expense', 'query', '<new_domain>'));
 ```
 
 Then update the allowed-values list above in this file.

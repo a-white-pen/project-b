@@ -2,7 +2,7 @@
 Manages conversation state for correction chains.
 
 A root row is written whenever a domain handler returns non-None pending_state.
-Food, attention, weight, and sleep/wake handlers write state for quoted corrections.
+Food, attention, aligner, weight, and sleep/wake handlers write state for quoted corrections.
 Correction rows link back via parent_telegram_reply_message_id.
 Thread is reconstructed via recursive CTE joining telegram_outbound and telegram_inbound.
 
@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 # Inserts a row into system.conversation_state.
 # Called by webhook._process_and_reply when a domain handler returns non-None pending_state.
-# Food, attention, weight, and sleep/wake handlers write state for quoted corrections.
+# Food, attention, aligner, weight, and sleep/wake handlers write state for quoted corrections.
 # Inputs:
 #   telegram_reply_message_id       — Telegram message_id of the bot reply (FK to telegram_outbound)
 #   triggering_telegram_update_id   — update_id of the inbound message that triggered this reply
-#   domain                          — domain string ("food", "attention", "weight", "sleep_wake", etc.)
+#   domain                          — domain string ("food", "attention", "aligner", "weight", "sleep_wake", etc.)
 #   context                         — domain-specific structured data (e.g. {food_log_ids, meal_type})
 #   parent_telegram_reply_message_id — None for root rows; quoted bot message_id for correction rows
 def save_state(

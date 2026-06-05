@@ -2,8 +2,9 @@
 Single send path for all outbound Telegram messages.
 
 Functions:
-  send_reply(chat_id, text, reply_to_message_id, parse_mode, bot_token) — sends a text message
-      to the given Telegram chat, optionally quoting a specific message.
+  send_reply(chat_id, text, reply_to_message_id, parse_mode, bot_token, reply_markup) — sends a
+      text message to the given Telegram chat, optionally quoting a specific message and/or
+      attaching a reply_markup (e.g. the aligner persistent keyboard).
       Returns (telegram_message_id, sent_payload) so the caller can log to telegram_outbound.
       telegram_message_id is None if the send failed.
       Pass bot_token explicitly to bypass get_config() (e.g. from scripts without full env).
@@ -33,6 +34,10 @@ _HTML_TAG_RE = re.compile(r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a)(?:\s+
 #         parse_mode (optional — Telegram parse_mode; auto-detected for safe HTML tags),
 #         bot_token (optional — pass explicitly to skip get_config(); useful in scripts
 #                   that don't have the full env set, e.g. replay.py).
+#         reply_markup (optional — Telegram reply_markup dict, e.g. a ReplyKeyboardMarkup.
+#                   Used by the aligner domain to dock the persistent 🦷 IN / 🍽️ OUT keyboard.
+#                   A persistent keyboard, once sent, stays until replaced; replies sent
+#                   without reply_markup leave the existing keyboard intact).
 # Outputs: (telegram_message_id, sent_payload).
 #   telegram_message_id — Telegram's message_id for the sent message; None on failure.
 #   sent_payload        — the full JSON body sent to the API (for outbound logging).
@@ -43,6 +48,7 @@ def send_reply(
     reply_to_message_id: int | None = None,
     parse_mode: str | None = None,
     bot_token: str | None = None,
+    reply_markup: dict | None = None,
 ) -> tuple[int | None, dict]:
     token = bot_token or get_config().telegram_bot_token
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -52,6 +58,8 @@ def send_reply(
         payload["parse_mode"] = resolved_parse_mode
     if reply_to_message_id is not None:
         payload["reply_parameters"] = {"message_id": reply_to_message_id}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
 
     try:
         response = httpx.post(url, json=payload, timeout=10)
@@ -65,6 +73,7 @@ def send_reply(
             message_id=message_id,
             reply_to_message_id=reply_to_message_id,
             text_chars=len(text),
+            has_reply_markup=reply_markup is not None,
         )
         return message_id, payload
     except httpx.HTTPError as e:
@@ -123,8 +132,8 @@ def store_outbound(message_id: int, payload: dict) -> None:
 
 
 # Detects whether a reply uses Telegram-compatible HTML tags and sets parse_mode="HTML".
-# Currently used by the attention domain (activity ended/started/updated/removed replies)
-# and the food domain (per-item replies).
+# Used by the attention domain (activity ended/started/updated/removed replies), the food
+# domain (per-item replies), and the aligner domain (wear/tray/status replies).
 #
 # CONTRACT: any domain that produces replies with HTML formatting tags MUST ensure that
 # all user-provided or LLM-provided content is passed through html.escape() before being

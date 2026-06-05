@@ -3,6 +3,37 @@ _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py
 
 ## Schema: `b`
 
+### Table: `b.aligner_tray_changes`
+One row per Invisalign tray activation per arch. Current tray for an arch is its open row (ended_at NULL); a new tray auto-closes the prior one. Treatment start = earliest started_at.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `aligner_tray_change_id` | `integer` | no | nextval('b.aligner_tray_changes_aligner_tray_change_id_seq'::regclass) | Surrogate primary key. |
+| `arch` | `text` | no |  | Which arch this tray belongs to: upper or lower. Arches advance independently. |
+| `tray_number` | `integer` | no |  | The tray number B switched to for this arch. |
+| `planned_days` | `integer` | yes |  | Dentist's planned wear duration for this tray, in days. Optional. |
+| `started_at` | `timestamp with time zone` | no |  | When B switched to this tray. Primary time dimension. |
+| `ended_at` | `timestamp with time zone` | yes |  | When B switched off this tray, auto-set to the next tray's started_at for the same arch. NULL means this is the current tray. |
+| `notes` | `text` | yes |  | Optional detail or correction note. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Provenance + lifecycle: corrections[]; spawned rows carry start.wear_event_id (source event, for reconcile/cascade) + start.reason=spawned_from_wear_correction; started_at_pinned=true once B directly corrects the start (suppresses auto-retime). |
+| `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp; NULL for rows never changed after insert. |
+
+### Table: `b.aligner_wear_events`
+One row per out-of-mouth event for B's Invisalign aligners (one removal/reinsertion cycle). Open row (reinserted_at NULL) means currently out; out-time per day = sum of events, worn = 24h minus out.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `aligner_wear_event_id` | `integer` | no | nextval('b.aligner_wear_events_aligner_wear_event_id_seq'::regclass) | Surrogate primary key. |
+| `removed_at` | `timestamp with time zone` | no |  | When the aligners came out of the mouth. Primary time dimension for out-time analysis. |
+| `reinserted_at` | `timestamp with time zone` | yes |  | When the aligners were put back in. NULL means this is the currently open event (aligners out right now). |
+| `upper_tray_number` | `integer` | yes |  | Upper-arch tray in use AS-OF removed_at. DERIVED CACHE recomputed from b.aligner_tray_changes (never edited independently); NULL if no tray had started by then. |
+| `lower_tray_number` | `integer` | yes |  | Lower-arch tray in use AS-OF removed_at. DERIVED CACHE recomputed from b.aligner_tray_changes (never edited independently); NULL if no tray had started by then. |
+| `notes` | `text` | yes |  | Optional extra detail or correction note. NULL if nothing useful to add. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance and lifecycle metadata: start/end source, self_reported, telegram_update_id, and a corrections array. |
+| `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use removed_at/reinserted_at for analysis. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp, set when an event is closed or corrected. NULL for rows never changed after insert. |
+
 ### Table: `b.attention_sessions`
 One row per continuous primary-attention interval for B. Grain: one activity session with a start time and optional end time.
 
@@ -379,6 +410,61 @@ Append-only restaurant menu snapshots. Every scrape run appends a new batch; row
 | `scraped_at` | `timestamp with time zone` | no |  | Timestamp shared by all rows in one scrape run. Acts as the batch identifier — use max(scraped_at) per restaurant_name to get the current menu. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insert timestamp. |
 
+## Schema: `finances`
+
+### Table: `finances.fx_lot_allocations`
+Links cash/TrueMoney foreign-currency spends to the fx_lots consumed for SGD cost basis. One spend may consume multiple lots (multi-row set when one lot has insufficient remaining balance). Used only for payment_method in (cash, truemoney). YouTrip and other wallet/card paths use market-rate estimate on the spend row, with breakdown (when blended) in spend_entries.source_meta.fx_rate_breakdown instead of allocation rows. Corrections delete-and-recreate all rows for a spend in a single transaction — do not patch individual allocation rows.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `fx_lot_allocation_id` | `integer` | no | nextval('finances.fx_lot_allocations_fx_lot_allocation_id_seq'::regclass) |  |
+| `spend_entry_id` | `integer` | no |  | FK to finances.spend_entries. ON DELETE CASCADE so spend deletion cleans allocations. |
+| `fx_lot_id` | `integer` | no |  | FK to finances.fx_lots — the lot consumed. |
+| `allocated_amount` | `numeric(12,2)` | no |  | Foreign-currency amount consumed from the lot for this spend. Currency is derivable via JOIN to fx_lots.target_currency_code. |
+| `allocated_sgd_amount` | `numeric(6,2)` | no |  | SGD cost basis consumed from the lot for this spend = allocated_amount * (fx_lots.sgd_cost_amount / fx_lots.target_amount). Sum across rows for a spend equals spend_entries.sgd_amount. |
+| `created_at` | `timestamp with time zone` | no | now() |  |
+
+### Table: `finances.fx_lots`
+Foreign-currency acquisition pool. One row per batch B obtained (e.g. exchanging SGD for THB at SuperRich). Records acquisition only — not spending. FIFO consumption order is (target_currency_code, acquired_at, fx_lot_id). Cash and TrueMoney share the same pool in v1 (no separate TrueMoney wallet model). Supports any target currency. Remaining balance = target_amount - SUM(fx_lot_allocations.allocated_amount); computed at read time, not stored.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `fx_lot_id` | `integer` | no | nextval('finances.fx_lots_fx_lot_id_seq'::regclass) |  |
+| `acquired_at` | `timestamp with time zone` | no |  | When the foreign currency was acquired. Required for FIFO ordering. |
+| `provider_name` | `text` | yes |  | Loose human label for the money changer. Examples: "SuperRich", "Arcade money changer", "Little India money changer", "Chinatown money changer". Free text; not normalised. |
+| `source_currency_code` | `text` | no |  | ISO 4217 of the currency B paid in. Usually SGD. |
+| `source_amount` | `numeric(12,2)` | no |  | Amount paid in source_currency_code. NUMERIC(12,2) — same precision as transaction_amount on spend_entries for symmetry. |
+| `target_currency_code` | `text` | no |  | ISO 4217 of the currency acquired. Examples: THB, JPY, EUR. |
+| `target_amount` | `numeric(12,2)` | no |  | Amount of target currency acquired (the FIFO pool fills this). |
+| `sgd_cost_amount` | `numeric(6,2)` | no |  | SGD cost basis for the lot. Equals source_amount when source_currency_code=SGD. NUMERIC(6,2) caps at S$9,999.99 — same as spend cap. Larger exchanges entered via SQL directly. Effective rate = sgd_cost_amount / target_amount, derived in views. |
+| `notes` | `text` | yes |  | Freeform B-facing notes: caveats, location, photo description, etc. For Telegram-sourced rows, app code defaults this to the original message text. |
+| `source_meta` | `jsonb` | yes |  | Provenance and parser metadata blob. Conventional keys: source_type (text/voice/photo/superrich_receipt/manual), source_reference (receipt number, if any), channel (telegram/manual), telegram_update_id, telegram_file_id, model, vision_parser_version. No secrets. |
+| `created_at` | `timestamp with time zone` | no | now() |  |
+| `updated_at` | `timestamp with time zone` | yes |  |  |
+
+### Table: `finances.spend_entries`
+One row per finance event B is tracking — real spend, pending candidate, or recognised non-spend (topup, bill payment, transfer). Grain: one transaction. SGD is the home currency, capped at NUMERIC(6,2) = max S$9,999.99 per row. Larger spends are out of scope for bot logging — insert via SQL directly. status and missing_fields are not stored; derived in domains/expense/types.py for follow-up decisions and in marts views for reporting. All inbound provenance lives in source_meta — no FK columns.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `spend_entry_id` | `integer` | no | nextval('finances.spend_entries_spend_entry_id_seq'::regclass) |  |
+| `spent_at` | `timestamp with time zone` | no |  | When the transaction occurred. Source timestamp when known (Grab email, OCBC posting, receipt). Telegram text without a stated date: time of the Telegram message in B local time. Relative ("2 days ago"): LLM-resolved local timestamp. Date-only sources: noon local. Bot reply shows resolved value for correction. |
+| `ignored_reason` | `text` | yes |  | NULL = real spend or pending. Non-NULL = recognised non-spend; presence acts as the is_ignored flag. Initial values: youtrip_topup, credit_card_bill_payment, transfer, duplicate, not_spend. |
+| `merchant_name_raw` | `text` | yes |  | Shop or recipient the money went to. Stored as observed — not normalised. Examples: "McDonald's" (GrabFood order), "Cold Storage", "YOU TECHNOLOGIES GROUP" (PayNow narrative for YouTrip topup). For GrabFood / Line Man / Bolt orders, this is the underlying merchant, not the platform. |
+| `platform` | `text` | yes |  | Delivery / marketplace layer between B and merchant. Examples: Grab, Line Man, Bolt, Foodpanda, Klook. NULL when B transacted directly. Never a payment processor (those go in payment_method). |
+| `category` | `text` | yes |  | Expense category, free text. Vocabulary in domains/expense/types.py, evolves over time. Initial set: food, transport, groceries, healthcare, personal_care, utilities, shopping, travel, fitness, supplements, beauty, entertainment, gifts, education, home, subscriptions, ignored, unknown. Quoted-reply correction can change this on any row. |
+| `notes` | `text` | yes |  | Freeform prose: what was bought, why, any B caveat. For Telegram-sourced rows, app code defaults this to the original Telegram message text (or caption for photos) so the raw input is always preserved on the row. Pairs with items_json when a receipt is itemised. |
+| `items_json` | `jsonb` | yes |  | Structured receipt breakdown (JSONB) when itemised: {currency, line_items:[{name,qty,amount}], fees:[{label,amount}], discounts:[{label,amount (negative)}], subtotal, total}. Amounts in transaction currency; total = subtotal + fees + discounts = transaction_amount. NULL when not itemised. Legacy rows may hold a flat array. |
+| `transaction_currency_code` | `text` | yes |  | ISO 4217 of the original transaction. Examples: SGD, THB, USD, JPY. May differ from payment_method home currency (e.g. HSBC SGD card charged in USD). |
+| `transaction_amount` | `numeric(12,2)` | yes |  | Original amount in transaction_currency_code. NUMERIC(12,2) for room (foreign currencies — THB tens of thousands for travel spends). |
+| `sgd_amount` | `numeric(6,2)` | yes |  | Home-currency amount in SGD. The single number every report sums. NUMERIC(6,2) caps at S$9,999.99 per row — larger spends are deliberate enough to enter via SQL directly. Effective FX rate is derived in views as sgd_amount / transaction_amount. |
+| `fx_rate_source` | `text` | yes |  | How sgd_amount was determined. Values: not_applicable_sgd (transaction in SGD), actual_ocbc, actual_youtrip, actual_superrich_fifo (FIFO from fx_lots — breakdown in fx_lot_allocations rows), frankfurter_estimate (daily ECB reference), manual (B stated SGD amount or rate), mixed (blended non-lot sources — breakdown in source_meta.fx_rate_breakdown), unknown. Never hallucinated. |
+| `fx_rate_observed_at` | `timestamp with time zone` | yes |  | When the FX rate snapshot was taken. For actual_* sources: receipt/posting timestamp (typically equals spent_at). For frankfurter_estimate: ECB publication date used (will be earlier than spent_at). Stored even when equal to spent_at for explicit auditability. NULL when unknown. |
+| `payment_method` | `text` | yes |  | How B paid. CHECK-constrained vocabulary. Adding a new method requires ALTER ... ADD CHECK. |
+| `source_meta` | `jsonb` | yes |  | Provenance and parser metadata blob. Conventional keys: source_type (text/voice/photo/correction/manual/grab/bolt/line_man/foodpanda/klook/ocbc_promptpay/paynow_email/paylah_email/hsbc_statement/youtrip_screenshot/youtrip_email/superrich_receipt/generic_receipt — semantic source, channel-independent), source_reference (external transaction ID for dedup: Grab booking ID, OCBC ref, PayNow ref, SuperRich receipt number, YouTrip tx ID), channel (telegram/gmail/manual), telegram_update_id, telegram_file_id, gmail_message_id, gmail_inbound_id, model, model_confidence, vision_parser_version, language_detected, transcription_used, fx_rate_breakdown (when fx_rate_source=mixed; see comment on fx_rate_source). No secrets, no raw email bodies, no full card numbers. |
+| `created_at` | `timestamp with time zone` | no | now() |  |
+| `updated_at` | `timestamp with time zone` | yes |  |  |
+
 ## Schema: `nutrition`
 
 ### Table: `nutrition.food_log`
@@ -407,15 +493,15 @@ One row per distinct food item. A single message from B may produce one or multi
 ## Schema: `system`
 
 ### Table: `system.conversation_state`
-One row per bot reply that may participate in a quoted correction chain. Root rows are written for every bot reply to a loggable action (food, weight, expense, attention). Follow-up rows are written when B quotes a bot reply and a correction is applied. Full thread is rebuilt via recursive CTE joining telegram_outbound and telegram_inbound. context holds only the minimal structured state needed for the next correction turn.
+One row per bot reply that may participate in a quoted correction chain. Root rows are written for every bot reply to a loggable action (food, weight, expense, attention, aligner). Follow-up rows are written when B quotes a bot reply and a correction is applied. Full thread is rebuilt via recursive CTE joining telegram_outbound and telegram_inbound. context holds only the minimal structured state needed for the next correction turn.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
 | `telegram_reply_message_id` | `integer` | no |  | Telegram message_id of this bot reply. References system.telegram_outbound(message_id). |
 | `parent_telegram_reply_message_id` | `integer` | yes |  | Bot reply B quoted when triggering this correction round. NULL for root rows (initial log reply). |
 | `triggering_telegram_update_id` | `bigint` | no |  | Inbound update_id that caused this bot reply. References system.telegram_inbound(update_id). Used to reconstruct user text from telegram_inbound.payload. |
-| `domain` | `text` | no |  | Domain for this state row. CHECK-constrained — add values when new domains are built. |
-| `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids": [int], "meal_type": str} attention: {"attention_session_ids": [int]} |
+| `domain` | `text` | no |  | Domain for this state row. CHECK-constrained vocabulary: food, attention, aligner, weight, sleep_wake, expense, query. Add a value to the CHECK and to this comment when a new domain saves correction state. |
+| `context` | `jsonb` | no |  | Per-domain correction-chain state. aligner wear-event reply: {"aligner_wear_event_ids":[int], "kind":"out"\|"in"\|"out_guard"} (kind = the IN/OUT anchor for tray switches). aligner tray reply: {"aligner_tray_change_ids":[int]}. (food/attention/weight/sleep_wake unchanged.) |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 
 ### Table: `system.garmin_inbound`
