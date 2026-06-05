@@ -128,7 +128,8 @@ def register_routes(app: FastAPI) -> None:
 
 
 # Normalizes the payload, classifies intent, sends the reply, and logs to telegram_outbound.
-# Runs as a background task — all errors are caught and logged, never raised.
+# Awaited synchronously within the webhook request (see the module docstring's processing
+# model) — NOT a detached background task; all errors are caught and logged, never raised.
 # Outbound logging and state saving failures are non-fatal: the reply was already sent to Telegram.
 # Inputs: raw payload dict, chat_id and message_id from the inbound update.
 async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
@@ -146,14 +147,21 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
         results = await asyncio.to_thread(route, msg)
         last_sent_message_id = None
         last_pending_state = None
-        # Send one Telegram message per (reply, state) pair. Food logging produces one per
-        # food item; attention logging produces one per session block (e.g. "finish X and
-        # start Y" yields two bubbles); attention correction produces one per affected
-        # session. Other domains produce a single-item list. Each message is stored and
-        # state saved independently so B can quote any individual item to correct it.
-        for reply_text, pending_state in results:
+        # Send one Telegram message per result item. Food logging produces one per food item;
+        # attention logging produces one per session block (e.g. "finish X and start Y" yields
+        # two bubbles); attention correction produces one per affected session; aligner wear
+        # correction produces the updated event plus one per spawned tray. Other domains
+        # produce a single-item list. Each message is stored and state saved independently so
+        # B can quote any individual item to correct it.
+        #
+        # Handlers normally yield (reply_text, pending_state) tuples. The aligner domain
+        # yields an optional third element — a reply_markup dict — to dock its persistent
+        # 🦷 IN / 🍽️ OUT keyboard; absent it, the call defaults to no reply_markup.
+        for item in results:
+            reply_text, pending_state = item[0], item[1]
+            reply_markup = item[2] if len(item) > 2 else None
             sent_message_id, sent_payload = await asyncio.to_thread(
-                send_reply, chat_id, reply_text, message_id
+                send_reply, chat_id, reply_text, message_id, reply_markup=reply_markup
             )
             last_sent_message_id = sent_message_id
             last_pending_state = pending_state

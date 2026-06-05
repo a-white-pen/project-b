@@ -17,6 +17,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 include = ["telegram*", "domains*", "outbound*", "system*", "inbound*", "api*"]

@@ -5,7 +5,10 @@ Slash commands are reserved for administrative actions that command the bot to d
 Free-form messages (text, photo, voice) are classified by the LLM.
 
 Functions:
-  route(msg) — classifies intent (or resolves callback/command) and returns list of (reply, state)
+  route(msg) — classifies intent (or resolves callback/command/button) and returns a list of
+      replies. Each item is (reply_text, pending_state) for most domains; the aligner domain
+      appends an optional third element (a reply_markup dict) to dock its persistent keyboard.
+      telegram/webhook.py unpacks the optional third element and passes it to send_reply.
 """
 
 import dataclasses
@@ -14,6 +17,14 @@ import os
 from enum import Enum
 
 from domains.menus.service import handle_refresh_menus
+from domains.aligner.correction import handle_aligner_correction
+from domains.aligner.service import (
+    BUTTON_IN_TEXT,
+    BUTTON_OUT_TEXT,
+    handle_aligner_in,
+    handle_aligner_out,
+    handle_aligner_status,
+)
 from domains.attention.correction import handle_attention_correction
 from domains.attention.service import handle_attention_log, try_handle_wake_as_nap_end
 from domains.expense.service import handle_expense_log
@@ -42,6 +53,9 @@ class Intent(str, Enum):
     LOG_WAKE = "log_wake"               # just woke up
     LOG_EXPENSE = "log_expense"         # logging money spent
     LOG_ATTENTION = "log_attention"     # logging what B is working on / paying attention to
+    LOG_ALIGNER_OUT = "log_aligner_out" # 🍽️ OUT button tap — aligners came out of the mouth
+    LOG_ALIGNER_IN = "log_aligner_in"   # 🦷 IN button tap — aligners back in the mouth
+    ALIGNER_STATUS = "aligner_status"   # /aligner_status — read current state + bootstrap keyboard
     QUERY_DATA = "query_data"           # question about B's own stored data
     ASK_GENERAL = "ask_general"         # general question — use as an LLM, unrelated to personal data
     CORRECT = "correct"                 # correction to a previously logged item (quoted bot reply)
@@ -55,6 +69,15 @@ class Intent(str, Enum):
 # /command@BotName form (used in groups) is handled by stripping the @suffix.
 _COMMAND_MAP: dict[str, Intent] = {
     "/refresh_menus": Intent.REFRESH_MENUS,
+    "/aligner_status": Intent.ALIGNER_STATUS,
+}
+
+# Maps the exact aligner reply-keyboard button labels to intents — like slash commands,
+# these bypass the LLM. The buttons are a recording action (tap to log in/out of mouth),
+# not a typed command; their text arrives as a normal TEXT message which we match verbatim.
+_BUTTON_MAP: dict[str, Intent] = {
+    BUTTON_IN_TEXT: Intent.LOG_ALIGNER_IN,
+    BUTTON_OUT_TEXT: Intent.LOG_ALIGNER_OUT,
 }
 
 _CLASSIFY_PROMPT = """\
@@ -86,15 +109,17 @@ Respond with only the intent name. Nothing else."""
 
 
 # Routes an inbound message to the right domain handler.
-# Priority: callback_query → slash command → voice transcription → quoted correction → LLM classifier.
+# Priority: callback_query → location → slash command → aligner button → voice transcription → quoted correction → LLM classifier.
 # Voice is transcribed before the correction check so that a quoted voice note works as a
 # correction — handle_food_correction reads msg.text, which would be None for an untranscribed voice.
 # Inputs: InboundMessage from normalizer.
-# Outputs: list of (reply_text, pending_state). Multi-entry lists when the domain
-#   genuinely produces more than one bubble: food logging (one per food item), food
-#   correction (per item), attention logging (one per session block — "finish X and
-#   start Y" yields two), attention correction (one per affected session). All other
-#   domains return a single-entry list.
+# Outputs: list of (reply_text, pending_state[, reply_markup]) tuples. The optional third
+#   element is a reply_markup dict, returned only by the aligner domain to keep its persistent
+#   keyboard docked; webhook.py treats it as None when absent. Multi-entry lists when the
+#   domain genuinely produces more than one bubble: food logging (one per food item), food
+#   correction (per item), attention logging (one per session block — "finish X and start Y"
+#   yields two), attention correction (one per affected session), aligner wear correction
+#   (the updated event plus one per spawned tray). All other domains return a single entry.
 #   pending_state keys: domain, context, [parent_telegram_reply_message_id].
 def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     log_event(
@@ -124,6 +149,17 @@ def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
             intent=command_intent.value,
         )
         return _dispatch(command_intent, _strip_command(msg))
+    # Aligner keyboard taps — exact button-label match, deterministic like commands.
+    button_intent = _extract_button(msg)
+    if button_intent is not None:
+        log_event(
+            logger,
+            logging.INFO,
+            "route_button_matched",
+            update_id=msg.update_id,
+            intent=button_intent.value,
+        )
+        return _dispatch(button_intent, msg)
     # Transcribe voice before correction check — correction handlers read msg.text.
     # A quoted voice note must be transcribed first so the correction can read the text.
     if msg.message_type == MessageType.VOICE:
@@ -171,6 +207,14 @@ def _extract_command(msg: InboundMessage) -> Intent | None:
         return None
     cmd = msg.text.split()[0].split("@")[0].lower()
     return _COMMAND_MAP.get(cmd)
+
+
+# Matches an aligner reply-keyboard button tap by its exact label. Returns None for any
+# other text. Whitespace is stripped so a stray trailing space from the client doesn't miss.
+def _extract_button(msg: InboundMessage) -> Intent | None:
+    if not msg.text:
+        return None
+    return _BUTTON_MAP.get(msg.text.strip())
 
 
 # Strips the leading slash command token from msg.text before handing to domain handlers.
@@ -281,6 +325,8 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
         return handle_food_correction(msg, state)  # already returns list
     if domain == "attention":
         return handle_attention_correction(msg, state)  # already returns list — one entry per affected session
+    if domain == "aligner":
+        return handle_aligner_correction(msg, state)  # already returns list
     if domain == "sleep_wake":
         return [handle_sleep_wake_correction(msg, state)]
     if domain == "weight":
@@ -320,6 +366,12 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | Non
         return [handle_expense_log(msg)]
     if intent == Intent.LOG_ATTENTION:
         return handle_attention_log(msg)  # already returns list — one entry per session block
+    if intent == Intent.LOG_ALIGNER_OUT:
+        return handle_aligner_out(msg)  # already returns list (with reply_markup)
+    if intent == Intent.LOG_ALIGNER_IN:
+        return handle_aligner_in(msg)  # already returns list (with reply_markup)
+    if intent == Intent.ALIGNER_STATUS:
+        return handle_aligner_status(msg)  # already returns list (with reply_markup; doubles as keyboard bootstrap)
     if intent == Intent.QUERY_DATA:
         return [handle_query_data(msg)]
     if intent == Intent.ASK_GENERAL:
