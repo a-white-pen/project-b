@@ -3,6 +3,7 @@ LLM client — thin wrappers for text generation and audio transcription.
 
 Functions:
   generate_with_image(image_bytes, prompt, mime_type, model) — sends image+text prompt and returns the response
+  generate_with_images(images, prompt, mime_type, model)     — sends multiple images + text prompt (one call)
   generate_text(prompt, model)                   — sends a text prompt and returns the response
   generate_json(prompt, model)                   — like generate_text but forces JSON output mode (disables thinking)
   transcribe_audio(audio_bytes, mime_type, model) — transcribes a voice message via Gemini
@@ -126,6 +127,56 @@ def generate_with_image(
             image_bytes=len(image_bytes),
             mime_type=mime_type,
             prompt_chars=len(prompt),
+        )
+        raise
+
+
+# Sends multiple images plus one text prompt to the LLM and returns the stripped text response.
+# Inputs: list of image byte blobs, prompt string, MIME type (applied to all), model.
+# Outputs: stripped response string. Raises on API error.
+# Used by the expense domain when several photos describe one transaction (receipt + payment
+# screenshot), so the model can cross-reference them in a single call.
+def generate_with_images(
+    images: list[bytes],
+    prompt: str,
+    mime_type: str = "image/jpeg",
+    model: str = MODEL_FLASH,
+) -> str:
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_generate_with_images_started",
+        model=model,
+        image_count=len(images),
+        total_bytes=sum(len(b) for b in images),
+        prompt_chars=len(prompt),
+    )
+    try:
+        parts = [types.Part(inline_data=types.Blob(data=b, mime_type=mime_type)) for b in images]
+        parts.append(types.Part(text=prompt))
+        response = _call_with_retry(
+            _get_client().models.generate_content,
+            model=model,
+            contents=parts,
+        )
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_generate_with_images_completed",
+            model=model,
+            image_count=len(images),
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_generate_with_images_failed",
+            e,
+            model=model,
+            image_count=len(images),
         )
         raise
 

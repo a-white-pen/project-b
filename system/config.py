@@ -2,16 +2,23 @@
 Centralised config — reads all environment variables in one place.
 
 Functions:
-  get_config()        — returns a Config instance populated from os.environ; raises on missing required vars
-  get_strava_config() — returns a StravaConfig instance; raises if Strava vars are not set
+  get_config()         — returns a Config instance populated from os.environ; raises on missing required vars
+  get_strava_config()  — returns a StravaConfig instance; raises if Strava vars are not set
+  get_card_method_map()— returns {card_last4: payment_method} from CARD_METHOD_MAP; {} if unset/invalid
 
 Note: Garmin has no env-var config in the app — it uses a token blob stored in
 system.garmin_tokens (written by the `garmin auth` CLI bootstrap step). See inbound/garmin/client.py.
 """
 
+import json
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+
+from system.logging import log_event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -87,3 +94,25 @@ def get_strava_config() -> StravaConfig:
         raise RuntimeError(f"Missing required Strava env vars: {', '.join(missing)}")
 
     return cfg
+
+
+# Returns the card-last4 -> payment_method map from the CARD_METHOD_MAP env var (JSON).
+# Optional: returns {} when unset or malformed, so the app runs fine without it. Keys are
+# stringified last-4 digits; values must be valid payment_method vocabulary (validated by the
+# caller). Sourced from Secret Manager on Cloud Run, .env locally — card numbers never in git.
+# Cached for the process lifetime; tests must call get_card_method_map.cache_clear() between cases.
+@lru_cache(maxsize=None)
+def get_card_method_map() -> dict[str, str]:
+    raw = os.environ.get("CARD_METHOD_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("CARD_METHOD_MAP is not a JSON object")
+        # Normalise keys to strings; values to lowercase method names.
+        return {str(k).strip(): str(v).strip().lower() for k, v in parsed.items()}
+    except (json.JSONDecodeError, ValueError):
+        # Do NOT log the exception/content — it may contain card digits. Generic event only.
+        log_event(logger, logging.WARNING, "card_method_map_parse_failed", entry_count=0)
+        return {}

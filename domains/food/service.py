@@ -661,8 +661,11 @@ def _handle_photo(msg: InboundMessage) -> list[tuple[str, dict | None]]:
         return [("Couldn't access the photo — please try again.", None)]
 
     try:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        image_bytes = get_file_bytes(msg.file_id, token)
+        # Reuse bytes the router already fetched for bare-photo intent classification.
+        image_bytes = msg.file_bytes
+        if image_bytes is None:
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            image_bytes = get_file_bytes(msg.file_id, token)
     except Exception as e:
         log_failure(logger, logging.ERROR, "food_photo_download_failed", e, update_id=msg.update_id)
         return [("Couldn't download the photo — please try again.", None)]
