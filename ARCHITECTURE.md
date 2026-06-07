@@ -26,7 +26,8 @@ Previously considered and rejected — do not reintroduce: `apps/`+`ingestion/` 
 Telegram servers
   → POST /telegram/webhook
   → telegram/webhook.py        validates secret; deduplicates retries (ON CONFLICT update_id);
-                                skips edited messages and non-first album photos (media_group_id)
+                                skips edited messages; gathers album photos (media_group_id) and
+                                processes one only when it adds a photo not yet in the row's thread
   → telegram/normalizer.py     normalizes to InboundMessage (text, photo, voice, caption, etc.)
   → telegram/router.py         LLM intent classifier → domain handler
   → domains/<x>/service.py     validates, extracts via system/llm.py, persists to DB
@@ -35,7 +36,7 @@ Telegram servers
   → 200 OK back to Telegram
 ```
 
-**Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food`, `attention`, `aligner`, `sleep_wake`, and `weight`.
+**Correction threading:** when B quotes a bot reply, `router.py` checks `system.conversation_state` for the quoted message ID. If a state row exists (domain + context saved from the original reply), the quoted message is routed to that domain's correction handler instead of the normal classifier. Currently wired for `food`, `attention`, `aligner`, `sleep_wake`, `weight`, and `expense`.
 
 **Deterministic recording taps:** the aligner domain docks a persistent reply keyboard (`🦷 IN` / `🍽️ OUT`). Taps arrive as plain TEXT whose exact labels `router.py` matches in `_BUTTON_MAP` — *before* the LLM classifier, alongside slash commands — and dispatches to `domains/aligner/service.py`. These handlers return an optional third tuple element (a `reply_markup` dict) that `webhook.py` passes to `send_reply` to keep the keyboard docked; all other domains return the usual `(reply, state)` and get no `reply_markup`. Routing priority: `callback_query → location → slash command → aligner button → voice transcription → quoted correction → LLM classifier`.
 
@@ -81,7 +82,43 @@ No new webhook route needed — Garmin is polled in response to the Strava trigg
 
 **Delete dispatch:** `process_delete_event` tries `delete_cardio_activity`, `delete_strength_session`, and `delete_other_exercise` — whichever finds a row deletes it. Strava doesn't tell us which family the deleted activity belonged to.
 
-### Flow 3 — A reminder fires *(not yet implemented)*
+### Flow 3 — Expense logging (text / voice / photo / album)
+
+The expense domain (`domains/expense/`) turns a Telegram message into one row in `finances.spend_entries`, with FIFO cost-basis allocations in `finances.fx_lot_allocations` for foreign cash spends. SGD is the home currency; foreign spends keep their original `(currency, amount)`.
+
+```
+Telegram message (text / voice / photo / album)
+  → telegram/webhook.py
+      → media-group (album)? settle ~2.5s, gather ALL photo file_ids, dedup by thread file_ids;
+        only EXPENSE albums merge into one row — a non-expense album falls through to per-photo
+  → telegram/router.py
+      → voice → transcribe → text
+      → quoted reply with saved conversation_state → expense correction handler (see below)
+      → photo → _classify_photo (lone) / _classify_album (media group): vision classifies from the
+                IMAGE(s) (caption as context, image wins); fetched bytes carried on the message
+  → domains/expense/service.handle_expense_log
+      → extract: extract_spend_from_text | _from_image | _from_images (album = all photos, one call)
+      → has_minimum_signal gate — no row written for misrouted chatter
+      → settle_money: SGD direct | cash/truemoney FIFO over finances.fx_lots | else pending
+      → media_group_id set AND a row already exists? OVERWRITE it (best-fit re-extraction) → "Spend updated"
+        else INSERT a new row → "Spend logged" / "Spend detected" (pending)
+  → telegram/replies.py   HTML labelled-rows reply (Amount/Via/At/Merchant/Category/Items); quotes B's message
+  → system/conversation_state   saves {spend_entry_id} so any reply can be quoted to correct
+```
+
+**Status is derived, never stored** (`domains/expense/types.get_status`): `complete` / `pending` (missing required field) / `ignored` (recognised non-spend — topup, bill payment, transfer). Reply headers track `previously_complete` (was the row a fully-logged spend BEFORE this change?): a spend reads `✅ Spend logged` the first time it becomes complete — even if assembled over several album photos — `📝 Spend detected — need …` while still pending, and `✏️ Spend updated — <fields>` only for edits AFTER it was first logged (changed rows show `<s>old</s> new`). `⚠️ Ignored — …` for non-spends.
+
+**Reply layout** (`domains/expense/replies.py`): one template, money-first, six fixed rows in order — **Amount** (`THB 426 ≈ S$16.75 · YouTrip rate`) · **Via** (payment method) · **At** (`Thu 5 Jun · 12:34 PM`) · **Merchant** (`+ platform`) · **Category** · **Items** (line names + qty/size only — the full price breakdown lives in `items_json` for the dashboard). Missing required fields render a `[ ? ]` slot. A blank line after the header is produced by an empty string in the `\n`-joined list (Telegram renders it).
+
+**FX resolution** (`fx_rate_source`): `not_applicable_sgd` (SGD spend) · `actual_superrich_fifo` (cash/TrueMoney FIFO from `finances.fx_lots`, allocations written in the same transaction) · `actual_youtrip` / `actual_ocbc` (SGD figure read from a screenshot) · `manual` (B stated the SGD) · `mixed` (reserved for a blended breakdown in `source_meta.fx_rate_breakdown` — not produced yet; multi-lot FIFO currently records its blend in the allocations, not a `mixed` source) · `frankfurter_estimate` (not yet wired). The effective rate is derived (`sgd_amount / transaction_amount`), never stored.
+
+**Updates = rebuild from the whole thread** — every spend keeps a `source_meta.thread`: the ordered list of contributions (`{update_id, kind, file_id, text}`) that built it. Any later contribution — an album straggler photo (matched by `media_group_id`) or a quoted correction — appends to the thread and calls `service.apply_thread_update`, which re-downloads ALL the thread's images and feeds them plus an ordered text transcript plus the current record to ONE LLM call (`extract_spend_from_thread`). The model produces the single best record: B's text messages are explicit overrides (later wins), and for everything else it picks the best value per field across all sources (merchant = restaurant not recipient/processor, SGD + rate from the payment screenshot, earliest timestamp, items from the receipt; notes appended sensibly). This is order-independent, so it does not matter which album photo arrives first. Because every image is re-read each time, a text-only edit usually keeps the rate and items; and `service.settle_money` deterministically preserves a known SGD/rate and FIFO allocations whenever the amount/currency are unchanged (an edit can still change them when B intends to — e.g. correcting the amount, or saying so in the text). The webhook dedups album photos by comparing their `file_id`s to the thread, so a photo is re-processed only when it adds something new. Other domains ignore `media_group_file_ids` — this is finance-only.
+
+**Correction** (`domains/expense/correction.py`) — quoting a spend reply routes here. It appends the new text/photo to the thread and delegates to `apply_thread_update` (same path as album stragglers). Hard delete (`delete` / `remove`) is handled directly. A clarification or recoverable error still returns thread state so the chain isn't broken.
+
+**Card last-4 → payment method** — vision reads `card_last4`; the `CARD_METHOD_MAP` secret (Secret Manager → env, never in git) maps it to a `payment_method`, overriding any model guess.
+
+### Flow 4 — A reminder fires *(not yet implemented)*
 
 ```
 Cloud Tasks
@@ -91,7 +128,7 @@ Cloud Tasks
   → updates system.reminders row
 ```
 
-### Flow 4 — Cloud Scheduler refreshes the visualisation snapshot
+### Flow 5 — Cloud Scheduler refreshes the visualisation snapshot
 
 ```
 Cloud Scheduler (*/15 * * * *)
@@ -100,7 +137,7 @@ Cloud Scheduler (*/15 * * * *)
   → data_visualisation.nutrition_visualisation   snapshot table updated
 ```
 
-### Flow 5 — Menu refresh (B command or weekly scheduler)
+### Flow 6 — Menu refresh (B command or weekly scheduler)
 
 ```
 B sends /refresh_menus   OR   Cloud Scheduler (Thu 18:00 ICT)
@@ -140,6 +177,12 @@ GET /api/data-visualisation/nutrition
 - `telegram/replies.py` is the single send path for all outbound Telegram messages. Do not introduce a second.
 - `outbound/` decides *whether* to act. `telegram/` knows *how* to send.
 
+**Accepted exception — Telegram media for the expense domain (single-user, pragmatic):**
+Two couplings deliberately bend the rules above, documented here so they are not re-flagged:
+1. `telegram/webhook.py` imports `domains/expense/repository.get_media_group_progress` to decide whether a newly-arrived album photo adds anything new before processing it. This is album (media-group) sequencing — inherently a Telegram-transport concern — but it reads finance state to do its job.
+2. The expense domain downloads Telegram files (`telegram.files.get_file_bytes`) and reads `TELEGRAM_BOT_TOKEN` when it re-reads a thread's images on rebuild. This mirrors the existing **food** domain, which already fetches Telegram media directly, so it is a project-wide pattern rather than an expense-specific one.
+The clean fix (a transport-agnostic media-fetch abstraction + moving album orchestration out of the repository import path) is deferred: it buys little for a one-person system and adds risk. Revisit if a second input source (e.g. Gmail) needs the same media/rebuild path.
+
 ---
 
 ## Cross-domain coordination
@@ -157,11 +200,13 @@ Some events naturally cross domain boundaries — finishing an attention session
 
 When two or more domains need the same piece of plumbing, it moves to `system/` rather than being copied or cross-imported. Current shared helpers used across domains:
 
-- `system/timezone.py::get_timezone(as_of)` — resolves B's timezone at an event timestamp from `b.location` (point-in-time), with `b.latest_location` and Asia/Singapore as fallbacks. Used by attention, sleep, food, and aligner.
+- `system/timezone.py::get_timezone(as_of)` — resolves B's timezone at an event timestamp from `b.location` (point-in-time), with `b.latest_location` and Asia/Singapore as fallbacks. Used by attention, sleep, food, aligner, and expense.
 - `system/db.py::get_connection()` — single Postgres connection factory.
-- `system/llm.py::generate_text(...)` — single LLM call path.
-- `system/messages.py::InboundMessage` — normalized message dataclass passed to every domain handler.
-- `system/conversation_state.py` — quote-reply correction threading.
+- `system/llm.py` — single LLM call path: `generate_text`, `generate_json`, `generate_with_image`, `generate_with_images` (multi-image, used by expense for album receipts), `transcribe_audio`.
+- `system/messages.py::InboundMessage` — normalized message dataclass passed to every domain handler. Carries `file_bytes` (router-prefetched media so handlers don't re-download), `media_group_file_ids` + `media_group_id` (Telegram album; consumed only by expense).
+- `system/conversation_state.py` — quote-reply correction threading. Replies always quote B's triggering message (the AGENTS.md quoting rule); the bot does not chain replies onto its own prior reply.
+
+**One pragmatic exception to the "no cross-domain reads" rule:** `telegram/webhook.py` imports `domains/expense/repository.get_media_group_progress` to decide whether a newly-arrived album photo adds anything to an existing spend before routing it. This keeps album dedup finance-only without giving every domain duplicate photos.
 
 ---
 

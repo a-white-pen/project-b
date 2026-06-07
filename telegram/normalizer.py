@@ -55,6 +55,7 @@ def normalize(payload: dict) -> InboundMessage:
             caption=msg.get("caption"),
             timestamp=_parse_ts(msg.get("date")),
             quoted_message_id=reply_to.get("message_id"),
+            media_group_id=msg.get("media_group_id"),
         )
 
         if "text" in msg:

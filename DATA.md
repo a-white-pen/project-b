@@ -100,6 +100,94 @@ ALTER TABLE system.conversation_state ADD CONSTRAINT conversation_state_domain_c
 
 Then update the allowed-values list above in this file.
 
+The `context` column comment must also document each domain's shape. The expense correction state is
+`{"spend_entry_id": int}` and was missing from the generated comment — apply + re-dump:
+```sql
+COMMENT ON COLUMN system.conversation_state.context IS
+  'Domain-specific structured data for the correction chain. '
+  'food: {"food_log_ids":[int],"meal_type":str}. attention: {"attention_session_ids":[int]}. '
+  'aligner (wear-event reply): {"aligner_wear_event_ids":[int],"kind":"out"|"in"|"out_guard"|"updated"}. '
+  'aligner (tray reply): {"aligner_tray_change_ids":[int],"arch":"upper"|"lower","kind":"tray"}. '
+  'weight: {"weight_measurement_ids":[int]}. '
+  'sleep_wake: {"sleep_wake_event_ids":[int],"event_type":"sleep"|"wake","auto_inferred":bool}. '
+  'expense: {"spend_entry_id":int}.';
+```
+
+---
+
+## `finances.spend_entries` CHECK vocabularies
+
+Several `finances.spend_entries` columns are CHECK-constrained. The code vocabulary
+(`domains/expense/types.py`) and the DB CHECK **must list identical values** — otherwise an insert
+fails at spend-log time, invisibly (the same silent-drift failure mode as the `conversation_state`
+domain constraint above). The generated `data_dictionary.md` only records *that* a column is
+CHECK-constrained, not the values, so the source of truth is recorded here.
+
+`payment_method` — 10 values (must equal `PAYMENT_METHODS` in types.py):
+```sql
+CHECK (payment_method IN (
+  'cash', 'truemoney', 'promptpay_ocbc', 'youtrip', 'paynow_ocbc', 'paylah',
+  'hsbc_revolution_credit_card', 'ocbc_debit_card', 'trustbank_credit_card', 'unknown'));
+```
+
+`ignored_reason` — **free text, NOT CHECK-constrained** (the column is plain `text`; the dictionary
+comment lists "Initial values", not a CHECK). So writing a new reason like `fx_acquisition` (a
+money-changer slip — recognised non-spend) **cannot fail at runtime** — there is no constraint to
+violate. The only gap is documentation: the generated dictionary comment still lists the original 5.
+Doc-only fix — apply the updated `COMMENT ON` and re-dump (no `ALTER … CHECK`):
+```sql
+COMMENT ON COLUMN finances.spend_entries.ignored_reason IS
+  'Non-NULL marks a recognised non-spend. Known values: youtrip_topup, credit_card_bill_payment, '
+  'transfer, duplicate, not_spend, fx_acquisition (money-changer slip / FX acquisition). '
+  'Free text validated in app code (IGNORED_REASONS), no CHECK.';
+```
+
+`category` and `fx_rate_source` likewise mirror `CATEGORIES` / `FX_RATE_SOURCES` in types.py. Verify
+in the live dictionary whether each is CHECK-constrained (like `payment_method`) or free text (like
+`ignored_reason` / `activity_type`) before assuming an `ALTER` is needed.
+
+**When changing any expense vocabulary:** propose the matching `ALTER … CHECK` (and `COMMENT ON`)
+to B, wait for B to apply + re-dump the dictionary, and update types.py in the same change.
+
+### `items_json` shape (v2 — capture everything)
+
+`items_json` is plain JSONB (no migration to change its internal shape). The schema is designed so
+NOTHING on a bill is ever lost — every product is a `line` (with qty/unit/modifiers), and every
+non-product money line (fee, discount, coupon, tax, service charge, tip, deposit, rounding) is an
+`adjustment` with a `kind` tag, so new kinds never need a schema change. The Telegram reply shows
+only the line names; the full structure is for the dashboard / later analysis. The dashboard reads
+the `lines` (name · qty · unit · modifiers) for the items breakdown; `adjustments` + totals are
+available for spend-composition analysis but are not needed for the items list itself.
+
+```jsonc
+{
+  "currency": "THB",
+  "lines": [
+    {"name": "Chocolate Milk", "name_local": "นมช็อกโกแลต", "qty": 1, "unit": "200ml",
+     "modifiers": ["chilled"], "unit_price": 25.00, "amount": 25.00},
+    {"name": "Banana", "name_local": null, "qty": 2, "unit": null, "modifiers": [],
+     "unit_price": 5.00, "amount": 10.00}
+  ],
+  "adjustments": [
+    {"kind": "fee",      "label": "Delivery fee", "amount": 15.00},
+    {"kind": "discount", "label": "LM Coupon",    "amount": -45.00}
+  ],
+  "subtotal": 35.00,           // sum of lines.amount
+  "total": 5.00               // subtotal + sum(adjustments) = transaction_amount
+}
+```
+
+Proposed column comment (apply + re-dump; legacy rows may still hold the old
+`{line_items, fees, discounts}` shape or a flat array — readers tolerate both):
+```sql
+COMMENT ON COLUMN finances.spend_entries.items_json IS
+  'Structured bill breakdown (JSONB), null when not itemised. v2: {currency, '
+  'lines:[{name (English), name_local (as printed / null), qty, unit, modifiers[], unit_price, amount}], '
+  'adjustments:[{kind in (fee,discount,tax,service_charge,tip,deposit,rounding,other),label,amount signed}], '
+  'subtotal, total}. total = subtotal + sum(adjustments) = transaction_amount. Names are English; '
+  'name_local keeps the original as printed so nothing is lost. Legacy rows may hold {line_items,fees,discounts} or a flat array.';
+```
+
 ---
 
 ## COMMENT ON standard

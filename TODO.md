@@ -44,9 +44,25 @@ Fallback chain summary:
 
 ---
 
-### Expense logging *(in progress — feat/expense-logging, Codex)*
+### Expense logging *(Part 2 — `expense-logging`: in live testing, not yet merged to master)*
 
-Log money spent via text description or receipt photo
+*Full plan in `PLAN_expense_logging.md` (gitignored, local only). Schema applied:
+`finances.spend_entries`, `finances.fx_lots`, `finances.fx_lot_allocations`.*
+
+Done (manual Telegram logging):
+- Text / voice / photo spend logging → `finances.spend_entries`.
+- SGD home currency; foreign spends keep original currency + amount.
+- FX: SGD direct; cash/TrueMoney foreign auto-resolved via FIFO over `fx_lots` (multi-lot blend recorded in the allocation rows); B-stated SGD = manual; YouTrip/OCBC actual rates from screenshots. (`mixed` + `source_meta.fx_rate_breakdown` are reserved but not produced yet.)
+- Ignored rows for YouTrip top-up / card-bill payment / transfer / money-changer slip (recoverable via correction).
+- Derived status (`complete`/`pending`/`ignored`) + missing-field detection in code, not stored.
+- Per-chain `source_type` tagging by vision (grab, bolt, youtrip_screenshot, …).
+- Quoted-reply corrections: edit any field, flip ignored↔spend, hard delete (allocations cascade / recreate).
+
+Remaining:
+1. **Telegram-side `fx_lots` logging** — money-changer lots are added via SQL for now. A `superrich_receipt` slip is currently recognised and saved as an *ignored* `fx_acquisition` row (not a spend); the remaining work is a natural-language / photo flow that turns it into an actual `fx_lots` row.
+2. **Gmail ingestion** (Parts 8–11) — `system.gmail_inbound`, OCBC PromptPay / PayNow / Grab / Bolt / YouTrip parsers, watch renewal, proactive messages. Needs `conversation_state.triggering_telegram_update_id` made nullable before proactive corrections.
+3. **Reporting views** — monthly spend / SGD totals in `marts` once enough real data exists.
+4. **Frankfurter estimate** — daily ECB fallback rate for foreign spends with no actual rate and no FIFO cover (not yet wired).
 
 ---
 

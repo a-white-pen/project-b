@@ -5,8 +5,15 @@ Functions:
   register_routes(app) — registers POST /telegram/webhook and GET /health onto the app instance
   receive_webhook()   — POST /telegram/webhook; validates secret, stores raw payload, routes update
   check_health()      — GET /health; checks app and DB connectivity, returns status dict
-  _extract_media_group_id(payload) — extracts media_group_id from photo/video payloads
-  _get_prior_media_group_update_id(media_group_id, update_id) — returns an earlier album update_id
+
+Internal:
+  _process_and_reply(payload, update_id) — album resolution → route → send each (reply, state)
+  _validate_secret(request)              — checks the Telegram webhook secret header
+  _extract_chat_and_message_id(payload)  — pulls chat_id + message_id for early error replies
+  _store_inbound(update_id, payload) / _store_outbound(...) — persist raw in/out payloads
+  _extract_media_group_id(payload)       — media_group_id from a photo/video payload
+  _get_media_group_photos(media_group_id) — (update_id, file_id) for every album photo, ordered
+  _ping_db()                             — health-check DB probe
 
 Processing model:
   _store_inbound() is called first and returns True if the row was newly inserted, False for a
@@ -19,6 +26,7 @@ Processing model:
 """
 
 import asyncio
+import dataclasses
 import hmac
 import json
 import logging
@@ -30,6 +38,7 @@ configure_logging()
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
+from domains.expense.repository import get_media_group_progress
 from system.config import get_config
 from system.conversation_state import save_state
 from system.db import get_connection
@@ -38,6 +47,17 @@ from telegram.replies import send_reply
 from telegram.router import route
 
 logger = logging.getLogger(__name__)
+
+# Seconds to wait for the rest of a Telegram album to arrive and be stored before the processor
+# gathers all photo file_ids. Telegram delivers album items near-simultaneously (~1s); 2.5s is a
+# safe margin without noticeably delaying the single reply.
+_ALBUM_SETTLE_SECONDS = 2.5
+
+# A non-first album photo whose spend row does not exist yet (the first photo may still be inside
+# LLM extraction) polls for the row up to this long, then appends itself. Without this, a sibling
+# that arrives during the first photo's extraction would be skipped and lost.
+_ALBUM_STRAGGLER_WAIT_SECONDS = 20.0
+_ALBUM_POLL_INTERVAL_SECONDS = 2.0
 
 
 def register_routes(app: FastAPI) -> None:
@@ -82,34 +102,71 @@ def register_routes(app: FastAPI) -> None:
             log_event(logger, logging.INFO, "webhook_edited_message_skipped", update_id=update_id)
             return {"ok": True}
 
-        # Skip non-first photos in a Telegram media group (album).
-        # When B sends multiple photos at once, Telegram fires one update per photo — all sharing
-        # a media_group_id. We process only the first update stored for each group; the rest are
-        # stored for audit but silently skipped to avoid duplicate bot replies.
+        # Telegram media group (album): B sent multiple photos, one update per photo, all sharing a
+        # media_group_id. Whichever update is processed gathers ALL the album's photos and the expense
+        # domain re-extracts over the full set (best-fit per field, order-independent). We process an
+        # update only when the album has a photo NOT yet in the row's thread (deduped by file_id).
+        #
+        # Cloud Run runs these requests CONCURRENTLY (Telegram fires one per album photo at nearly
+        # the same time). The min-update/poll logic here only ORDERS those near-simultaneous album
+        # deliveries; it is not the concurrency guard. The actual write races are handled downstream
+        # in the expense domain — spend_lock serialises updates to one row, fifo_lock serialises FIFO
+        # resolve+write per currency.
+        #
+        # The album DB queries are wrapped so a transient failure never loses the (already-stored)
+        # update: on error we fall back to processing this single photo instead of 500-ing (which
+        # Telegram would retry and then skip as a duplicate).
+        album_file_ids: list[str] | None = None
         media_group_id = _extract_media_group_id(payload)
         if media_group_id is not None:
-            prior_update_id = await asyncio.to_thread(_get_prior_media_group_update_id, media_group_id, update_id)
-            if prior_update_id is not None:
-                log_event(
-                    logger, logging.INFO, "webhook_media_group_duplicate_skipped",
-                    update_id=update_id,
-                    media_group_id=media_group_id,
-                    prior_update_id=prior_update_id,
-                )
-                return {"ok": True}
-            log_event(
-                logger,
-                logging.INFO,
-                "webhook_media_group_first_seen",
-                update_id=update_id,
-                media_group_id=media_group_id,
-            )
+            try:
+                await asyncio.sleep(_ALBUM_SETTLE_SECONDS)  # let closely-arriving siblings store
+                photos = await asyncio.to_thread(_get_media_group_photos, media_group_id)
+                spend_id, processed_files = await asyncio.to_thread(get_media_group_progress, media_group_id)
+                is_min = bool(photos) and photos[0][0] == update_id
+                if spend_id is None and not is_min:
+                    # No expense row yet and we are not the first update. The min update may still be
+                    # creating the merged row (expense albums make ONE row from all photos). Poll for
+                    # it so a sibling arriving during the first photo's LLM call is not lost.
+                    waited = 0.0
+                    while spend_id is None and waited < _ALBUM_STRAGGLER_WAIT_SECONDS:
+                        await asyncio.sleep(_ALBUM_POLL_INTERVAL_SECONDS)
+                        waited += _ALBUM_POLL_INTERVAL_SECONDS
+                        spend_id, processed_files = await asyncio.to_thread(
+                            get_media_group_progress, media_group_id)
+                    if spend_id is not None:
+                        photos = await asyncio.to_thread(_get_media_group_photos, media_group_id)
+                # Only expense albums merge into one row (the first update creates it, later updates
+                # append). If this is the first update (is_min) or an expense row exists, take the
+                # album-merge path. Otherwise no expense row materialised — this is NOT an expense
+                # album (e.g. a food album), so fall through and process THIS photo on its own (the
+                # domain logs one entry per photo) rather than discarding it.
+                if is_min or spend_id is not None:
+                    current_files = {fid for _, fid in photos}
+                    if spend_id is not None and current_files <= processed_files:
+                        # Every album photo is already in the spend's thread — nothing new to add.
+                        log_event(logger, logging.INFO, "webhook_media_group_no_new_photos",
+                                  update_id=update_id, media_group_id=media_group_id)
+                        return {"ok": True}
+                    album_file_ids = [fid for _, fid in photos] or None
+                    log_event(logger, logging.INFO, "webhook_media_group_processing",
+                              update_id=update_id, media_group_id=media_group_id,
+                              photo_count=len(album_file_ids or []), existing_spend_id=spend_id)
+                else:
+                    log_event(logger, logging.INFO, "webhook_media_group_non_expense_single",
+                              update_id=update_id, media_group_id=media_group_id)
+            except Exception as e:
+                # Transient DB error during album resolution — do NOT lose the update. Fall back to
+                # processing this single photo; the rebuild can incorporate siblings on a later touch.
+                log_failure(logger, logging.ERROR, "webhook_media_group_resolution_failed", e,
+                            update_id=update_id, media_group_id=media_group_id)
+                album_file_ids = None
 
         # Process synchronously — work stays alive for the duration of this request.
         # Telegram retries are caught by the duplicate check above, so long LLM calls won't
         # produce double replies even if Telegram times out and retries before we respond.
         if chat_id is not None:
-            await _process_and_reply(payload, chat_id, message_id)
+            await _process_and_reply(payload, chat_id, message_id, album_file_ids)
         else:
             log_event(logger, logging.INFO, "webhook_no_chat_id_skipped", update_id=update_id)
 
@@ -132,7 +189,12 @@ def register_routes(app: FastAPI) -> None:
 # model) — NOT a detached background task; all errors are caught and logged, never raised.
 # Outbound logging and state saving failures are non-fatal: the reply was already sent to Telegram.
 # Inputs: raw payload dict, chat_id and message_id from the inbound update.
-async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None) -> None:
+async def _process_and_reply(
+    payload: dict,
+    chat_id: int,
+    message_id: int | None,
+    album_file_ids: list[str] | None = None,
+) -> None:
     update_id = payload.get("update_id")
     try:
         log_event(
@@ -142,8 +204,12 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
             update_id=update_id,
             chat_id=chat_id,
             reply_to_message_id=message_id,
+            album_photos=len(album_file_ids or []),
         )
         msg = normalize(payload)
+        # Attach all album photo file_ids so the expense domain can read them as one transaction.
+        if album_file_ids:
+            msg = dataclasses.replace(msg, media_group_file_ids=album_file_ids)
         results = await asyncio.to_thread(route, msg)
         last_sent_message_id = None
         last_pending_state = None
@@ -157,6 +223,9 @@ async def _process_and_reply(payload: dict, chat_id: int, message_id: int | None
         # Handlers normally yield (reply_text, pending_state) tuples. The aligner domain
         # yields an optional third element — a reply_markup dict — to dock its persistent
         # 🦷 IN / 🍽️ OUT keyboard; absent it, the call defaults to no reply_markup.
+        #
+        # Every reply quotes B's triggering message (message_id) per the AGENTS.md quoting rule;
+        # corrections quote the prior reply via B's own quoted message, not a bot-side override.
         for item in results:
             reply_text, pending_state = item[0], item[1]
             reply_markup = item[2] if len(item) > 2 else None
@@ -283,35 +352,34 @@ def _extract_media_group_id(payload: dict) -> str | None:
     return None
 
 
-# Returns the earliest lower update_id already stored for the same media_group_id.
-# The caller skips routing when this returns a value, and logs the prior update_id so the
-# processed album item can be reconstructed from Cloud Run logs.
-#
-# This deliberately avoids a schema change. A tiny residual race remains if album updates arrive
-# out of order before the lower update_id commits; a dedicated media_group claim table would close it.
-# Inputs: media_group_id string, current update_id.
-def _get_prior_media_group_update_id(media_group_id: str, current_update_id: int) -> int | None:
+# Returns (update_id, largest_photo_file_id) for every stored update in a media group, ordered by
+# update_id. Used by the album processor to gather all photos after the settle delay. The first
+# tuple's update_id is the canonical processor for the group (the minimum update_id).
+# Inputs: media_group_id. Output: list of (update_id, file_id); empty if none/no photos.
+def _get_media_group_photos(media_group_id: str) -> list[tuple[int, str]]:
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT update_id FROM system.telegram_inbound
-                    WHERE (
-                        payload->'message'->>'media_group_id' = %s
-                        OR payload->'channel_post'->>'media_group_id' = %s
-                    )
-                    AND update_id < %s
+                    SELECT update_id, payload FROM system.telegram_inbound
+                    WHERE payload->'message'->>'media_group_id' = %s
+                       OR payload->'channel_post'->>'media_group_id' = %s
                     ORDER BY update_id
-                    LIMIT 1
                     """,
-                    (media_group_id, media_group_id, current_update_id),
+                    (media_group_id, media_group_id),
                 )
-                row = cur.fetchone()
-                return row[0] if row else None
+                rows = cur.fetchall()
     finally:
         conn.close()
+    photos: list[tuple[int, str]] = []
+    for upd_id, payload in rows:
+        msg = payload.get("message") or payload.get("channel_post") or {}
+        photo_sizes = msg.get("photo") or []
+        if photo_sizes:
+            photos.append((upd_id, photo_sizes[-1]["file_id"]))  # largest size = last entry
+    return photos
 
 
 # Runs SELECT 1 against the DB. Returns "ok" or the error message string.

@@ -9,6 +9,18 @@ Functions:
       replies. Each item is (reply_text, pending_state) for most domains; the aligner domain
       appends an optional third element (a reply_markup dict) to dock its persistent keyboard.
       telegram/webhook.py unpacks the optional third element and passes it to send_reply.
+
+Internal:
+  _route_callback(msg)                 — deterministic callback_query dispatch
+  _extract_command(msg) / _strip_command(msg) — slash-command parsing
+  _extract_button(msg)                 — aligner reply-keyboard button-label match
+  _classify_intent(msg)                — text/voice intent via LLM
+  _classify_photo(msg)                 — lone-photo intent via vision (carries fetched bytes)
+  _classify_album(msg)                 — media-group intent across ALL photos in one vision call
+  _transcribe_voice(msg)               — voice → text via Gemini
+  _parse_intent(raw)                   — LLM output → Intent enum
+  _try_correction(msg)                 — quoted-reply correction routing
+  _dispatch(intent, msg)               — Intent → domain handler
 """
 
 import dataclasses
@@ -27,6 +39,7 @@ from domains.aligner.service import (
 )
 from domains.attention.correction import handle_attention_correction
 from domains.attention.service import handle_attention_log, try_handle_wake_as_nap_end
+from domains.expense.correction import handle_expense_correction
 from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
 from domains.food.service import handle_food_log
@@ -38,7 +51,13 @@ from domains.sleep.service import handle_sleep_log, handle_wake_log
 from domains.weight.correction import handle_weight_correction
 from domains.weight.service import handle_weight_log
 from system.conversation_state import load_state
-from system.llm import MODEL_FLASH, generate_text, transcribe_audio
+from system.llm import (
+    MODEL_FLASH,
+    generate_text,
+    generate_with_image,
+    generate_with_images,
+    transcribe_audio,
+)
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
@@ -89,7 +108,7 @@ Classify the message into exactly one of these intents:
 - log_weight: logging body weight or body measurements — a bare number like "57.1" or "57.1 kg" always means weight in this context
 - log_sleep: user is explicitly logging that they are going to NIGHT-SLEEP — strong signals: "night night", "going to sleep", "heading to bed", "bed bed", "sleeping now", "orh orh", "orh orh kun", sleep/moon emoji alone (🌙😴). A standalone "goodnight" with no conversational context may qualify. Do NOT classify as log_sleep if the message is clearly a conversational farewell or closing message in an ongoing exchange. Naps are NOT log_sleep — see the nap rule below under Disambiguation.
 - log_wake: user is explicitly logging that they just woke up — strong signals: "just woke up", "woke up", "wakey wakey", "rise and shine", sunrise emoji alone (🌅). A standalone "good morning" or "morning" with no conversational context may qualify. Do NOT classify as log_wake if the message is clearly a conversational greeting opening a chat.
-- log_expense: logging money spent or a receipt (text or photo)
+- log_expense: any money movement — money spent, a receipt or payment screenshot (text or photo), a wallet top-up (e.g. "topped up YouTrip"), a credit-card bill payment, or a transfer to someone. PayNow/PayLah/PromptPay/Grab/Bolt payments all count.
 - log_attention: logging an attention/activity session start or finish — what the user is doing, working on, reading, watching, eating, cooking, commuting, resting, grooming/showering, or spending time on. Examples: "working on Project B", "I go cook dinner now", "finish lunch", "prep breakfast", "coffee break", "order food", "go poop", "go mum mum" (eat), "go pong pong" (shower/bathe), "done with attention module", "watching Succession"
 - query_data: asking a question about their own stored data ("what did I eat today?", "am I hitting protein?")
 - ask_general: a general question or request to use the assistant as an LLM — not about personal data
@@ -104,6 +123,49 @@ Disambiguation:
 - "go cook dinner", "prep breakfast", "eat lunch", "finish lunch", "coffee break", "order food", "go mum mum", "finish mum mum", "cooking", or meal words used as time/activity boundaries without specific food items = log_attention.
 - Naps are log_attention (downtime/rest), NOT log_sleep. Signals: "nap nap", "napping", "taking a nap", "having a nap", "power nap", "lie down for a bit". log_sleep is reserved for going to bed for night sleep.
 - Baby-talk terms may arrive literally from voice transcription: "orh orh" or "orh orh kun" = log_sleep; "mum mum" = eating activity; "pong pong" = shower/bathe activity; "nap nap" = nap (log_attention, downtime/rest).
+
+Respond with only the intent name. Nothing else."""
+
+
+_PHOTO_CLASSIFY_PROMPT = """\
+You are classifying a photo sent to a personal tracker by one person. Decide what the image is,
+using BOTH the image content and the caption. The image is the stronger signal — a caption that
+sounds like an activity does not override a receipt/payment image.
+
+- log_expense: a financial document — a shop/restaurant receipt, an order receipt, a payment app \
+screenshot (YouTrip, PayNow, PayLah, PromptPay, TrueMoney), a bank transaction notification, a \
+money-changer slip, a paid bill, or any screen showing an amount that was paid.
+- log_food: food itself — a meal, dish, drink, or a packaged-food nutrition label / ingredients panel.
+- log_weight: a scale display or body-measurement readout showing a weight number.
+- unknown: none of the above / cannot tell.
+
+Caption from the user: {caption}
+
+Disambiguation:
+- A receipt, bill, or payment/transaction screenshot is log_expense — even if the caption describes \
+an activity (e.g. "did laundry", "had lunch") or the spend is for food. What was PAID for is a spend.
+- A nutrition label or a photo of food on a plate (no prices/payment shown) is log_food.
+- If the image shows an amount paid, choose log_expense regardless of the caption wording.
+
+Respond with only the intent name. Nothing else."""
+
+
+_ALBUM_CLASSIFY_PROMPT = """\
+You are classifying a GROUP of photos that were sent together as ONE submission to a personal
+tracker by one person. Decide what the WHOLE group represents, using all the images and the caption.
+
+KEY RULE: if ANY single photo in the group is a financial document — a shop/restaurant receipt, an \
+order receipt, a payment-app screenshot (YouTrip, PayNow, PayLah, PromptPay, TrueMoney), a bank \
+transaction notification, a money-changer slip, a paid bill, or any screen showing an amount that \
+was paid — classify the WHOLE group as log_expense. People commonly send a receipt together with a \
+payment screenshot, and the other photos do not override that.
+
+Only if NO photo is a financial document, pick from:
+- log_food: the photos are food — meals, dishes, drinks, or a packaged-food nutrition label.
+- log_weight: a scale display or body-measurement readout showing a weight number.
+- unknown: none of the above / cannot tell.
+
+Caption from the user: {caption}
 
 Respond with only the intent name. Nothing else."""
 
@@ -177,9 +239,20 @@ def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
                 quoted_message_id=msg.quoted_message_id,
             )
             return result
-    # PHOTO: classified by LLM from message_type + caption.
-    # Bare photos with no caption are unreliable — future fix is vision-based intent classification.
-    intent = _classify_intent(msg)
+    # Photos are classified from the IMAGE (with the caption as extra context), not caption-only —
+    # a caption that reads like an activity must not hide a receipt/payment image. The fetched bytes
+    # are carried on the message so the domain handler does not re-download. Text/voice use the text
+    # classifier.
+    if msg.message_type == MessageType.PHOTO and msg.file_id:
+        # An album (>1 photo) is ONE submission: classify across ALL its photos so an ambiguous
+        # first photo (e.g. a plain food shot) cannot route a later clear payment screenshot away
+        # from expense. A lone photo uses the single-image classifier.
+        if msg.media_group_file_ids and len(msg.media_group_file_ids) > 1:
+            msg, intent = _classify_album(msg)
+        else:
+            msg, intent = _classify_photo(msg)
+    else:
+        intent = _classify_intent(msg)
     log_event(logger, logging.INFO, "route_intent_resolved", update_id=msg.update_id, intent=intent.value)
     return _dispatch(intent, msg)
 
@@ -229,6 +302,8 @@ def _strip_command(msg: InboundMessage) -> InboundMessage:
 
 
 # Sends the message context to the LLM and parses the intent.
+# Used for text and voice (already transcribed). All photos are handled by _classify_photo (lone
+# photo) or _classify_album (media group), both image-based, before this is reached.
 # Inputs: InboundMessage. Outputs: Intent enum value; falls back to UNKNOWN on error.
 def _classify_intent(msg: InboundMessage) -> Intent:
     prompt = _CLASSIFY_PROMPT.format(
@@ -249,6 +324,68 @@ def _classify_intent(msg: InboundMessage) -> Intent:
             message_type=msg.message_type.value,
         )
         return Intent.UNKNOWN
+
+
+# Classifies any photo by looking at the IMAGE (with its caption as extra context), and carries
+# the fetched bytes back on the message so the chosen domain handler does not download it again.
+# Downloads once, asks the LLM what kind of image it is (expense vs food vs weight). The image is
+# the stronger signal so a receipt/payment photo routes to expense even when the caption reads like
+# an activity (e.g. a laundry-payment screenshot captioned "did laundry").
+# Inputs: InboundMessage with message_type=PHOTO and a file_id.
+# Output: (message_with_file_bytes, Intent). On download/LLM failure: (original_msg, UNKNOWN).
+def _classify_photo(msg: InboundMessage) -> tuple[InboundMessage, Intent]:
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        image_bytes = get_file_bytes(msg.file_id, token)
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "route_photo_fetch_failed", e, update_id=msg.update_id)
+        return msg, Intent.UNKNOWN
+    msg = dataclasses.replace(msg, file_bytes=image_bytes)
+    try:
+        prompt = _PHOTO_CLASSIFY_PROMPT.format(caption=msg.caption or "—")
+        raw = generate_with_image(image_bytes, prompt, model=MODEL_FLASH)
+        intent = _parse_intent(raw)
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "route_photo_intent_classification_failed", e,
+                    update_id=msg.update_id)
+        return msg, Intent.UNKNOWN
+    log_event(logger, logging.INFO, "route_photo_intent_classified",
+              update_id=msg.update_id, intent=intent.value,
+              has_caption=bool(msg.caption), image_bytes=len(image_bytes))
+    return msg, intent
+
+
+# Classifies a Telegram album (media group) as ONE submission across all its photos in a single
+# multi-image vision call. The "any financial document -> log_expense" rule means an ambiguous or
+# non-financial first photo cannot gate a later payment screenshot away from expense.
+# Carries the triggering photo's bytes on the message (the expense domain re-fetches the full album
+# itself for extraction). On download/LLM failure, falls back to single-photo classification.
+# Inputs: InboundMessage with media_group_file_ids (>1). Output: (message, Intent).
+def _classify_album(msg: InboundMessage) -> tuple[InboundMessage, Intent]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    file_ids = msg.media_group_file_ids or []
+    try:
+        images = [get_file_bytes(fid, token) for fid in file_ids]
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "route_album_fetch_failed", e, update_id=msg.update_id)
+        return _classify_photo(msg)
+    if not images:
+        return _classify_photo(msg)
+    # Carry the triggering photo's bytes so a single-photo code path stays warm.
+    idx = file_ids.index(msg.file_id) if msg.file_id in file_ids else 0
+    msg = dataclasses.replace(msg, file_bytes=images[idx])
+    try:
+        prompt = _ALBUM_CLASSIFY_PROMPT.format(caption=msg.caption or "—")
+        raw = generate_with_images(images, prompt, model=MODEL_FLASH)
+        intent = _parse_intent(raw)
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "route_album_intent_classification_failed", e,
+                    update_id=msg.update_id)
+        return _classify_photo(msg)
+    log_event(logger, logging.INFO, "route_album_intent_classified",
+              update_id=msg.update_id, intent=intent.value,
+              image_count=len(images), has_caption=bool(msg.caption))
+    return msg, intent
 
 
 # Downloads a voice message and transcribes it via Gemini.
@@ -331,6 +468,8 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
         return [handle_sleep_wake_correction(msg, state)]
     if domain == "weight":
         return [handle_weight_correction(msg, state)]
+    if domain == "expense":
+        return [handle_expense_correction(msg, state)]
     # Other domains: not implemented yet — fall through to normal routing
     log_event(
         logger,
