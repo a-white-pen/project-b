@@ -135,10 +135,9 @@ data_visualisation.* are live VIEWS over b.* / finances / nutrition — no snaps
 no refresh job. The public read endpoints query them directly; each view applies a
 15-minute publication lag.
 
-Legacy (transitional): the original /nutrition snapshot was refreshed by Cloud Scheduler
-→ POST /internal/refresh-nutrition → TRUNCATE+INSERT. Since nutrition_visualisation is now
-a view, that refresh route + its scheduler job are dead and being retired once the
-dashboard moves from /nutrition to /nutrition-new.
+Legacy (transitional): the /nutrition read route remains alongside its replacement
+/nutrition-new (same shape, same view) and will be retired once the dashboard moves over.
+The old snapshot-refresh route + its Cloud Scheduler job have been removed.
 ```
 
 ### Flow 6 — Menu refresh (B command or weekly scheduler)

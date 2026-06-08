@@ -35,7 +35,7 @@ Each domain writes to its own Postgres schema. Never write across schemas.
 | `external_data` | Raw reference data from external sources (menus, scraped data) |
 | `system` | Internal state — Telegram raw payloads, outbound log, conversation state, OAuth tokens |
 | `marts` | Read-only analytics views — never written by the app |
-| `data_visualisation` | Live views over `b.*` / `finances` / `nutrition` for external read APIs — never written by the live request path. (Legacy nutrition snapshot-refresh retained transitionally, being retired.) |
+| `data_visualisation` | Live views over `b.*` / `finances` / `nutrition` for external read APIs — never written by the live request path. (Legacy `/nutrition` read route retained transitionally, being retired.) |
 
 If unsure which schema a new table belongs to, ask. Do not invent a new schema without approval.
 

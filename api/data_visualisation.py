@@ -2,13 +2,11 @@
 Public read API for data visualisation consumers (the awhitepen.com dashboard).
 
 All endpoints are served live from views in the data_visualisation schema — no snapshot
-tables, no refresh job. nutrition_visualisation is now a view too; the legacy /nutrition
-refresh route below (_refresh_nutrition + POST /internal/refresh-nutrition) is dead and
-retained only transitionally, being retired once the dashboard moves to /nutrition-new.
+tables, no refresh job. The legacy /nutrition read route is retained transitionally,
+being retired once the dashboard moves to /nutrition-new.
 
 Functions:
-  register_routes(app)        — registers the (legacy) nutrition refresh route + public read routes
-  _refresh_nutrition()        — (legacy, dead) TRUNCATE+INSERT; nutrition is a view now — do not use
+  register_routes(app)        — registers the public read routes
   _fetch_nutrition()          — (legacy) reads the nutrition view; returns (rows, refreshed_at)
   _fetch_nutrition_view()     — reads the nutrition view for /nutrition-new; returns (rows, refreshed_at)
   _fetch_aligner()            — queries the aligner view; returns (wear_events, tray_changes)
@@ -23,10 +21,9 @@ Functions:
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from api.limiter import limiter
@@ -97,30 +94,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-# Registers the internal refresh route and the public read route onto the FastAPI app.
+# Registers the public read routes onto the FastAPI app.
 # Called from app.py during startup alongside other inbound route registrations.
 def register_routes(app: FastAPI) -> None:
-
-    @app.post("/internal/refresh-nutrition", status_code=status.HTTP_200_OK)
-    async def refresh_nutrition(x_internal_key: str = Header(None)) -> dict:
-        # Refreshes data_visualisation.nutrition_visualisation from nutrition.food_log.
-        # Called by Cloud Scheduler every 15 minutes.
-        # Inputs: X-Internal-Key header matched against INTERNAL_API_KEY env var.
-        # Returns: {"ok": true, "rows": <count>} on success; 401 if key is wrong.
-        expected = os.environ.get("INTERNAL_API_KEY", "").strip()
-        if not expected or x_internal_key != expected:
-            log_event(logger, logging.WARNING, "nutrition_refresh_auth_rejected",
-                      key_present=(x_internal_key is not None))
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-
-        log_event(logger, logging.INFO, "nutrition_refresh_started")
-        try:
-            rows = await asyncio.to_thread(_refresh_nutrition)
-            log_event(logger, logging.INFO, "nutrition_visualisation_refreshed", rows=rows)
-            return {"ok": True, "rows": rows}
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "nutrition_visualisation_refresh_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @app.get("/api/data-visualisation/nutrition", status_code=status.HTTP_200_OK)
     @limiter.limit("5/minute")
@@ -269,33 +245,6 @@ def register_routes(app: FastAPI) -> None:
         response = JSONResponse(content={"refreshed_at": _now_iso(), "events": events})
         response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
         return response
-
-
-# Truncates data_visualisation.nutrition_visualisation and re-inserts the last 7 days
-# from nutrition.food_log in a single transaction. Opens and closes its own connection.
-# Returns: number of rows inserted.
-def _refresh_nutrition() -> int:
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("TRUNCATE data_visualisation.nutrition_visualisation")
-                cur.execute("""
-                    INSERT INTO data_visualisation.nutrition_visualisation
-                        (food_log_id, meal_type, food_item,
-                         kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg,
-                         logged_at, refreshed_at)
-                    SELECT
-                        food_log_id, meal_type, food_item,
-                        kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg,
-                        created_at, now()
-                    FROM nutrition.food_log
-                    WHERE created_at >= now() - INTERVAL '7 days'
-                    ORDER BY created_at
-                """)
-                return cur.rowcount
-    finally:
-        conn.close()
 
 
 # Queries all rows from data_visualisation.nutrition_visualisation ordered by logged_at.
