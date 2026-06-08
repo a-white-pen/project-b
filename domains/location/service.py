@@ -2,11 +2,15 @@
 Location domain — handles LOCATION message type.
 
 Saves B's shared location to b.location with IANA timezone (via timezonefinder, offline)
-and a human-readable English location name (via Nominatim reverse geocoding, free).
+and a human-readable location name + country (via Nominatim reverse geocoding, free).
 Application code reads b.location to get B's timezone as-of a given event timestamp.
 
 Functions:
-  handle_location(msg) — inserts a row into b.location, returns (reply, None)
+  handle_location(msg)         — inserts a row into b.location, returns (reply, None)
+  _coords_to_timezone(lat,lon) — offline IANA timezone lookup
+  _get_location_geo(lat,lon)   — Nominatim reverse geocode → (location_name, country)
+  _update_location_geo(...)    — sets location_name + country on the row post-insert
+  _insert_location(...)        — inserts the row, returns location_id
 """
 
 import logging
@@ -66,16 +70,16 @@ def handle_location(msg: InboundMessage) -> tuple[str, None]:
         log_failure(logger, logging.ERROR, "location_insert_failed", e, update_id=msg.update_id)
         return ("Got your location but failed to save it — please try again.", None)
 
-    # Enrich location_name best-effort — slow/rate-limited Nominatim won't block the insert.
-    location_name = _get_location_name(lat, lon)
-    if location_name and location_id is not None:
+    # Enrich location_name + country best-effort — slow/rate-limited Nominatim won't block the insert.
+    location_name, country = _get_location_geo(lat, lon)
+    if (location_name or country) and location_id is not None:
         try:
-            _update_location_name(location_id, location_name)
+            _update_location_geo(location_id, location_name, country)
         except Exception as e:
             log_failure(
                 logger,
                 logging.WARNING,
-                "location_name_update_failed",
+                "location_geo_update_failed",
                 e,
                 location_id=location_id,
             )
@@ -105,9 +109,10 @@ def _coords_to_timezone(lat: float, lon: float) -> str | None:
         return None
 
 
-# Returns a human-readable English location name from Nominatim, or None on failure.
-# Format: "District, City" e.g. "Bang Sue, Bangkok" or "Tanjong Pagar, Singapore".
-def _get_location_name(lat: float, lon: float) -> str | None:
+# Returns (location_name, country) from Nominatim, or (None, None) on failure.
+# location_name format: "District, City" e.g. "Bang Sue, Bangkok"; country is the English
+# country name (e.g. Thailand). Both are best-effort enrichment.
+def _get_location_geo(lat: float, lon: float) -> tuple[str | None, str | None]:
     try:
         resp = httpx.get(
             _NOMINATIM_URL,
@@ -131,13 +136,16 @@ def _get_location_name(lat: float, lon: float) -> str | None:
             or address.get("state")
             or address.get("country")
         )
+        country = address.get("country")
 
         if district and city:
-            return f"{district}, {city}"
-        return city or district or None
+            name = f"{district}, {city}"
+        else:
+            name = city or district or None
+        return name, country
     except Exception as e:
         log_failure(logger, logging.WARNING, "location_reverse_geocode_failed", e)
-        return None
+        return None, None
 
 
 # Inserts one row into b.location. Returns location_id for the follow-up location_name UPDATE.
@@ -168,13 +176,13 @@ def _insert_location(
         conn.close()
 
 
-# Updates location_name on an existing row after Nominatim returns.
-def _update_location_name(location_id: int, location_name: str) -> None:
-    sql = "UPDATE b.location SET location_name = %s WHERE location_id = %s"
+# Updates location_name + country on an existing row after Nominatim returns.
+def _update_location_geo(location_id: int, location_name: str | None, country: str | None) -> None:
+    sql = "UPDATE b.location SET location_name = %s, country = %s WHERE location_id = %s"
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (location_name, location_id))
+                cur.execute(sql, (location_name, country, location_id))
     finally:
         conn.close()

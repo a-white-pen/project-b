@@ -43,7 +43,7 @@
 
 `b` · `nutrition` · `finances` · `system` · `external_data` · `exercise` · `data_visualisation` — all Postgres.
 
-`data_visualisation` holds snapshot tables refreshed by Cloud Scheduler for external read APIs.
+`data_visualisation` holds live views over `b.*`, `finances`, and `nutrition` for the external read APIs. (A legacy `/nutrition` snapshot-refresh route + Cloud Scheduler job are retained transitionally, being retired once the dashboard moves to `/nutrition-new`.)
 Analytics views go in a `marts` schema when there is something worth visualizing. Not yet.
 
 ## Repo layout

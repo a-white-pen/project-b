@@ -79,7 +79,7 @@ SELECT location_id,
 | `created_at` | `timestamp with time zone` | yes |  |  |
 
 ### Table: `b.location`
-Log of every location B shares via Telegram. One row per LOCATION message. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API) and is immutable after insert. location_name is backfilled in a single UPDATE after the row is committed — Nominatim (OpenStreetMap, free, no API key) is called best-effort and may leave location_name NULL on geocoding failure; no other columns are ever changed. Application code falls back to Asia/Singapore if this table has no rows. Use b.latest_location view to get the active timezone.
+Log of every location B shares via Telegram. One row per LOCATION message. timezone is derived at insert time from lat/lon using timezonefinder (Python library, offline, no API) and is immutable after insert. location_name and country are backfilled in a single UPDATE after the row is committed — Nominatim (OpenStreetMap, free, no API key) is called best-effort and may leave them NULL on geocoding failure; no other columns are ever changed. Application code falls back to Asia/Singapore if this table has no rows. Use b.latest_location view to get the active timezone.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -90,6 +90,7 @@ Log of every location B shares via Telegram. One row per LOCATION message. timez
 | `timezone` | `text` | no |  | IANA timezone string derived offline via timezonefinder. e.g. Asia/Bangkok, Asia/Singapore. |
 | `location_name` | `text` | yes |  | Human-readable district and city in English via Nominatim. e.g. Bang Sue, Bangkok. Null if geocoding fails. |
 | `created_at` | `timestamp with time zone` | no | now() | Timestamp of the Telegram location message. |
+| `country` | `text` | yes |  | Country (English) from Nominatim reverse geocoding at insert time. NULL for rows geocoded before this column existed or on geocoding failure. |
 
 ### Table: `b.sleep_wake_events`
 One row per sleep boundary event for B. Grain: one sleep or one wake event. Pair a sleep row and a wake row to derive session duration. No telegram_update_id column — Telegram provenance is stored in meta. Deduplication is handled upstream by the webhook (system.telegram_inbound unique on update_id).
@@ -115,13 +116,99 @@ One row per body-weight reading for B. Grain: one measurement. No telegram_updat
 
 ## Schema: `data_visualisation`
 
-### Table: `data_visualisation.nutrition_visualisation`
-Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud Scheduler. Fully overwritten on each refresh (TRUNCATE + INSERT). Grain: one row per food_log_id from nutrition.food_log. Consumed by GET /api/data-visualisation/nutrition.
+### View: `data_visualisation.aligner_visualisation`
+Aligner widget feed (body). wear_events + tray_changes via record_type, rows >=15 min old. Notes excluded.
+
+**View definition:**
+```sql
+SELECT 'wear_event'::text AS record_type,
+    w.aligner_wear_event_id AS id,
+    w.removed_at,
+    w.reinserted_at,
+    w.upper_tray_number,
+    w.lower_tray_number,
+    NULL::text AS arch,
+    NULL::integer AS tray_number,
+    NULL::integer AS planned_days,
+    NULL::timestamp with time zone AS started_at,
+    NULL::timestamp with time zone AS ended_at
+   FROM b.aligner_wear_events w
+  WHERE w.created_at <= (now() - '00:15:00'::interval)
+UNION ALL
+ SELECT 'tray_change'::text AS record_type,
+    t.aligner_tray_change_id AS id,
+    NULL::timestamp with time zone AS removed_at,
+    NULL::timestamp with time zone AS reinserted_at,
+    NULL::integer AS upper_tray_number,
+    NULL::integer AS lower_tray_number,
+    t.arch,
+    t.tray_number,
+    t.planned_days,
+    t.started_at,
+    t.ended_at
+   FROM b.aligner_tray_changes t
+  WHERE t.created_at <= (now() - '00:15:00'::interval);
+```
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `food_log_id` | `integer` | no |  | Primary key sourced from nutrition.food_log.food_log_id. Stable within a refresh cycle. |
-| `meal_type` | `text` | yes |  | Meal slot. Values: breakfast, brunch, lunch, snack, dinner, supper, pre_workout, post_workout. |
+| `record_type` | `text` | yes |  |  |
+| `id` | `integer` | yes |  |  |
+| `removed_at` | `timestamp with time zone` | yes |  |  |
+| `reinserted_at` | `timestamp with time zone` | yes |  |  |
+| `upper_tray_number` | `integer` | yes |  |  |
+| `lower_tray_number` | `integer` | yes |  |  |
+| `arch` | `text` | yes |  |  |
+| `tray_number` | `integer` | yes |  |  |
+| `planned_days` | `integer` | yes |  |  |
+| `started_at` | `timestamp with time zone` | yes |  |  |
+| `ended_at` | `timestamp with time zone` | yes |  |  |
+
+### View: `data_visualisation.location_visualisation`
+Awake & location widget feed (today). City (from location_name, district dropped) + country (b.location.country, from Nominatim) + timezone. No coordinates.
+
+**View definition:**
+```sql
+SELECT NULLIF(btrim(regexp_replace(location_name, '^.*,'::text, ''::text)), ''::text) AS city,
+    country,
+    timezone
+   FROM b.location
+  WHERE created_at <= (now() - '00:15:00'::interval)
+  ORDER BY created_at DESC
+ LIMIT 1;
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `city` | `text` | yes |  |  |
+| `country` | `text` | yes |  |  |
+| `timezone` | `text` | yes |  |  |
+
+### View: `data_visualisation.nutrition_visualisation`
+Fuel widget feed. Live view over nutrition.food_log, full history, rows >=15 min old.
+
+**View definition:**
+```sql
+SELECT food_log_id,
+    meal_type,
+    food_item,
+    kcal,
+    protein_g,
+    carbs_g,
+    fat_g,
+    fibre_g,
+    sugar_g,
+    sodium_mg,
+    created_at AS logged_at,
+    now() AS refreshed_at
+   FROM nutrition.food_log f
+  WHERE created_at <= (now() - '00:15:00'::interval);
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `food_log_id` | `integer` | yes |  |  |
+| `meal_type` | `text` | yes |  |  |
 | `food_item` | `text` | yes |  |  |
 | `kcal` | `numeric(7,2)` | yes |  |  |
 | `protein_g` | `numeric(6,2)` | yes |  |  |
@@ -130,8 +217,111 @@ Rolling 7-day window of food log entries, refreshed every 15 minutes via Cloud S
 | `fibre_g` | `numeric(6,2)` | yes |  |  |
 | `sugar_g` | `numeric(6,2)` | yes |  |  |
 | `sodium_mg` | `numeric(7,2)` | yes |  |  |
-| `logged_at` | `timestamp with time zone` | no |  | created_at from the source food_log row — when B actually ate the item. |
-| `refreshed_at` | `timestamp with time zone` | no |  | Timestamp when this refresh batch ran. Identical across all rows after each TRUNCATE + INSERT. Use this to show "data as of X" in the dashboard. |
+| `logged_at` | `timestamp with time zone` | yes |  |  |
+| `refreshed_at` | `timestamp with time zone` | yes |  |  |
+
+### View: `data_visualisation.sleep_visualisation`
+Awake/asleep state for the today widget. Live view over b.sleep_wake_events, full history, rows >=15 min old.
+
+**View definition:**
+```sql
+SELECT event_type,
+    occurred_at
+   FROM b.sleep_wake_events
+  WHERE created_at <= (now() - '00:15:00'::interval);
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `event_type` | `text` | yes |  |  |
+| `occurred_at` | `timestamp with time zone` | yes |  |  |
+
+### View: `data_visualisation.spend_visualisation`
+Expenses widget feed (resources). Real spends, SGD>0, last ~6 months, rows >=15 min old. English item names only.
+
+**View definition:**
+```sql
+SELECT spend_entry_id,
+    spent_at,
+    merchant_name_raw,
+    platform,
+    category,
+    COALESCE(( SELECT array_agg(t.elem ->> 'name'::text ORDER BY t.ord) AS array_agg
+           FROM jsonb_array_elements(
+                CASE
+                    WHEN jsonb_typeof(s.items_json -> 'lines'::text) = 'array'::text THEN s.items_json -> 'lines'::text
+                    ELSE '[]'::jsonb
+                END) WITH ORDINALITY t(elem, ord)
+          WHERE NULLIF(btrim(t.elem ->> 'name'::text), ''::text) IS NOT NULL), ARRAY[]::text[]) AS items,
+    sgd_amount,
+    fx_rate_source,
+    payment_method
+   FROM finances.spend_entries s
+  WHERE COALESCE(ignored_reason, ''::text) = ''::text AND sgd_amount > 0::numeric AND spent_at >= (now() - '6 mons'::interval) AND created_at <= (now() - '00:15:00'::interval);
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `spend_entry_id` | `integer` | yes |  |  |
+| `spent_at` | `timestamp with time zone` | yes |  |  |
+| `merchant_name_raw` | `text` | yes |  |  |
+| `platform` | `text` | yes |  |  |
+| `category` | `text` | yes |  |  |
+| `items` | `text[]` | yes |  |  |
+| `sgd_amount` | `numeric(6,2)` | yes |  |  |
+| `fx_rate_source` | `text` | yes |  |  |
+| `payment_method` | `text` | yes |  |  |
+
+### View: `data_visualisation.weight_visualisation`
+Weight widget feed (body). One row per local day (first weigh-in), rows >=15 min old.
+
+**View definition:**
+```sql
+WITH eligible AS (
+         SELECT w.measured_at,
+            w.weight_kg
+           FROM b.weight_measurements w
+          WHERE w.created_at <= (now() - '00:15:00'::interval)
+        ), localized AS (
+         SELECT e.measured_at,
+            e.weight_kg,
+            COALESCE(( SELECT l.timezone
+                   FROM b.location l
+                  WHERE l.created_at <= e.measured_at
+                  ORDER BY l.created_at DESC
+                 LIMIT 1), ( SELECT latest_location.timezone
+                   FROM b.latest_location), 'Asia/Singapore'::text) AS tz
+           FROM eligible e
+        ), with_wake AS (
+         SELECT lo.measured_at,
+            lo.weight_kg,
+            (lo.measured_at AT TIME ZONE lo.tz) AS measured_at_local,
+            wake.occurred_at AS wake_at
+           FROM localized lo
+             LEFT JOIN LATERAL ( SELECT e.occurred_at
+                   FROM b.sleep_wake_events e
+                  WHERE e.event_type = 'wake'::text AND e.occurred_at <= lo.measured_at AND e.occurred_at >= (lo.measured_at - '06:00:00'::interval) AND (( SELECT s.event_type
+                           FROM b.sleep_wake_events s
+                          WHERE s.occurred_at < e.occurred_at
+                          ORDER BY s.occurred_at DESC
+                         LIMIT 1)) = 'sleep'::text
+                  ORDER BY e.occurred_at DESC
+                 LIMIT 1) wake ON true
+        )
+ SELECT DISTINCT ON ((measured_at_local::date)) measured_at,
+    measured_at_local,
+    weight_kg,
+    round(EXTRACT(epoch FROM measured_at - wake_at) / 60::numeric)::integer AS minutes_after_wake
+   FROM with_wake
+  ORDER BY (measured_at_local::date), measured_at;
+```
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `measured_at` | `timestamp with time zone` | yes |  |  |
+| `measured_at_local` | `timestamp without time zone` | yes |  |  |
+| `weight_kg` | `numeric(5,2)` | yes |  |  |
+| `minutes_after_wake` | `integer` | yes |  |  |
 
 ## Schema: `exercise`
 

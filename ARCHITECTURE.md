@@ -128,13 +128,17 @@ Cloud Tasks
   → updates system.reminders row
 ```
 
-### Flow 5 — Cloud Scheduler refreshes the visualisation snapshot
+### Flow 5 — Dashboard read models (live views)
 
 ```
-Cloud Scheduler (*/15 * * * *)
-  → POST /internal/refresh-nutrition   X-Internal-Key header checked against INTERNAL_API_KEY
-  → api/data_visualisation.py          TRUNCATE + INSERT from nutrition.food_log (last 7 days)
-  → data_visualisation.nutrition_visualisation   snapshot table updated
+data_visualisation.* are live VIEWS over b.* / finances / nutrition — no snapshot tables,
+no refresh job. The public read endpoints query them directly; each view applies a
+15-minute publication lag.
+
+Legacy (transitional): the original /nutrition snapshot was refreshed by Cloud Scheduler
+→ POST /internal/refresh-nutrition → TRUNCATE+INSERT. Since nutrition_visualisation is now
+a view, that refresh route + its scheduler job are dead and being retired once the
+dashboard moves from /nutrition to /nutrition-new.
 ```
 
 ### Flow 6 — Menu refresh (B command or weekly scheduler)
@@ -165,10 +169,14 @@ Query current menu: `SELECT * FROM external_data.menu_items WHERE scraped_at = (
 
 External consumers (e.g. awhitepen.com dashboard) read from:
 ```
-GET /api/data-visualisation/nutrition
-  → rate limited: 5/min + 200/day per IP, 1000/day per instance (in-memory; not shared across Cloud Run instances)
-  → reads data_visualisation.nutrition_visualisation
-  → returns {"refreshed_at": <iso8601>, "data": [...]}
+GET /api/data-visualisation/nutrition-new   reads nutrition_visualisation (view) → {"refreshed_at", "data":[...]}
+GET /api/data-visualisation/nutrition        legacy alias, same view — retained transitionally
+GET /api/data-visualisation/aligner          reads aligner_visualisation → {"refreshed_at", "wear_events":[...], "tray_changes":[...]}
+GET /api/data-visualisation/weight           reads weight_visualisation → bare array [{Date, Day, "Weighing Time", "Weight kg", "Minutes After Wake"}]
+GET /api/data-visualisation/spend            reads spend_visualisation → {"refreshed_at", "data":[...]}
+GET /api/data-visualisation/location         reads location_visualisation → {city, country, timezone}
+GET /api/data-visualisation/sleep            reads sleep_visualisation → {"refreshed_at", "events":[...]}
+  All rate limited: 5/min + 200/day per IP, 1000/day per instance (in-memory, per Cloud Run instance).
 ```
 
 **Invariants — do not break these:**
