@@ -1,7 +1,8 @@
 """
 Routes normalized inbound messages to domain handlers based on LLM-classified intent.
 Callback query updates are routed deterministically from callback_data, not via the LLM.
-Slash commands are reserved for administrative actions that command the bot to do something.
+Slash commands are reserved for administrative or read/status actions (e.g. /refresh_menus,
+/aligner_status, /attention_status) and bypass the LLM — never for data logging.
 Free-form messages (text, photo, voice) are classified by the LLM.
 
 Functions:
@@ -38,7 +39,11 @@ from domains.aligner.service import (
     handle_aligner_status,
 )
 from domains.attention.correction import handle_attention_correction
-from domains.attention.service import handle_attention_log, try_handle_wake_as_nap_end
+from domains.attention.service import (
+    handle_attention_log,
+    handle_attention_status,
+    try_handle_wake_as_nap_end,
+)
 from domains.expense.correction import handle_expense_correction
 from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
@@ -72,6 +77,7 @@ class Intent(str, Enum):
     LOG_WAKE = "log_wake"               # just woke up
     LOG_EXPENSE = "log_expense"         # logging money spent
     LOG_ATTENTION = "log_attention"     # logging what B is working on / paying attention to
+    ATTENTION_STATUS = "attention_status"  # /attention_status — current focus + today's per-category breakdown
     LOG_ALIGNER_OUT = "log_aligner_out" # 🍽️ OUT button tap — aligners came out of the mouth
     LOG_ALIGNER_IN = "log_aligner_in"   # 🦷 IN button tap — aligners back in the mouth
     ALIGNER_STATUS = "aligner_status"   # /aligner_status — read current state + bootstrap keyboard
@@ -83,12 +89,13 @@ class Intent(str, Enum):
 
 
 # Maps slash commands to intents — bypasses LLM entirely.
-# Slash commands are for administrative bot actions, not data logging.
+# Slash commands are for administrative or read/status bot actions, not data logging.
 # Free-form messages (text, photo, voice) go through the LLM classifier instead.
 # /command@BotName form (used in groups) is handled by stripping the @suffix.
 _COMMAND_MAP: dict[str, Intent] = {
     "/refresh_menus": Intent.REFRESH_MENUS,
     "/aligner_status": Intent.ALIGNER_STATUS,
+    "/attention_status": Intent.ATTENTION_STATUS,
 }
 
 # Maps the exact aligner reply-keyboard button labels to intents — like slash commands,
@@ -505,6 +512,8 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | Non
         return [handle_expense_log(msg)]
     if intent == Intent.LOG_ATTENTION:
         return handle_attention_log(msg)  # already returns list — one entry per session block
+    if intent == Intent.ATTENTION_STATUS:
+        return handle_attention_status(msg)  # already returns list — read-only status reply
     if intent == Intent.LOG_ALIGNER_OUT:
         return handle_aligner_out(msg)  # already returns list (with reply_markup)
     if intent == Intent.LOG_ALIGNER_IN:

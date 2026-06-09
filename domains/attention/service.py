@@ -3,6 +3,7 @@ Attention logging domain — handles log_attention intent.
 
 Public functions:
   handle_attention_log(msg)              — parses an attention start/finish message and persists it
+  handle_attention_status(msg)           — reports the current open session + today's per-main-category breakdown + untracked remainder (powers /attention_status); read-only, writes no state
   try_handle_wake_as_nap_end(msg)        — when B says "wake up" with an open rest session, close the nap instead of logging a wake event; returns None to fall through to sleep/wake
   close_open_sessions_externally(...)    — cross-domain API: closes any open attention session on behalf of another domain (e.g. sleep handler when B says "night night" without finishing first). Returns end-block replies; empty list when nothing open
   build_attention_state(...)             — constructs the conversation_state dict for one session reply; canonical state schema source so service.py and correction.py don't drift
@@ -16,17 +17,21 @@ Internal handlers:
 DB access:
   _get_open_session(cur)                 — fetches the most recent open attention session, if one exists
   _get_all_open_sessions(cur)            — fetches ALL open sessions DESC by started_at; used by start/finish for sweep-close semantics
+  _get_last_closed_session(cur)          — fetches the most recently closed session (latest ended_at); powers the "nothing open · last logged …" line
   _lock_attention_writes(cur)            — acquires a transaction-scoped advisory lock that serializes all attention writes
   _insert_session(...)                   — inserts a new b.attention_sessions row
   _close_session(...)                    — closes an open b.attention_sessions row
   _get_overlapping_sessions(...)         — fetches sessions that overlap a proposed interval
   _row_to_session(row)                   — converts a DB row into a session dict
   _get_daily_total_minutes(...)          — sums minutes for a main category over a UTC day-window; powers the "today · 1h 12m work" footer
+  _get_window_category_minutes(...)      — sums per-main-category minutes CLIPPED to a UTC window (LEAST/GREATEST overlap); powers the /attention_status ledger as a true partition of waking time so far
   _get_wake_day_window_utc(...)          — computes [day_start, day_end) for the daily total, anchored to B's most recent morning wake (local-4am fallback)
   _get_most_recent_morning_wake_utc(...) — looks up the most recent wake-after-sleep in the last 24h
 
 Rendering / formatting:
   _format_session_block(...)             — single-blockquote formatter for "activity <verb>" replies. Header + one combined blockquote (category, project, also lines, description, time(s)) + italic day-total footer (closed only) + blank line + expandable Categories menu (suppressed for "removed"). Shared with correction.py for "activity updated" / "activity removed"
+  _format_attention_status(...)          — renders the /attention_status reply (design "v3", Option A): "Right now" block + divider + "Today so far · awake …" monospace <pre> ledger (label · time · █ bar · share-of-awake %) per main category + untracked residual
+  _friendly_label(name)                  — taxonomy name → title-cased phrase for the "Right now"/"last" line (deep_work → "Deep work")
   _format_change_category_menu()         — renders the <blockquote expandable> labelled "Categories:" listing every (main, [subs]) taxonomy row. Attached to every reply except "removed"
   _build_session_reply(...)              — builds the (reply, state) tuple for one session block; state scopes the correction to that single session
   _format_category_label(...)            — "🟦 <b>work : deep_work</b>" — emoji-by-main-category + bold "main : sub" label (space-colon-space)
@@ -103,6 +108,16 @@ _CATEGORY_EMOJI: dict[str, str] = {
     "transit":   "⬜",
     "other":     "⬛",
 }
+
+# Bullet for the residual "untracked" row in /attention_status (waking time no session
+# covers). Deliberately a circle, not a colored square, so it reads as a meta/residual
+# row distinct from the 8 taxonomy categories — none of which use a circle.
+_UNTRACKED_EMOJI = "⚪"
+
+# Typed horizontal rule between the "Right now" and "Today so far" sections of the
+# /attention_status reply (U+2500 ×14). Telegram bot messages have no <hr>, so the divider
+# is literal box-drawing text, per the "Attention Status Reply v3" design.
+_STATUS_DIVIDER = "─" * 14
 
 
 # Returns True when (category, subcategory) is a valid v3 taxonomy pair.
@@ -292,6 +307,89 @@ def handle_attention_log(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     if action == "log_completed":
         return _handle_completed(msg, occurred_at, extracted)
     return _handle_start(msg, occurred_at, extracted)
+
+
+# Handles the /attention_status read command. Renders the "Attention Status Reply v3"
+# design (Option A): a "Right now" block (open session, or "Nothing open" + the last logged
+# session), a divider, and a "Today so far · awake <Xh Ym>" monospace ledger showing minutes,
+# a █ bar, and share-of-awake % per MAIN category plus an "untracked" residual.
+# Read-only — writes nothing and returns no pending state (None), so quoting the reply
+# does not trigger a correction.
+# Inputs: InboundMessage from the /attention_status dispatch in telegram/router.py.
+# Outputs: a single-element list [(reply_text, None)] (matches the other handlers' shape).
+#
+# "Awake / since waking" uses the same wake-day window as the end-block footer
+# (_get_wake_day_window_utc — anchored to B's most recent morning wake, local-4am
+# fallback). The currently-open session's running time is folded into its category total
+# so the breakdown reflects time spent so far including the in-progress activity, and the
+# percentages are each category's share of waking time so far.
+def handle_attention_status(msg: InboundMessage) -> list[tuple[str, dict | None]]:
+    now_utc = msg.timestamp if msg.timestamp is not None else datetime.now(timezone.utc)
+    log_event(logger, logging.INFO, "attention_status_requested", update_id=msg.update_id)
+
+    # Resolve the wake-day window BEFORE opening our own connection: _get_wake_day_window_utc
+    # opens its own connection for the morning-wake lookup, so keeping the two calls sequential
+    # avoids holding two connections at once.
+    tz = get_timezone(now_utc)
+    day_start_utc, day_end_utc = _get_wake_day_window_utc(now_utc, tz)
+
+    last_closed: dict | None = None
+    try:
+        conn = get_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    open_sessions = _get_all_open_sessions(cur, for_update=False)
+                    # Only need the last logged session when nothing is currently open.
+                    if not open_sessions:
+                        last_closed = _get_last_closed_session(cur)
+                    # Clip closed-session time to [day_start, min(now, day_end)] so the ledger
+                    # is a true partition of waking time so far (shares ≤ 100%, untracked ≥ 0).
+                    category_totals = _get_window_category_minutes(
+                        cur, day_start_utc, min(now_utc, day_end_utc)
+                    )
+        finally:
+            conn.close()
+    except Exception as e:
+        log_failure(logger, logging.ERROR, "attention_status_fetch_failed", e, update_id=msg.update_id)
+        return [("Couldn't read your attention state — try again.", None)]
+
+    open_session = open_sessions[0] if open_sessions else None
+
+    # Fold the open session's running time into its main-category total. Counted from
+    # max(started_at, day_start) so an overnight-open session contributes only the slice
+    # inside today's window — matching the by-ended_at attribution used for closed sessions.
+    totals = dict(category_totals)
+    if open_session is not None:
+        running = _duration_minutes(max(open_session["started_at"], day_start_utc), now_utc)
+        if running > 0:
+            cat = open_session["category"]
+            totals[cat] = totals.get(cat, 0) + running
+
+    # Untracked = waking time so far not covered by any session. Closed totals are clipped to
+    # the waking window and the open-session fold is clipped to [day_start, now], and closed
+    # sessions never overlap each other or the open one (one-open invariant + overlap-rejecting
+    # corrections) — so sum(totals) ≤ elapsed and the displayed category lines plus this
+    # remainder are a complete partition of waking time so far. max(0, …) stays as a
+    # belt-and-suspenders against per-category integer rounding.
+    elapsed_minutes = _duration_minutes(day_start_utc, now_utc)
+    untracked_minutes = max(0, elapsed_minutes - sum(totals.values()))
+
+    reply = _format_attention_status(
+        now_utc, open_session, last_closed, totals, untracked_minutes, elapsed_minutes
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "attention_status_sent",
+        update_id=msg.update_id,
+        has_open_session=open_session is not None,
+        open_session_id=open_session["attention_session_id"] if open_session else None,
+        category_count=sum(1 for m in totals.values() if m > 0),
+        untracked_minutes=untracked_minutes,
+        awake_minutes=elapsed_minutes,
+    )
+    return [(reply, None)]
 
 
 # Closes an open category=rest attention session when B says "wake up" mid-nap.
@@ -869,6 +967,24 @@ def _get_open_session(cur, for_update: bool = False) -> dict | None:
     return rows[0] if rows else None
 
 
+# Fetches the most recently CLOSED attention session (latest ended_at). Read-only — powers
+# the "nothing open · last logged …" line in /attention_status when no session is running.
+# Inputs: an open DB cursor. Outputs: session dict, or None when nothing has ever been closed.
+def _get_last_closed_session(cur) -> dict | None:
+    cur.execute(
+        """
+        SELECT attention_session_id, category, subcategory, description, project,
+               started_at, ended_at, notes, meta
+        FROM b.attention_sessions
+        WHERE ended_at IS NOT NULL
+        ORDER BY ended_at DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    return _row_to_session(row) if row else None
+
+
 # Acquires a transaction-scoped advisory lock that serializes all attention writes.
 # Inputs: an open DB cursor inside a transaction.
 # Outputs: none — the call blocks (couple of ms typical) until any other attention write
@@ -1103,6 +1219,114 @@ def _format_session_block(verb: str, session: dict, now_utc: datetime) -> str:
     return "\n".join(parts)
 
 
+# Rounds half up (toward +∞) for non-negative inputs, matching the design's JS Math.round so
+# the /attention_status percentages and bar lengths land exactly as in the approved mock.
+# Python's built-in round() uses banker's rounding, which differs by one on exact .5 cases.
+def _round_half_up(value: float) -> int:
+    return int(value + 0.5)
+
+
+# Renders a stored taxonomy name (main or sub) as a friendly title-cased phrase for the
+# "Right now" / "last" line: underscores → spaces, first letter capitalised (deep_work →
+# "Deep work", social_in_person → "Social in person"). Only the first character is touched,
+# so any intentional casing later in the word is preserved.
+def _friendly_label(name: str) -> str:
+    spaced = name.replace("_", " ")
+    return spaced[:1].upper() + spaced[1:] if spaced else spaced
+
+
+# Renders the /attention_status reply — the "Attention Status Reply v3" design, Option A.
+# One Telegram-HTML bubble, three stacked sections (no blockquotes):
+#   "Right now"  — open session: colour square + friendly subcategory, italic description,
+#                  "since <time> · <elapsed>". Nothing open: "Nothing open" + the last logged
+#                  session ('<sq> last · <Sub> "<desc>"' / 'ended <time> · <N> ago'); a bare
+#                  "Nothing open" only when nothing has ever been closed.
+#   divider      — the typed ────────────── rule (_STATUS_DIVIDER).
+#   "Today so far · awake <Xh Ym>" — header, then a monospace <pre> ledger: one row per non-zero
+#                  main category plus the untracked residual, each
+#                  "<sq> <label> <time>  <█-bar> <pct>%". Columns are space-aligned; the bar is
+#                  monochrome █ scaled so the biggest row gets 7 squares; pct is share of awake.
+#                  Rows sorted biggest-first (name tiebreak; "" pins untracked ahead on a tie).
+#                  "nothing yet" when every row is zero.
+# Colour comes only from the one leading square per row (Telegram can't colour text or █); a
+# single constant-width square per row keeps the <pre> columns aligned.
+# Inputs: now (UTC); the open session dict (or None); the last closed session (or None, used only
+# when nothing is open); {main_category: minutes} totals already inclusive of the open session's
+# running time; the untracked remainder; and awake_minutes (waking time so far) for the header
+# and the percentages. Output: Telegram-HTML string.
+def _format_attention_status(
+    now_utc: datetime,
+    open_session: dict | None,
+    last_closed: dict | None,
+    category_totals: dict[str, int],
+    untracked_minutes: int,
+    awake_minutes: int,
+) -> str:
+    tz = get_timezone(now_utc)
+
+    # ── Right now ────────────────────────────────────────────────────────────────
+    if open_session is not None:
+        started_local = open_session["started_at"].astimezone(tz)
+        elapsed = _format_duration_short(_duration_minutes(open_session["started_at"], now_utc))
+        emoji = _CATEGORY_EMOJI.get(open_session["category"], "⬜")
+        sub = escape(_friendly_label(open_session.get("subcategory") or "other"))
+        description = escape(open_session.get("description") or "(no description)")
+        now_block = (
+            "<b>Right now</b>\n"
+            f"{emoji} <b>{sub}</b>\n"
+            f"<i>“{description}”</i>\n"
+            f"since {escape(_format_time_12h(started_local))} · <b>{escape(elapsed)}</b>"
+        )
+    elif last_closed is not None:
+        ended_local = last_closed["ended_at"].astimezone(tz)
+        ago_min = _duration_minutes(last_closed["ended_at"], now_utc)
+        ago = "just now" if ago_min == 0 else f"{_format_duration_short(ago_min)} ago"
+        emoji = _CATEGORY_EMOJI.get(last_closed["category"], "⬜")
+        sub = escape(_friendly_label(last_closed.get("subcategory") or "other"))
+        description = escape(last_closed.get("description") or "(no description)")
+        now_block = (
+            "<b>Right now</b>\n"
+            "<i>Nothing open</i>\n"
+            f"{emoji} last · <b>{sub}</b> <i>“{description}”</i>\n"
+            f"ended {escape(_format_time_12h(ended_local))} · {escape(ago)}"
+        )
+    else:
+        now_block = "<b>Right now</b>\n<i>Nothing open</i>"
+
+    # ── Today so far ─────────────────────────────────────────────────────────────
+    header = f"<b>Today so far · awake {escape(_format_duration_short(max(0, awake_minutes)))}</b>"
+
+    # rows: (minutes, sort_name, ledger_label). untracked uses "" as sort_name so it pins
+    # ahead of a same-minute category, matching the breakdown's tiebreak elsewhere.
+    rows: list[tuple[int, str, str]] = [
+        (mins, cat, cat.replace("_", " ")) for cat, mins in category_totals.items() if mins > 0
+    ]
+    if untracked_minutes > 0:
+        rows.append((untracked_minutes, "", "untracked"))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+
+    if rows:
+        pcts = [_round_half_up(m / awake_minutes * 100) if awake_minutes > 0 else 0 for m, _, _ in rows]
+        times = [_format_duration_short(m) for m, _, _ in rows]
+        max_pct = max(pcts) or 1
+        label_w = max(len(lbl) for _, _, lbl in rows)
+        time_w = max(len(t) for t in times)
+        lines = []
+        for (_, name, lbl), tstr, pct in zip(rows, times, pcts):
+            emoji = _UNTRACKED_EMOJI if name == "" else _CATEGORY_EMOJI.get(name, "⬜")
+            squares = max(1, min(7, _round_half_up(pct / max_pct * 7)))
+            bar = ("█" * squares).ljust(7)
+            # Two-space gutter between label and time so the widest label (e.g. "untracked")
+            # never butts against a full-width time like "1h 12m"; times stay right-aligned.
+            line = f"{emoji} {lbl.ljust(label_w)}  {tstr.rjust(time_w)}  {bar} {(str(pct) + '%').rjust(4)}"
+            lines.append(escape(line))
+        ledger = "<pre>" + "\n".join(lines) + "</pre>"
+    else:
+        ledger = "<i>nothing yet</i>"
+
+    return f"{now_block}\n{_STATUS_DIVIDER}\n{header}\n{ledger}"
+
+
 # Renders the "change category" expandable blockquote attached to the bottom of every
 # started/ended/updated reply. Uses Telegram's <blockquote expandable> attribute so
 # the menu collapses to a short preview with a "▾" caret; tapping expands the full
@@ -1245,6 +1469,39 @@ def _get_daily_total_minutes(category: str, day_start_utc: datetime, day_end_utc
             day_start_utc=day_start_utc.isoformat(),
         )
         return 0
+
+
+# Sums minutes per MAIN category that CLOSED b.attention_sessions spend INSIDE the half-open
+# window [window_start, window_end) — each session clipped to its overlap with the window via
+# LEAST/GREATEST, never counted beyond it. Powers the "Today so far · awake" ledger in
+# /attention_status, where the totals must be a true partition of waking time so far: clipping
+# keeps every category's share ≤ 100% and the untracked remainder ≥ 0.
+#
+# NOTE: this deliberately differs from _get_daily_total_minutes (the end-block footer), which
+# attributes each session's FULL duration to its ended_at day. The footer answers "total time
+# in this category today"; this answers "share of the waking window so far" — so a session
+# straddling the wake anchor (e.g. 8–10am with a 9am wake) contributes only its in-window slice
+# here, not its whole length. Callers should pass window_end = min(now, day_end).
+#
+# Inputs: an OPEN DB cursor (caller owns the connection/transaction) and the UTC window bounds.
+# Outputs: {main_category: minutes} containing only categories with in-window time; categories
+# with none are absent (so the caller renders non-zero rows only).
+def _get_window_category_minutes(cur, window_start: datetime, window_end: datetime) -> dict[str, int]:
+    cur.execute(
+        """
+        SELECT category,
+               SUM(GREATEST(0, EXTRACT(EPOCH FROM (
+                   LEAST(ended_at, %(win_end)s) - GREATEST(started_at, %(win_start)s)
+               )) / 60.0))::int AS minutes
+        FROM b.attention_sessions
+        WHERE ended_at IS NOT NULL
+          AND ended_at   > %(win_start)s
+          AND started_at < %(win_end)s
+        GROUP BY category
+        """,
+        {"win_start": window_start, "win_end": window_end},
+    )
+    return {row[0]: int(row[1]) for row in cur.fetchall() if row[1] is not None}
 
 
 # Returns (day_start_utc, day_end_utc) for the "wake-day" total window anchored to

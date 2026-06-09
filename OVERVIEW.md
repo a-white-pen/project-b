@@ -21,7 +21,7 @@
 
 **Stub/minimal:** general ask, data query.
 
-**Slash commands:** admin/read actions only. `/refresh_menus` triggers a full scrape across all restaurant sources and reports back via Telegram. `/aligner_status` (on `feat/aligner-module`) reports current aligner state and docks the keyboard. Free-form text still goes through the LLM classifier as before.
+**Slash commands:** admin/read actions only. `/refresh_menus` triggers a full scrape across all restaurant sources and reports back via Telegram. `/aligner_status` (on `feat/aligner-module`) reports current aligner state and docks the keyboard. `/attention_status` reports what B's attention is currently on (the open session, or "Nothing open" + the last logged session and how long ago it ended), then a "Today so far · awake Xh Ym" monospace ledger — per main category: time, a `█` bar, and share-of-waking-day %, plus an "untracked" residual (rendered per the "Attention Status Reply v3" design, Option A). Free-form text still goes through the LLM classifier as before.
 
 ## Scope
 
