@@ -30,6 +30,7 @@ import dataclasses
 import hmac
 import json
 import logging
+import os
 from json import JSONDecodeError
 
 from system.logging import configure_logging, get_error_summary, log_event, log_failure
@@ -86,6 +87,17 @@ def register_routes(app: FastAPI) -> None:
             # malformed. Postgres NULL != NULL so ON CONFLICT would not deduplicate it, and
             # a second such request would produce duplicate domain rows. Reject early.
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing update_id")
+
+        # Owner allowlist: this is a single-user personal bot with no per-user data isolation, so an
+        # update from anyone but the owner must be dropped — otherwise a stranger who finds the bot could
+        # read the owner's data back (it replies to the sender) or pollute the warehouse. When
+        # TELEGRAM_OWNER_CHAT_ID is set we 200-and-ignore non-owners (acknowledge to Telegram, process
+        # nothing, store nothing). If the env var is unset the allowlist is OFF (backward compatible).
+        if not _is_owner(payload):
+            log_event(logger, logging.WARNING, "webhook_unauthorized_sender_dropped",
+                      update_id=update_id, sender_id=_sender_id(payload))
+            return {"ok": True}
+
         chat_id, message_id = _extract_chat_and_message_id(payload)
 
         inserted = await asyncio.to_thread(_store_inbound, payload, update_id)
@@ -297,6 +309,39 @@ def _extract_chat_and_message_id(payload: dict) -> tuple[int | None, int | None]
             if chat:
                 return chat.get("id"), None  # don't quote bot's own keyboard message
     return None, None
+
+
+# Allowed Telegram user ids (the bot's owner). Read from TELEGRAM_OWNER_CHAT_ID (comma-separated).
+# Empty set = allowlist disabled (process everyone, the prior behaviour).
+def _owner_ids() -> set[int]:
+    ids: set[int] = set()
+    for tok in os.environ.get("TELEGRAM_OWNER_CHAT_ID", "").replace(" ", "").split(","):
+        if tok:
+            try:
+                ids.add(int(tok))
+            except ValueError:
+                pass
+    return ids
+
+
+# The Telegram user id that sent this update (message/edited/channel/callback). None if not present.
+def _sender_id(payload: dict) -> int | None:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        m = payload.get(key)
+        if m and m.get("from"):
+            return (m["from"] or {}).get("id")
+    cq = payload.get("callback_query")
+    if cq and cq.get("from"):
+        return (cq["from"] or {}).get("id")
+    return None
+
+
+# True if this update is from the bot owner (or the allowlist is disabled). Used to drop strangers.
+def _is_owner(payload: dict) -> bool:
+    owners = _owner_ids()
+    if not owners:
+        return True   # allowlist disabled (TELEGRAM_OWNER_CHAT_ID unset)
+    return _sender_id(payload) in owners
 
 
 # Checks the X-Telegram-Bot-Api-Secret-Token header against our configured secret.
