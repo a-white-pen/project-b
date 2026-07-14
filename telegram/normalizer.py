@@ -37,6 +37,7 @@ def normalize(payload: dict) -> InboundMessage:
             location=None,
             callback_data=cq.get("data"),
             timestamp=_parse_ts(msg.get("date")),
+            callback_query_id=cq.get("id"),
         )
 
     for key in ("message", "edited_message", "channel_post", "edited_channel_post"):

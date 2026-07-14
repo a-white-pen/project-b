@@ -13,4 +13,6 @@ HANDOFF.md
 HANDOVER_NEW_AGENT.md
 .claude/
 schema/old_schema_snapshot_*_reference_only.json
+schema/private_relations.txt
 PLAN_*.md
+agentic/

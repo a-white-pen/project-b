@@ -1,0 +1,330 @@
+# ---------------------------------------------------------------------------
+# Strength exercise catalog — STRUCTURAL data only (slow-changing).
+#
+# This file answers: which exercises exist, how they map to Garmin FIT codes,
+# where B does them (gym vs apartment), and what equipment + weight increments apply.
+#
+# Reps, sets AND rest are deliberately NOT stored here — the planner's model decides ALL
+# of them per exercise from best evidence (hypertrophy/strength science: rep ranges by
+# role, ~10–20 hard sets/muscle/week, rest by load) AND B's own data: recent
+# exercise.strength_sets history, current weight, recovery (sleep/running), the whole
+# session mix + the ~80 min budget, and her goals. The catalog is STRUCTURAL only — what
+# each exercise IS and how it maps to Garmin — never the prescription.
+#
+# It deliberately does NOT store B's current working loads. Those change as B gets
+# stronger/weaker and are derived LIVE from exercise.strength_sets at planning time.
+# `seed_weight` / `fixed_weight` below are only cold-start hints (used when there is
+# no recent history for an exercise, or for fixed apartment dumbbells).
+#
+# Garmin codes (category, code) come from the FIT profile (see fit.py — "Looking up new
+# Garmin codes"). `garmin_aliases` are the SCREAMING_SNAKE labels the Garmin
+# on-device ML classifier writes into strength_sets.exercise_name — used to match a
+# catalog exercise to B's recorded history. The classifier is sometimes wrong ("Garmin
+# coding error"); refine these aliases as real values are observed in strength_sets.
+#
+# To add an exercise: append an entry. To change B's gym/apartment setup or default
+# schemes: edit here. Edits go through git (a small PR), matching the project workflow.
+# ---------------------------------------------------------------------------
+
+meta:
+  # Weight increments B can actually load, by equipment family.
+  increments:
+    dumbbell_lb: 5            # gym free-weight dumbbells come in 5 lb steps
+    cable_kg_low: 2.5         # cable/machine stacks: 2.5 kg steps up to the threshold
+    cable_kg_high: 5          # 5 kg steps above the threshold
+    cable_threshold_kg: 10
+  apartment:
+    # B's apartment has ONLY a pair of 3 kg dumbbells (lateral raises, triceps
+    # extensions) plus bodyweight floor work. Apartment exercises are always done
+    # LAST — B finishes the gym in ideal order, then completes the rest at home.
+    dumbbell_kg: 3
+
+# role:    compound | accessory | isolation | core
+# equipment: dumbbell | cable | machine | bodyweight
+# load_unit: lb (free DBs, B thinks in lb) | kg (stacks) | bodyweight
+# weight_basis: single (one implement) | each_hand | stack | bodyweight
+# reps_per_side: true when the prescribed reps are PER SIDE (cannot be encoded in .fit)
+# seed_weight: cold-start hint only; live loads come from strength_sets
+# garmin: {category, code} — null means no Garmin code exists (excluded from the .fit)
+
+exercises:
+
+  # ---- GYM: lower body ----
+  - name: Goblet Squat
+    watch_label: Goblet Squat
+    garmin: {category: 28, code: 37}
+    garmin_aliases: [GOBLET_SQUAT]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: single
+    reps_per_side: false
+    movement_pattern: squat
+    role: compound
+    seed_weight: {value: 25, unit: lb}
+
+  - name: Bulgarian Split Squat
+    watch_label: Bulgarian Split Squat
+    garmin: {category: 17, code: 18}          # Garmin only has the loaded (DB) variant
+    garmin_aliases: [DUMBBELL_BULGARIAN_SPLIT_SQUAT, BULGARIAN_SPLIT_SQUAT, SPLIT_SQUAT]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: true
+    movement_pattern: squat
+    role: compound
+    seed_weight: {value: 0, unit: bodyweight}  # currently bodyweight
+
+  - name: Romanian Deadlift
+    watch_label: Romanian Deadlift
+    garmin: {category: 8, code: 4}            # Garmin "Dumbbell Straight-Leg Deadlift"; no 2-leg RDL
+    garmin_aliases: [DUMBBELL_STRAIGHT_LEG_DEADLIFT, ROMANIAN_DEADLIFT, STRAIGHT_LEG_DEADLIFT]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: hinge
+    role: compound
+    seed_weight: {value: 25, unit: lb}
+
+  - name: Hip Thrust
+    watch_label: Hip Thrust
+    garmin: {category: 10, code: 1}           # Garmin "Barbell Hip Thrust w/ Bench"; B uses a plate
+    garmin_aliases: [BARBELL_HIP_THRUST, BARBELL_HIP_THRUST_WITH_BENCH, BARBELL_HIP_THRUST_ON_FLOOR, HIP_THRUST, HIP_THRUST_WITH_BENCH]
+    location: gym
+    equipment: machine
+    load_unit: kg
+    weight_basis: single
+    reps_per_side: false
+    movement_pattern: hinge
+    role: compound
+    pairs_after: Seated Cable Row             # uses the bench at the cable-row station — only programmed together, row first
+
+  - name: Calf Raise
+    watch_label: Calf Raise
+    garmin: {category: 1, code: 18}           # Standing Calf Raise
+    garmin_aliases: [STANDING_CALF_RAISE, CALF_RAISE, SINGLE_LEG_STANDING_CALF_RAISE, "_3_WAY_WEIGHTED_CALF_RAISE"]
+    location: gym
+    equipment: machine
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: calf
+    role: accessory
+
+  # ---- GYM: push ----
+  - name: Dumbbell Bench Press
+    watch_label: Dumbbell Bench Press
+    garmin: {category: 0, code: 6}
+    garmin_aliases: [DUMBBELL_BENCH_PRESS, FLAT_DUMBBELL_BENCH_PRESS, ALTERNATING_DUMBBELL_CHEST_PRESS_ON_SWISS_BALL]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: horizontal_push
+    role: compound
+    seed_weight: {value: 20, unit: lb}
+
+  - name: Incline Dumbbell Press
+    watch_label: Incline Dumbbell Press
+    garmin: {category: 0, code: 9}
+    garmin_aliases: [INCLINE_DUMBBELL_BENCH_PRESS, INCLINE_DUMBBELL_PRESS]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: horizontal_push
+    role: compound
+
+  - name: Dumbbell Shoulder Press
+    watch_label: Dumbbell Shoulder Press
+    garmin: {category: 24, code: 17}          # Seated DB Shoulder Press
+    garmin_aliases: [DUMBBELL_SHOULDER_PRESS, SEATED_DUMBBELL_SHOULDER_PRESS, ALTERNATING_DUMBBELL_SHOULDER_PRESS, OVERHEAD_DUMBBELL_PRESS]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: vertical_push
+    role: compound
+
+  # ---- GYM: pull ----
+  - name: Lat Pulldown
+    watch_label: Lat Pulldown
+    garmin: {category: 21, code: 13}
+    garmin_aliases: [LAT_PULLDOWN, WIDE_GRIP_LAT_PULLDOWN]
+    location: gym
+    equipment: machine
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: vertical_pull
+    role: compound
+    seed_weight: {value: 25, unit: kg}
+
+  - name: Seated Cable Row
+    watch_label: Seated Cable Row
+    garmin: {category: 23, code: 18}
+    garmin_aliases: [SEATED_CABLE_ROW, CABLE_ROW]
+    location: gym
+    equipment: machine
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: horizontal_pull
+    role: compound
+    seed_weight: {value: 25, unit: kg}
+
+  - name: Face Pull
+    watch_label: Face Pull
+    garmin: {category: 23, code: 5}
+    garmin_aliases: [FACE_PULL, CABLE_FACE_PULL]
+    location: gym
+    equipment: cable
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: rear_delt
+    role: accessory
+    seed_weight: {value: 10, unit: kg}
+
+  - name: Cable Rear Delt Fly
+    watch_label: Cable Rear Delt Fly
+    garmin: {category: 9, code: 6}            # Single-Arm Standing Cable Reverse Flye
+    garmin_aliases: [CABLE_REAR_DELT_FLY, SINGLE_ARM_STANDING_CABLE_REVERSE_FLYE, STANDING_CABLE_REVERSE_FLYE, REAR_DELT_FLY]
+    location: gym
+    equipment: cable
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: rear_delt
+    role: isolation
+
+  - name: Dumbbell Biceps Curl
+    watch_label: Dumbbell Biceps Curl
+    garmin: {category: 7, code: 37}           # Standing DB Curl
+    garmin_aliases: [DUMBBELL_BICEPS_CURL, DUMBBELL_CURL, STANDING_DUMBBELL_BICEPS_CURL, BARBELL_BICEPS_CURL]
+    location: gym
+    equipment: dumbbell
+    load_unit: lb
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: isolation_arms
+    role: isolation
+
+  - name: Triceps Pushdown
+    watch_label: Triceps Pushdown
+    garmin: {category: 30, code: 39}          # TRICEPS_PRESSDOWN (cable). B prefers DB extensions but mixes both.
+    garmin_aliases: [TRICEPS_PRESSDOWN, REVERSE_GRIP_TRICEPS_PRESSDOWN, ROPE_PRESSDOWN, REVERSE_GRIP_PRESSDOWN]
+    location: gym
+    equipment: cable
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: isolation_arms
+    role: isolation
+
+  # ---- GYM: core ----
+  - name: Cable Crunch
+    watch_label: Cable Crunch
+    garmin: {category: 6, code: 1}
+    garmin_aliases: [CABLE_CRUNCH, KNEELING_CABLE_CRUNCH]
+    location: gym
+    equipment: cable
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: false
+    movement_pattern: core_flexion
+    role: core
+
+  - name: Pallof Press
+    watch_label: Pallof Press
+    garmin: {category: 5, code: 6}            # Garmin "Cable Core Press" (anti-rotation)
+    garmin_aliases: [CABLE_CORE_PRESS, PALLOF_PRESS]
+    location: gym
+    equipment: cable
+    load_unit: kg
+    weight_basis: stack
+    reps_per_side: true
+    movement_pattern: core_antirotation
+    role: core
+    seed_weight: {value: 7.5, unit: kg}
+
+  - name: Incline Sit-Ups
+    watch_label: Incline Sit-Ups
+    garmin: {category: 27, code: 37}          # Garmin has only a plain Sit-Up
+    garmin_aliases: [SIT_UP, INCLINE_SIT_UP, DECLINE_SIT_UP]
+    location: gym
+    equipment: bodyweight
+    load_unit: bodyweight
+    weight_basis: bodyweight
+    reps_per_side: false
+    movement_pattern: core_flexion
+    role: core
+
+  # ---- APARTMENT (always done LAST): 3 kg dumbbells + bodyweight floor work ----
+  - name: Lateral Raise
+    watch_label: Lateral Raise
+    garmin: {category: 14, code: 24}          # Garmin "Seated Lateral Raise"
+    garmin_aliases: [LATERAL_RAISE, SEATED_LATERAL_RAISE, DUMBBELL_LATERAL_RAISE]
+    location: apartment
+    equipment: dumbbell
+    load_unit: kg
+    weight_basis: each_hand
+    reps_per_side: false
+    movement_pattern: lateral_raise
+    role: isolation
+    fixed_weight: {value: 3, unit: kg}        # apartment 3 kg dumbbells
+
+  - name: Dumbbell Triceps Extension
+    watch_label: Dumbbell Triceps Extension
+    garmin: {category: 30, code: 15}          # Overhead DB Triceps Extension
+    garmin_aliases: [DUMBBELL_TRICEPS_EXTENSION, OVERHEAD_DUMBBELL_TRICEPS_EXTENSION, TRICEPS_EXTENSION]
+    location: apartment
+    equipment: dumbbell
+    load_unit: kg
+    weight_basis: single                      # one 3 kg DB held overhead in both hands
+    reps_per_side: false
+    movement_pattern: isolation_arms
+    role: isolation
+    fixed_weight: {value: 3, unit: kg}        # B prefers DB triceps ext over cable pushdowns
+
+  - name: Dead Bugs
+    watch_label: Dead Bugs
+    garmin: null                              # No Garmin code in the Core category — excluded from the .fit
+    garmin_aliases: [DEAD_BUG, DEAD_BUGS]
+    location: apartment
+    equipment: bodyweight
+    load_unit: bodyweight
+    weight_basis: bodyweight
+    reps_per_side: false
+    movement_pattern: core_antiextension
+    role: core
+
+  - name: Leg Raises
+    watch_label: Leg Raises
+    garmin: {category: 16, code: 8}           # Lying Straight-Leg Raise
+    garmin_aliases: [LEG_RAISE, LYING_LEG_RAISE, LEG_RAISES]
+    location: apartment
+    equipment: bodyweight
+    load_unit: bodyweight
+    weight_basis: bodyweight
+    reps_per_side: false
+    movement_pattern: core_flexion
+    role: core
+
+  - name: Side Plank Hip Lift
+    watch_label: Side Plank Hip Lift
+    garmin: {category: 19, code: 70}          # Side Plank Lift
+    garmin_aliases: [SIDE_PLANK_HIP_LIFT, SIDE_PLANK_LIFT, SIDE_PLANK]
+    location: apartment
+    equipment: bodyweight
+    load_unit: bodyweight
+    weight_basis: bodyweight
+    reps_per_side: true
+    movement_pattern: core_lateral
+    role: core

@@ -6,6 +6,13 @@ Scrapes restaurant menus from FitFuel by Grain, Jones Salad, and WongNai deliver
 writes them to `external_data.menu_items`. The food planning agent reads from
 `external_data.menu_current` (a view over the table).
 
+**Jones Salad is FROZEN (B 2026-07-02) — do not re-scrape it.** Its source page publishes no prices,
+so the 2026-06-25 batch was one-off price-matched from the WongNai delivery listing and `menu_current`
+serves it indefinitely (per-restaurant-latest view). `run_all()`'s DEFAULT source list excludes
+`jones`; `jones.py` stays importable and `run_all(["jones"])` / the CLI still work, but running them
+appends a fresh price-less batch that becomes the latest and EVICTS the priced one — only do that
+deliberately, to reverse the freeze.
+
 ## Invariants — never break these
 
 ### 1. Every scraper returns `list[MenuItem]`

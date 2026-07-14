@@ -145,6 +145,20 @@ def process_activity_event(strava_inbound_id: int, activity_id: int, aspect_type
                   chat_id=chat_id,
                   message_id=message_id)
 
+        # Spec F: a NEW cardio activity reconciles its planned day + sends a proactive tally nudge.
+        # Only on 'create' (an 'update' must not re-nudge); lazy-imported + wrapped so it can NEVER
+        # affect ingestion. Strength is handled in the Garmin processor (its own notification path).
+        if aspect_type == "create" and saved and activity_category in ("run", "walk", "ride", "swim"):
+            try:
+                from domains.health_agent.week_planner.activity_nudge import notify_activity_landed
+                dist_m = activity.get("distance")
+                detail = (f"{activity_category} ({dist_m / 1000:.1f} km)"
+                          if dist_m else activity_category)
+                notify_activity_landed(activity.get("start_date"), "cardio", detail)
+            except Exception as e:
+                log_failure(logger, logging.WARNING, "cardio_reconcile_nudge_failed", e,
+                            strava_inbound_id=strava_inbound_id)
+
     except Exception as e:
         log_failure(logger, logging.ERROR, "strava_process_failed", e,
                     strava_inbound_id=strava_inbound_id, activity_id=activity_id)

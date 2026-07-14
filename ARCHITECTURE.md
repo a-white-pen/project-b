@@ -112,7 +112,7 @@ Telegram message (text / voice / photo / album)
 
 **FX resolution** (`fx_rate_source`): `not_applicable_sgd` (SGD spend) · `actual_superrich_fifo` (cash/TrueMoney FIFO from `finances.fx_lots`, allocations written in the same transaction) · `actual_youtrip` / `actual_ocbc` (SGD figure read from a screenshot) · `manual` (B stated the SGD) · `mixed` (reserved for a blended breakdown in `source_meta.fx_rate_breakdown` — not produced yet; multi-lot FIFO currently records its blend in the allocations, not a `mixed` source) · `frankfurter_estimate` (not yet wired). The effective rate is derived (`sgd_amount / transaction_amount`), never stored.
 
-**Updates = rebuild from the whole thread** — every spend keeps a `source_meta.thread`: the ordered list of contributions (`{update_id, kind, file_id, text}`) that built it. Any later contribution — an album straggler photo (matched by `media_group_id`) or a quoted correction — appends to the thread and calls `service.apply_thread_update`, which re-downloads ALL the thread's images and feeds them plus an ordered text transcript plus the current record to ONE LLM call (`extract_spend_from_thread`). The model produces the single best record: B's text messages are explicit overrides (later wins), and for everything else it picks the best value per field across all sources (merchant = restaurant not recipient/processor, SGD + rate from the payment screenshot, earliest timestamp, items from the receipt; notes appended sensibly). This is order-independent, so it does not matter which album photo arrives first. Because every image is re-read each time, a text-only edit usually keeps the rate and items; and `service.settle_money` deterministically preserves a known SGD/rate and FIFO allocations whenever the amount/currency are unchanged (an edit can still change them when B intends to — e.g. correcting the amount, or saying so in the text). The webhook dedups album photos by comparing their `file_id`s to the thread, so a photo is re-processed only when it adds something new. Other domains ignore `media_group_file_ids` — this is finance-only.
+**Updates = rebuild from the whole thread** — every spend keeps a `source_meta.thread`: the ordered list of contributions (`{update_id, kind, file_id, text}`) that built it. Any later contribution — an album straggler photo (matched by `media_group_id`) or a quoted correction — appends to the thread and calls `service.apply_thread_update`, which re-downloads ALL the thread's images and feeds them plus an ordered text transcript plus the current record to ONE LLM call (`extract_spend_from_thread`). The model produces the single best record: B's text messages are explicit overrides (later wins), and for everything else it picks the best value per field across all sources (merchant = restaurant not recipient/processor, SGD + rate from the payment screenshot, earliest timestamp, items from the receipt; notes appended sensibly). This is order-independent, so it does not matter which album photo arrives first. Because every image is re-read each time, a text-only edit usually keeps the rate and items; and `service.settle_money` deterministically preserves a known SGD/rate and FIFO allocations whenever the amount/currency are unchanged (an edit can still change them when B intends to — e.g. correcting the amount, or saying so in the text). The webhook dedups album photos by comparing their `file_id`s to the thread, so a photo is re-processed only when it adds something new. **Exception (2026-07-01):** a **quoted-reply correction** sent as an album (e.g. menu screenshots replying to the meal card) is now aggregated too — the webhook hands all its photos to ONE correction via `media_group_file_ids` (min-update aggregates, siblings drop), and the meal correction reads them in one vision call. So `media_group_file_ids` is consumed by the expense flow AND by quoted-correction albums (still not by the per-photo food-log path).
 
 **Correction** (`domains/expense/correction.py`) — quoting a spend reply routes here. It appends the new text/photo to the thread and delegates to `apply_thread_update` (same path as album stragglers). Hard delete (`delete` / `remove`) is handled directly. A clarification or recoverable error still returns thread state so the chain isn't broken.
 
@@ -153,9 +153,8 @@ B sends /refresh_menus   OR   Cloud Scheduler (Thu 18:00 ICT)
   → api/menus.py                       returns 202 immediately; adds background task
       → BackgroundTask: _scrape_and_notify(notify_start)
           → if notify_start: _notify_telegram("refreshing menus · weekly…")
-          → inbound/menus/runner.run_all()
+          → inbound/menus/runner.run_all()            default sources = fitfuel + wongnai (jones EXCLUDED)
               → inbound/menus/fitfuel.scrape_all()    REST API: grainth.nutribotcrm.com (no auth)
-              → inbound/menus/jones.scrape_all()      BeautifulSoup over jonessalad.com/menu/nutrition-fact/
               → inbound/menus/wongnai.scrape_all()    direct WongNai delivery HTML via curl_cffi
                   → LINE Shopping product pages       official Leanlicious macro enrichment
               → runner._drop_unusable_macro_items()   drop no-macro and all-zero rows
@@ -165,6 +164,8 @@ B sends /refresh_menus   OR   Cloud Scheduler (Thu 18:00 ICT)
 ```
 
 Query current menu: `SELECT * FROM external_data.menu_items WHERE scraped_at = (SELECT max(scraped_at) FROM external_data.menu_items WHERE restaurant_name = '...')`.
+
+**Jones Salad is FROZEN (2026-07-02):** its source page publishes no prices, so the 2026-06-25 batch was one-off price-matched from the WongNai delivery listing (58/80 items priced; `meta.price_source` stamped) and Jones was removed from the default `run_all()` list. `menu_current` (per-restaurant latest) keeps serving that batch forever — meal planning is unaffected. `jones.py` stays importable; `python3 -m inbound.menus.runner jones` is an explicit opt-in that UNDOES the freeze (appends a fresh price-less batch which becomes the latest).
 
 External consumers (e.g. awhitepen.com dashboard) read from:
 ```
@@ -177,6 +178,72 @@ GET /api/data-visualisation/location         reads location_visualisation → {c
 GET /api/data-visualisation/sleep            reads sleep_visualisation → {"refreshed_at", "events":[...]}
   All rate limited: 5/min + 200/day per IP, 1000/day per instance (in-memory, per Cloud Run instance).
 ```
+
+### Flow 7 — Agentic health planner (spine + satellite)
+
+The health planner (`domains/health_agent/`) turns B's goals + actuals into a rolling weekly plan and day-of meal/exercise cards. **Design principle: the LLM only *proposes*; deterministic code *guarantees* every hard constraint.** Gemini drafts the week shape, dish picks, and run/strength detail; the code decides feasibility, clamps to the constraints, and reports any *soft* rule it had to bend. Initial plans use **Gemini 2.5 Pro** (`generate_json_reasoning`); the meal composition and **all** corrections use **Flash** (the deterministic solver validates the picks, so a weaker model degrades gracefully). The full design rationale — the calibration derivation, the decisions log — lives in `agentic/BRIEF.md`, which is kept out of git (gitignored); this section is the how-it-works, grounded in the code.
+
+**Data model — spine + satellites** (`schema/data_dictionary.md` is the contract):
+```
+health_agent.daily_plan        SPINE — 1 row/planned day: activity_type[] + meal_plan_provider (shop) + macro_target
+   ├─ exercise.strength_plan   1/day  ↔ exercise.strength_sessions   (Garmin actuals)
+   ├─ exercise.cardio_plan     1/day  ↔ exercise.cardio_activities   (Strava actuals)
+   └─ nutrition.meal_plan      lunch+dinner  →  nutrition.food_log    (consumed)
+health_agent.weekly_reflections  1/ISO week — maintenance + target + weight trend
+```
+- Satellites FK to `daily_plan.plan_date` (`ON DELETE CASCADE`); two DB triggers (`assert_activity`, `cleanup_satellites`) stop a strength/cardio plan row existing unless its activity is in `activity_type[]`.
+- `activity_type` is `text[]` (an AM-lift + PM-cardio day is one row). `cardio` = run / hash / hike / cycle / swim — **all count** toward the weekly cardio target; `other` = yoga / pilates / climbing (no satellite).
+
+**Two user commands; everything else is inline buttons + crons** (`plan_command.py`; router `Intent.VIEW_WEEK` / `Intent.PLAN`):
+
+| Surface | Entry | Does |
+|---|---|---|
+| `/week` | command | read-only week view + a single `[🗓️ Plan Week]` button |
+| Plan Week | the `/week` button (ONLY entry) | re-roll a today+7 window: re-read actuals → gap to 2 cardio + 2 strength → plan the forward days around pins; pinned `kind='week'` |
+| `/plan` | command | hub with `🏃 Run` / `🏋️ Strength` / `🍽️ Meal` buttons |
+| 🍽️ Meal | `/plan` button | today's meal — the shop card if a shop is assigned, else the `/suggest_food` guide; pinned `kind='meal'` |
+| 🏋️ / 🏃 | `/plan` button | today's strength (PNG + `.fit` + Garmin) / run (text; +`.fit`+Garmin for quality/fartlek); pinned `kind='exercise'` |
+
+`/plan week` is deliberately NOT a command — the rolling re-plan is reachable only via the button, so it can't be hit by accident.
+
+**Crons — Cloud Scheduler → internal endpoints** (`api/planner_jobs.py::register_routes`; auth = `system.internal_auth.check_internal_key`: `X-Internal-Key` header vs `INTERNAL_API_KEY` env, constant-time, 503 if the key is unset). Each endpoint doubles as a manual `curl` test trigger and resolves times via point-in-time Bangkok tz.
+
+| Schedule | Endpoint | Job |
+|---|---|---|
+| Sun 2pm BKK | `/internal/planner/weekly-reflection`, then `/scaffold` | reflect on last week (calibrate + 3-goal review) → roll the forward scaffold |
+| 11am daily | `/internal/planner/meals` | sweep yesterday's unresolved slots → plan today's meal (shop card) or `/suggest_food` |
+| 1pm daily | `/internal/planner/strength`, `/run` | only if today has that activity: regenerate detail → Garmin push → pin `kind='exercise'` |
+
+**The meal solver — deterministic, two layers** (`meal_planner/{service,solver,persistence}.py`):
+- *Sunday scaffold* (`week_planner/meal_assign.py`) assigns each Mon–Fri order-day a shop that satisfies the week-level **hard** rules (one shop/day, Grain ≤ 2 in a rolling 7d, budget, veg day → only a veg-capable shop from `goals.yaml veg_day_shops`) while best-efforting the soft ones (Jones ≥ 1).
+- *Day-of (11am)* computes `remaining = macro_target − logged-by-11am`, deterministically **filters** the shop's menu to dishes that fit (kcal band, protein/fat floors, lunch ≠ dinner, price), then Gemini **composes** lunch + dinner from that already-valid palette + home staples; code does the final macro check + enforces staple caps. The LLM never sees an infeasible option.
+- Budget is SGD at a **flat `฿25 = S$1`** planning rate (real fx lives in finances only); cap = `$6.50 × planned meals`, weekly average. Prices display in ฿.
+- Re-running `/plan meals` re-plans only the not-yet-eaten slots (eaten/bought are locked); a correction that flags specific dishes keeps the un-flagged slots verbatim (`solver.slots_to_keep`).
+- **Sold-out memory + menu photos:** a correction can name a dish unavailable in text OR by attaching photo(s) of the shop's board today; the dishes are recorded on `daily_plan.unavailable_items` (`{shop:[names]}`, day-scoped) and stripped from the palette so they can't be re-offered. A board vision judges *complete* becomes the menu of record (≥3 confirmed matches guard against a blurry shot). Board↔DB matching is promo-tolerant (`solver._match_known`). A menu album is aggregated into ONE correction by `telegram/webhook.py`.
+- **Protein rotation** (beef/pork/fish/duck) is day-of best-effort: each pick is nudged toward still-owed proteins and away from already-met ones (compose receives the week's tally; duck is judged over a 2-week window via `solver.owed_proteins_split`).
+- No feasible pair from the assigned shop → swap to an alternative shop that still satisfies the hard rules, and flag the swap; if none fits, closest-fit + flag.
+
+**Calibration — n=1, no Garmin, no 7700** (`calibration.py`, run every Sunday by `weekly_reflection/`):
+- **maintenance** = mean daily intake over the trailing-8-week set of weeks whose 7-day-avg weight held flat (`|Δ| < 0.2 kg`, period weeks excluded); carries the last value / seed (1950) until ≥2 flat weeks exist. It already includes habitual training — there is no per-session burn term, and it does not track down mid-cut (measure-at-rest).
+- **weekly target** = maintenance − 160 above the 55 kg mid-band / + 100 below / hold in-band, plus a safety brake if losing > 0.30 kg/wk.
+- **day targets** = a fixed preference split (+180 cardio, +100 strength, rest-day carries the balance) that nets to zero against the weekly target.
+- Stored in `health_agent.weekly_reflections` (maintenance, target, 4-week weight-trend slope, narrative, directives). The reflection also scores the 3 equal goals: sub-60 10k via a Riegel projection from the most recent quality/fartlek run (**display only — never used to plan runs**); muscle via `strength_sets` load/volume deltas; weight-band position + trend.
+
+**Reconcile — tally follows reality** (`week_planner/reconcile.py`): each past planned day is matched to actuals on the local BKK date — a same-kind actual → `done` + link; none by 22:00 → `skipped`. The weekly 2+2 tally counts **actual sessions by kind, planned or not** (an unplanned run still counts; a planned strength done as cardio = strength skipped + cardio counted). It drives nudges only — calibration no longer uses session count.
+
+**✓ Ate buttons** (`meal_planner/completion.py`): a tap posts the planned item(s) into `nutrition.food_log` through the food module's own pipeline (so the confirmation card, macro gap-fill, and quoted corrections are identical to a normal food log — editable + deletable), marks the slot `ate`, and edits the pinned card to drop that row. Each home staple has its OWN button and posts that staple alone. Idempotent (a server-side guard refuses a repeat); no Skip button.
+
+**Next-day sweep** (part of the 11am `meals` job, `meal_planner/persistence.sweep_meals`): yesterday's `planned` (never bought/ate) → `skipped`; `bought` (not ate) → `ate` and its items are posted to `food_log` **stamped on the meal's own planned day** (not the sweep day).
+
+**Corrections** (quoted-reply; routed by `conversation_state` domain='plan' + `context.kind`; all Flash): reply to `/week` → classify a **pin** (lock a day) vs a **context** note; reply to the meal card → re-pick within the feasible set; reply to run/strength → regenerate type-locked + re-push to Garmin (same-name replace); reply to a `✓ Ate` log → the food module handles it. **Pin fallback:** proactive/summary cards carry no saved `conversation_state`, so `router._try_correction` looks the quoted message up in `system.pinned_messages` (`replies.pin_kind_for`) and routes by pin kind (`meal`/`week`) — this is what stops a menu photo quoting the pinned card from falling through to the food/expense classifier.
+
+**Kind-scoped pins** (`system.pinned_messages(kind PK)`, `telegram/replies.pin_kept`): the `meal`, `exercise`, and `week` pins coexist, each self-replacing within its kind (Telegram's native single-pin would evict the others). `pin_kept` pins the new card FIRST, then retires the old and advances the DB row only on success, under a per-kind `pg_advisory_xact_lock` so the two 1pm jobs (run + strength, both `kind='exercise'`) can't race into two live pins.
+
+**Spend → meal auto-mark is DISABLED** (2026-07-08): a food-category spend no longer flips the day's meals to `bought` (it silently produced a non-editable "✓ Both meals logged" card for dishes B may not have ordered). Meals are marked only via the ✓ Ate buttons or the next-day sweep. `domains/expense/service._reconcile_food_spend` early-returns; the body is kept for easy re-enable (which must then also re-send the meal card).
+
+**Build status (2026-07):** the day-of meal / strength / run flows, the reconcilers, the calibration, and the internal cron endpoints are live in testing (deployed from `agentic-module`); the `/week` read-render (`plan_command.handle_week_view`) is still being finalised.
+
+---
 
 **Invariants — do not break these:**
 - `telegram/` orchestrates. No business logic here. If you find logic in `telegram/`, move it to the relevant domain.

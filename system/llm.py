@@ -6,6 +6,8 @@ Functions:
   generate_with_images(images, prompt, mime_type, model)     — sends multiple images + text prompt (one call)
   generate_text(prompt, model)                   — sends a text prompt and returns the response
   generate_json(prompt, model)                   — like generate_text but forces JSON output mode (disables thinking)
+  generate_json_reasoning(prompt, model, thinking_budget) — JSON output WITH a thinking budget (initial plans=Pro, corrections=Flash)
+  parse_json_response(raw)                       — strips ```json fences + parses an LLM reply into a dict (raises on bad/non-object JSON)
   transcribe_audio(audio_bytes, mime_type, model) — transcribes a voice message via Gemini
 
 Internal helpers:
@@ -15,6 +17,7 @@ Internal helpers:
   _extract_text(response)      — extracts and strips text from a GenerateContentResponse
 """
 
+import json
 import logging
 import os
 import time
@@ -30,6 +33,7 @@ logger = logging.getLogger(__name__)
 # Verify current model IDs with: client.models.list()
 # 2.0 series sunsets June 2026 — prefer 2.5.
 MODEL_FLASH = "gemini-2.5-flash"        # balanced — general reasoning, summaries, vision
+MODEL_FLASH_LITE = "gemini-2.5-flash-lite"  # cheapest/fastest — trivial tasks (e.g. dish-name translation)
 MODEL_PRO = "gemini-2.5-pro"            # most capable — complex reasoning, ambiguous inputs
 
 
@@ -257,6 +261,80 @@ def generate_json(prompt: str, model: str = MODEL_FLASH) -> str:
             prompt_chars=len(prompt),
         )
         raise
+
+
+# Like generate_json but KEEPS a thinking budget — for tasks that need the model to reason
+# before emitting structured JSON (the agentic planners: week scaffold, meal compose, day-of
+# run/strength, weekly reflection). INITIAL plans use the MODEL_PRO default; CORRECTIONS pass
+# model=MODEL_FLASH. Unlike generate_json (thinking_budget=0, which stops Flash spending all
+# tokens on thinking), this allocates a budget so reasoning happens, then JSON is returned.
+# Inputs: prompt string, model name, thinking token budget. Output: stripped JSON string. Raises on API error.
+def generate_json_reasoning(
+    prompt: str,
+    model: str = MODEL_PRO,
+    thinking_budget: int = 8000,
+) -> str:
+    log_event(
+        logger,
+        logging.INFO,
+        "llm_generate_json_reasoning_started",
+        model=model,
+        prompt_chars=len(prompt),
+        thinking_budget=thinking_budget,
+    )
+    try:
+        response = _call_with_retry(
+            _get_client().models.generate_content,
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            ),
+        )
+        result = _extract_text(response)
+        log_event(
+            logger,
+            logging.INFO,
+            "llm_generate_json_reasoning_completed",
+            model=model,
+            response_chars=len(result),
+        )
+        return result
+    except Exception as e:
+        log_failure(
+            logger,
+            logging.ERROR,
+            "llm_generate_json_reasoning_failed",
+            e,
+            model=model,
+            prompt_chars=len(prompt),
+        )
+        raise
+
+
+# Parses an LLM JSON reply into a dict. Strips an OUTER ```json … ``` wrapper only (a leading fence
+# with a case-insensitive label + a trailing fence) — so backticks INSIDE string values (rationale,
+# note, narrative prose) survive verbatim. None-safe. Raises ValueError on malformed JSON or a
+# non-object top-level value (e.g. 'null' / '[]' / a scalar) — every planner caller already wraps its
+# LLM call in try/except, so a raise degrades gracefully, vs. silently returning {} (garbage plan) or
+# crashing later on a .get(). Never logs the raw text, only its length. Shared by the week / meal /
+# run / strength / reflection planner paths.
+def parse_json_response(raw: str | None) -> dict:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):                 # a leading ```json / ``` fence (label case-insensitive)
+        cleaned = cleaned[3:]
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.rsplit("```", 1)[0]     # drop only the trailing fence, not in-value backticks
+    cleaned = cleaned.strip()
+    try:
+        obj = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM returned invalid JSON ({len(cleaned)} chars)") from e
+    if not isinstance(obj, dict):
+        raise ValueError(f"expected a JSON object, got {type(obj).__name__}")
+    return obj
 
 
 # Transcribes a voice message using Gemini's multimodal input.

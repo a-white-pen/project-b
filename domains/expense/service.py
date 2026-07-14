@@ -90,6 +90,27 @@ def _might_touch_fifo_pool(spend: SpendInput) -> bool:
             and spend.payment_method in FIFO_PAYMENT_METHODS)
 
 
+# Best-effort meal reconcile: a food-category spend whose merchant matches the day's assigned shop links
+# it (daily_plan.meal_spend_id) and flips that day's 'planned' meal slots to 'bought' (BRIEF §6).
+# Lazy-imported + wrapped so it can NEVER affect expense logging. Called from BOTH save paths —
+# handle_expense_log (single message) AND apply_thread_update (album stragglers + corrections), because
+# the merchant/spent_at are often only finalised on the rebuild (e.g. a receipt-photo album, which was
+# what skipped the reconcile before this was shared).
+def _reconcile_food_spend(spend: SpendInput, msg: InboundMessage) -> None:
+    # DISABLED (B 2026-07-08): a spend must NOT silently mark meals 'bought' — that flipped the meal card to
+    # "✓ Both meals logged" with no editable message and hid the order. Meals are now marked ONLY via the
+    # ✓Ate buttons (which send an editable card). Re-enable by restoring the body if B wants the auto-link
+    # back (then it must also re-send the meal card, per B's "every meal log must send the meal card").
+    return
+    try:  # noqa  (kept for easy re-enable)
+        if spend.category == "food" and spend.merchant_name_raw and spend.spend_entry_id and spend.spent_at:
+            from domains.health_agent.meal_planner.persistence import reconcile_spend_to_meal
+            local_date = spend.spent_at.astimezone(get_timezone(spend.spent_at)).date()
+            reconcile_spend_to_meal(local_date, spend.merchant_name_raw, spend.spend_entry_id)
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "meal_spend_reconcile_failed", e, update_id=msg.update_id)
+
+
 # Handles an expense logging request from B (text, transcribed voice, or receipt photo).
 # Inputs: normalised InboundMessage. Outputs: (reply_text, pending_state).
 #   pending_state is {"domain": "expense", "context": {"spend_entry_id": int}} on a save,
@@ -166,6 +187,7 @@ def handle_expense_log(msg: InboundMessage) -> tuple[str, dict | None]:
         spend_entry_id=spend.spend_entry_id,
         status=get_status(spend),
     )
+    _reconcile_food_spend(spend, msg)   # link a food spend to the day's planned meal (best-effort)
     state = {"domain": "expense", "context": {"spend_entry_id": spend.spend_entry_id}}
     return (reply, state)
 
@@ -245,6 +267,9 @@ def apply_thread_update(current: SpendInput, added: list[dict], msg: InboundMess
     reply = format_spend_reply(rebuilt, fifo_available=fifo_available,
                                tz=get_timezone(rebuilt.spent_at),
                                previously_complete=previously_complete, previous=fresh)
+    # Reconcile here too: a receipt-photo album / correction often only NOW finalises the merchant +
+    # spent_at, so this is where a food spend first becomes matchable to the day's planned shop.
+    _reconcile_food_spend(rebuilt, msg)
     return (reply, state)
 
 

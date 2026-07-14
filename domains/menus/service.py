@@ -27,7 +27,7 @@ _REFRESH_MENUS_PATH = "/internal/refresh-menus"
 _COOLDOWN_MINUTES = 15
 _BKK_TZ = ZoneInfo("Asia/Bangkok")
 
-_SOURCES = ["fitfuel", "jones", "wongnai"]
+_SOURCES = ["fitfuel", "wongnai"]   # jones frozen 2026-07-02 — served from menu_current, not re-scraped
 _ACK_TEXT = (
     "<b>refreshing {n} menus near you</b>\n"
     "{sources}\n"
