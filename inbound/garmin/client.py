@@ -64,8 +64,10 @@ class GarminApiClient:
     """
     Thin authenticated client for connectapi.garmin.com.
 
-    Exposes .connectapi(path, params=None) to match the garth interface used
-    by processor.py. Automatically refreshes the di_token when it expires.
+    Exposes .connectapi(path, params=None) (GET) to match the garth interface used
+    by processor.py, plus .connectapi_post(path, payload) and .connectapi_delete(path)
+    for the workout uploaders (strength + run push). Automatically refreshes the
+    di_token on 401 and retries once, across all three verbs.
     """
 
     # Initialises the client with DI OAuth2 credentials and a shared httpx session.
@@ -102,6 +104,50 @@ class GarminApiClient:
                          "Accept": "application/json"},
                 **kwargs,
             )
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.text.strip():
+            return None
+        return resp.json()
+
+    # POSTs a JSON body to connectapi.garmin.com{path} and returns parsed JSON (or None for 204/empty).
+    # Mirrors connectapi() including the 401 refresh-and-retry-once behaviour. Used to create resources
+    # such as workouts: POST /workout-service/workout.
+    # Inputs: path, payload (dict serialised as the JSON body), optional kwargs passed to httpx.post.
+    def connectapi_post(self, path: str, payload: dict | None = None, **kwargs):
+        url = f"{CONNECTAPI_BASE}{path}"
+
+        def _post():
+            headers = {
+                "Authorization": f"Bearer {self.di_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            return self._session.post(url, json=payload, headers=headers, **kwargs)
+
+        resp = _post()
+        if resp.status_code == 401:
+            log_event(logger, logging.INFO, "garmin_di_token_expired_refreshing")
+            self._refresh_token()
+            resp = _post()
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.text.strip():
+            return None
+        return resp.json()
+
+    # DELETEs connectapi.garmin.com{path}. Mirrors connectapi() including the 401 refresh-and-retry-once
+    # behaviour. Used to remove a resource, e.g. DELETE /workout-service/workout/{id}.
+    def connectapi_delete(self, path: str, **kwargs):
+        url = f"{CONNECTAPI_BASE}{path}"
+
+        def _delete():
+            headers = {"Authorization": f"Bearer {self.di_token}", "Accept": "application/json"}
+            return self._session.delete(url, headers=headers, **kwargs)
+
+        resp = _delete()
+        if resp.status_code == 401:
+            log_event(logger, logging.INFO, "garmin_di_token_expired_refreshing")
+            self._refresh_token()
+            resp = _delete()
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.text.strip():
             return None

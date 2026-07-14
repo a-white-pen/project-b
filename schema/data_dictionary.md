@@ -92,6 +92,17 @@ Log of every location B shares via Telegram. One row per LOCATION message. timez
 | `created_at` | `timestamp with time zone` | no | now() | Timestamp of the Telegram location message. |
 | `country` | `text` | yes |  | Country (English) from Nominatim reverse geocoding at insert time. NULL for rows geocoded before this column existed or on geocoding failure. |
 
+### Table: `b.period_days`
+Sparse: one row per day B is on her period (presence = period). Manual logging now; future Oura (temperature-inferred) or Garmin Women's Health. Predictions are computed on-demand from history (no stored predicted column). A dense every-day true/false readout is a VIEW over generate_series, not stored. Use: flag water-retention weeks for the weight-trend calibration.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `period_day_id` | `integer` | no | nextval('b.period_days_period_day_id_seq'::regclass) |  |
+| `period_date` | `date` | no |  | A period day. UNIQUE. |
+| `source` | `text` | no | 'manual'::text | manual \| oura \| garmin \| apple. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific extras. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+
 ### Table: `b.sleep_wake_events`
 One row per sleep boundary event for B. Grain: one sleep or one wake event. Pair a sleep row and a wake row to derive session duration. No telegram_update_id column — Telegram provenance is stored in meta. Deduplication is handled upstream by the webhook (system.telegram_inbound unique on update_id).
 
@@ -444,6 +455,25 @@ One row per completed cardio activity synced from Strava. Covers runs, walks, hi
 | `created_at` | `timestamp with time zone` | no | now() |  |
 | `updated_at` | `timestamp with time zone` | yes |  |  |
 
+### Table: `exercise.cardio_plan`
+Planned structured run (one row/day; UNIQUE plan_date). Holds detail only for actual runs (treadmill/outdoor); ad-hoc cardio (hash/hike/cycle/swim) sits as activity_type=cardio with NO row here and reconciles loosely against cardio_activities. Real FK to daily_plan + trigger requires activity_type contains 'cardio'.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `cardio_plan_id` | `integer` | no | nextval('exercise.cardio_plan_cardio_plan_id_seq'::regclass) |  |
+| `plan_date` | `date` | no |  |  |
+| `status` | `text` | no | 'planned'::text | planned -> done \| skipped \| unplanned. Forward-only. |
+| `run_type` | `text` | yes |  | easy \| long \| quality \| fartlek. Drives delivery (text vs Garmin push). |
+| `run_surface` | `text` | yes |  | treadmill (default) \| outdoor. |
+| `target_distance_m` | `integer` | yes |  | Coarse target distance (m). Duration is derived (distance ÷ pace). |
+| `target_pace_s_per_km` | `integer` | yes |  | Target pace (seconds per km). |
+| `plan` | `jsonb` | yes |  | Day-of detail: text line for easy/long; interval steps for quality (Garmin push). NULL at scaffold. |
+| `garmin_workout_id` | `text` | yes |  | Garmin id of the pushed workout (quality/fartlek). NULL otherwise. |
+| `completed_cardio_activity_id` | `integer` | yes |  | Loose FK to exercise.cardio_activities, set by the reconciler. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Provenance. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation. |
+
 ### Table: `exercise.cardio_splits`
 Per-km lap data for each cardio activity. One row per Garmin auto-lap (typically 1 km). Combines fields from Strava laps (cadence, max HR, elevation gain) and splits_metric (moving time, elevation difference, grade-adjusted speed). Used for per-km training analysis and AI planning.
 
@@ -490,6 +520,21 @@ One row per completed activity that is neither distance-based cardio (run/walk/r
 | `meta` | `jsonb` | no | '{}'::jsonb | Source-specific and type-specific fields not promoted to dedicated columns. Examples — climbing: {"hardest_grade": "V4", "route_count": 8}; yoga: {"style": "vinyasa", "instructor": "..."}; strava provenance: {"external_id": "garmin_ping_..."}. Keeps schema stable as new activity types arrive. |
 | `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp (UTC). |
 | `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp (UTC). Set on any correction or re-sync. |
+
+### Table: `exercise.strength_plan`
+Planned strength session (one row/day; UNIQUE plan_date). Sun scaffold writes intent (status planned, plan NULL); the day-of planner REGENERATES the full plan jsonb from all current data and UPSERTs the same row; the reconciler stamps completion. Real FK to daily_plan (CASCADE) + trigger: a row may only exist when daily_plan.activity_type contains 'strength'.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `strength_plan_id` | `integer` | no | nextval('exercise.strength_plan_strength_plan_id_seq'::regclass) |  |
+| `plan_date` | `date` | no |  |  |
+| `status` | `text` | no | 'planned'::text | planned -> done (reconciled to an actual) \| skipped (passed, none) \| unplanned (did it w/o a plan; reconciler-created). Forward-only. Counts toward the target when status IN (done,unplanned). |
+| `plan` | `jsonb` | yes |  | Day-of detail JSONB: {"exercises":[{name,watch_label,location,garmin,sets,reps:{low,high},reps_per_side,rest_s:{low,high},weight:{kg_low,kg_high,basis},note,fit:{reps,rest_s,weight_kg}}],"focus":...,"estimated_minutes":...,"rationale":...,"model":...}. NULL at scaffold; regenerated + pushed to Garmin day-of. |
+| `garmin_workout_id` | `text` | yes |  | Garmin Connect id of the workout PUSHED to B's watch (set when pushed, before she trains). NULL if not pushed. Distinct from completion. |
+| `completed_strength_session_id` | `integer` | yes |  | Loose FK to exercise.strength_sessions — the ACTUAL session, set by the reconciler after. NULL until done. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Provenance: {"model":...,"factors":{"sleep_h":..,"days_since_cardio":..}}. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation. |
 
 ### Table: `exercise.strength_sessions`
 One row per strength training session. Source-agnostic: source_app + source_activity_id identify the origin platform. inbound_row_id is a loose FK into whichever raw inbound table applies (system.garmin_inbound today).
@@ -655,6 +700,41 @@ One row per finance event B is tracking — real spend, pending candidate, or re
 | `created_at` | `timestamp with time zone` | no | now() |  |
 | `updated_at` | `timestamp with time zone` | yes |  |  |
 
+## Schema: `health_agent`
+
+### Table: `health_agent.daily_plan`
+The 7-day spine: one row per planned day. Holds the day's activity kinds, the meal shop + the vegetarian flag, the cached macro target, the meal-spend link, and B's free-text notes. Exercise detail lives in exercise.strength_plan / cardio_plan; meals in nutrition.meal_plan.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `daily_plan_id` | `integer` | no | nextval('health_agent.daily_plan_daily_plan_id_seq'::regclass) |  |
+| `plan_date` | `date` | no |  | Calendar day. UNIQUE; satellites FK to this. |
+| `activity_type` | `text[]` | no | ARRAY['rest'::text] | The day's activities (array; supports a 2-a-day e.g. {strength,cardio}). Vocab: rest \| cardio (run/hash/hike/cycle/swim — all count toward the cardio target) \| strength \| other (yoga/pilates/climbing — no satellite). A strength_plan/cardio_plan row may only exist when the matching value is present (enforced by trigger). |
+| `is_vegetarian_day` | `boolean` | yes |  | TRUE on the single vegetarian day the Sun scaffold picks each Mon-Fri week (B can move it). Set week-ahead so /week shows it BEFORE meals are planned day-of; the 11am planner honours it. |
+| `macro_target` | `jsonb` | yes |  | Derived cache of the day's macro budget: {"kcal":{low,target,high},"protein_g":{low,high},"fat_g":{min},"carbs_g":{target},"fibre_g":{target,stretch},"day_type"}. kcal low/high = target ± kcal_band_kcal (125); carbs = remainder (no floor). Recomputed when activity changes + refreshed day-of. NULL until computed. |
+| `meal_plan_provider` | `text` | yes |  | The day's ONE shop (same_shop). Canonical external_data menu restaurant_name. NULL on own-food/weekend. |
+| `meal_spend_id` | `integer` | yes |  | Loose link to finances.spend_entries — the day's meal order. Set by the expense reconciler when a meal-category spend's merchant matches meal_plan_provider. ON DELETE SET NULL. |
+| `notes` | `jsonb` | no | '[]'::jsonb | B's free-text edits as a timestamped array: [{"at":ts,"text":str,"active":bool,"kind":"pin\|context"}]. The edit handler (Flash) auto-classifies: a PIN changes the day's activity/shop and deterministically LOCKS that day (a re-plan/scaffold must NOT move a day with an active pin — the pin IS the lock signal, no separate column); a CONTEXT note only informs the LLM. Notes are ONE-OFF (this week; treated as expired once the horizon passes — no standing rules, those get coded directly). An active pin outranks every other constraint. Editable/removable via Telegram; shown as a note line in /week + /plan week. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Provenance/debug, e.g. {"model":"...","scaffold_run_id":"..."}. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation; set ONLY on a real change (never a blanket update). |
+
+### Table: `health_agent.weekly_reflections`
+One row per ISO week. The Sun cron computes maintenance (mean intake over flat-weight weeks) + the 3-4wk weight trend, sets next week's target (= maintenance − a band-aware deficit), and writes the narrative + carry-forward directives. No 7700, no Garmin, no kcal/kg, no regression — maintenance is the flat-week intake MEAN (the regression intercept; PERIOD weeks excluded); the band controller + 3-4wk trend pick cut/hold/gain. Frozen during cuts (carries last value), re-measures when stable.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `weekly_reflection_id` | `integer` | no | nextval('health_agent.weekly_reflections_weekly_reflection_id_seq'::regclass) |  |
+| `iso_week` | `text` | no |  | ISO year-week, format IYYY-"W"IW (e.g. 2026-W26, 2026-W52, 2027-W01). UNIQUE. MUST use IYYY (ISO-year) not YYYY (calendar-year): they diverge in late-Dec/early-Jan, so YYYY would mislabel the turn-of-year week. Rolls into next year with no collisions since the ISO year is in the key. |
+| `maintenance_kcal` | `integer` | yes |  | Mean daily intake over trailing flat-weight weeks (\|Δ7d-avg\| < 0.2 kg). |
+| `target_kcal` | `integer` | yes |  | Daily weekly-AVERAGE target set for next week (redistributed across cardio/strength/rest days). |
+| `weight_trend_kg` | `numeric(4,2)` | yes |  | 3-4wk slope of the 7d-avg weight (kg/week) — the calibration anchor. |
+| `narrative` | `text` | yes |  | Prose B reads. |
+| `directives` | `jsonb` | no | '{}'::jsonb | Machine carry-forward for the daily planners (cautions, focus). |
+| `meta` | `jsonb` | no | '{}'::jsonb | Audit of the inputs. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation. |
+
 ## Schema: `nutrition`
 
 ### Table: `nutrition.food_log`
@@ -679,6 +759,22 @@ One row per distinct food item. A single message from B may produce one or multi
 | `macro_method` | `text` | no |  | Tool or source used to derive the macro values. Values: nutrition_label (read directly from packaged food label panel), restaurant_reported (numbers published or printed by a brand or meal service — includes macro_screenshot photos of meal cards, restaurant menus, and app screenshots), usda (USDA FoodData Central), open_foods (Open Food Facts), edamam (Edamam API), llm (model estimated), manual (B provided numbers directly via text). |
 | `macro_meta` | `jsonb` | yes |  | Method-specific provenance detail. Shape varies by macro_method — llm: {"model": "gemini-2.5-flash"}; nutrition_label: {"model": "...", "file_id": "<telegram file_id>", "field_sources": {"fibre_g": {"source": "nutrition_label", "status": "zero_from_label"}}}; restaurant_reported (macro_screenshot): {"model": "...", "file_id": "...", "field_sources": {"kcal": {"status": "from_source", "source": "macro_screenshot"}, "fibre_g": {"status": "gap_filled", "model": "gemini-2.5-flash"}}}; usda: {"fdc_id": "...", "description": "..."}; open_foods: {"barcode": "...", "product_name": "..."}; edamam: {"food_id": "...", "label": "..."}; manual: null or {"user_stated_fields": [...], "correction_update_id": N}. |
 | `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Set automatically; not edited after insert. |
+| `protein_source` | `text[]` | yes |  | Main protein(s) actually eaten in this entry — only a MAIN protein (>=~15 g, or the dish centrepiece; garnish like bacon bits is ignored), including B's own outside meals. Vocab: beef, pork, chicken, duck, lamb, mutton, fish, other_seafood, egg, cheese, plant_other. The PRESENCE-based protein rotation (beef>=1, pork>=1, fish 1-2, duck>=1/2wk, 1 veg day) tallies lunch/dinner mains from HERE — only fish counts toward the fish slot; other_seafood (shellfish/prawns/squid) is logged but does NOT count. NOTE: the >=10 eggs/wk rule counts egg QUANTITY from food_log items, NOT from this array — text[] is presence-only and holds no count. |
+
+### Table: `nutrition.meal_plan`
+A planned lunch/dinner (one row per (plan_date, meal_type)). Born 'planned' at 11am; flips 'bought' when a matching meal spend logs; 'ate' on confirm (posts items to food_log); 'skipped' by the next-day 11am sweep. Status is FORWARD-ONLY (eat before logging spend -> stays ate). Shop is day-level on daily_plan.meal_plan_provider; protein lives per-item in items.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `meal_plan_id` | `integer` | no | nextval('nutrition.meal_plan_meal_plan_id_seq'::regclass) |  |
+| `plan_date` | `date` | no |  |  |
+| `meal_type` | `text` | no |  | lunch \| dinner. UNIQUE per (plan_date, meal_type). |
+| `status` | `text` | no | 'planned'::text | planned -> bought (spend matches) -> ate (confirmed; posts food_log) \| skipped (sweep). bought ⇒ auto-ate at the sweep (paid ≈ eaten). Never regresses. |
+| `items` | `jsonb` | no | '[]'::jsonb | Chosen items + home staples, macros SNAPSHOTTED at plan time (menu is a re-scraped view, no stable id): [{"item_name","restaurant","kcal","protein_g","carbs_g","fat_g","price_thb","protein_source","role":"main\|staple\|side"}]. role=staple = an always-stocked fridge item (egg/yoghurt/milk/edamame/natto), composed co-equally with shop dishes but shop-independent (restaurant NULL). A staple is STORED in the lunch or dinner items[] it accompanies, but logs INDEPENDENTLY: each staple gets its OWN ✓ Ate button (separate from the meal's), posting only that staple to food_log; per-staple posted state is tracked in meta (idempotent). The protein-rotation tally reads food_log.protein_source (actual), not here. |
+| `posted_food_log_ids` | `integer[]` | yes |  | All food_log rows posted for this slot — the main meal plus any tapped staples (idempotent undo). Which individual items have posted is tracked in meta (per-staple ✓ Ate buttons log independently). |
+| `meta` | `jsonb` | no | '{}'::jsonb | Provenance: {"model":...}. |
+| `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation. |
 
 ## Schema: `system`
 
@@ -690,8 +786,8 @@ One row per bot reply that may participate in a quoted correction chain. Root ro
 | `telegram_reply_message_id` | `integer` | no |  | Telegram message_id of this bot reply. References system.telegram_outbound(message_id). |
 | `parent_telegram_reply_message_id` | `integer` | yes |  | Bot reply B quoted when triggering this correction round. NULL for root rows (initial log reply). |
 | `triggering_telegram_update_id` | `bigint` | no |  | Inbound update_id that caused this bot reply. References system.telegram_inbound(update_id). Used to reconstruct user text from telegram_inbound.payload. |
-| `domain` | `text` | no |  | Domain for this state row. CHECK-constrained vocabulary: food, attention, aligner, weight, sleep_wake, expense, query. Add a value to the CHECK and to this comment when a new domain saves correction state. |
-| `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids":[int],"meal_type":str}. attention: {"attention_session_ids":[int]}. aligner (wear-event reply): {"aligner_wear_event_ids":[int],"kind":"out"\|"in"\|"out_guard"\|"updated"}. aligner (tray reply): {"aligner_tray_change_ids":[int],"arch":"upper"\|"lower","kind":"tray"}. weight: {"weight_measurement_ids":[int]}. sleep_wake: {"sleep_wake_event_ids":[int],"event_type":"sleep"\|"wake","auto_inferred":bool}. expense: {"spend_entry_id":int}. |
+| `domain` | `text` | no |  | Domain that owns the quoted-reply correction chain. CHECK-constrained vocabulary: food, attention, aligner, weight, sleep_wake, expense, query, plan. (plan = 7-day planner edits: context = {"plan_date_range":[...],"plan_day_ids":[...],"planned_run_ids":[...],"meal_plan_ids":[...]}.) Add a value here and in this comment when a new domain saves correction state. |
+| `context` | `jsonb` | no |  | Domain-specific structured data for the correction chain. food: {"food_log_ids":[int],"meal_type":str}. attention: {"attention_session_ids":[int]}. aligner (wear-event reply): {"aligner_wear_event_ids":[int],"kind":"out"\|"in"\|"out_guard"\|"updated"}. aligner (tray reply): {"aligner_tray_change_ids":[int],"arch":"upper"\|"lower","kind":"tray"}. weight: {"weight_measurement_ids":[int]}. sleep_wake: {"sleep_wake_event_ids":[int],"event_type":"sleep"\|"wake","auto_inferred":bool}. expense: {"spend_entry_id":int}. plan: {"kind":"meal"\|"run"\|"week","plan_date":date,...} — the agentic planner correctors (meal swap / run+strength re-gen / week edit), routed by kind. |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 
 ### Table: `system.garmin_inbound`
@@ -713,6 +809,16 @@ Single-row cache of the Garmin Connect DI OAuth2 token blob. Written by the garm
 |--------|------|----------|---------|-------|
 | `garmin_token_id` | `integer` | no | 1 |  |
 | `token_blob` | `jsonb` | no |  | JSON: {"auth_mode": "garmin_health_data", "di_token": "<jwt>", "di_refresh_token": "<base64>", "di_client_id": "GARMIN_CONNECT_MOBILE_ANDROID_DI_2025Q2"}. Upserted on every token refresh. |
+| `updated_at` | `timestamp with time zone` | no | now() |  |
+
+### Table: `system.pinned_messages`
+One row per pin "kind" we keep alive in the Telegram chat. Lets the 11am meal pin and the 1pm exercise pin coexist (Telegram supports multiple pins) while each self-replaces within its kind. pin_kept(kind,new_id) unpins the stored message_id for that kind, pins new_id, upserts the row. Keyed on kind (not date) so today's meal pin replaces yesterday's. Replaces the getChat-based single-pin path for these two flows only.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `kind` | `text` | no |  |  |
+| `chat_id` | `bigint` | no |  |  |
+| `message_id` | `bigint` | no |  |  |
 | `updated_at` | `timestamp with time zone` | no | now() |  |
 
 ### Table: `system.strava_inbound`

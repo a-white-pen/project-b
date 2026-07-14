@@ -262,6 +262,16 @@ def _parse_and_notify(
               message_id=message_id,
               parsed_sets_count=len(parsed_sets))
 
+    # Spec F: a NEW strength session reconciles its planned day + sends a proactive tally nudge. Reached
+    # only on created=True (the early return above blocks re-syncs); lazy-imported + wrapped so it can
+    # NEVER affect ingestion.
+    try:
+        from domains.health_agent.week_planner.activity_nudge import notify_activity_landed
+        notify_activity_landed(started_at, "strength", "strength session")
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "strength_reconcile_nudge_failed", e,
+                    strength_session_id=strength_session_id)
+
 
 # Searches Garmin for an activity within ±120s of the given UTC datetime.
 # Fetches activities for a ±1 day window around the Strava start time to account

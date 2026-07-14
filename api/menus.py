@@ -16,23 +16,23 @@ notify_start query param (default True):
   False — skip the start notification (used by domains/menus/service.py, which already sends
           the "refreshing…" ack to Telegram before posting to this endpoint).
 
-Auth: X-Internal-Key header matched against INTERNAL_API_KEY env var — same pattern
-as /internal/refresh-nutrition.
+Auth: X-Internal-Key header matched against INTERNAL_API_KEY env var (shared system.internal_auth
+check — constant-time; 503 if the secret is unset, 403 on mismatch).
 """
 
 import logging
-import os
 import threading
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, status
 
 from inbound.menus.runner import format_summary_message, run_all
+from system.internal_auth import check_internal_key
 from system.logging import get_error_summary, log_event, log_failure
 from telegram.replies import get_latest_chat_id, send_reply, store_outbound
 
 logger = logging.getLogger(__name__)
 
-_SOURCES = ["fitfuel", "jones", "wongnai"]
+_SOURCES = ["fitfuel", "wongnai"]   # jones frozen 2026-07-02 — served from menu_current, not re-scraped
 
 # Module-level lock: prevents concurrent scrapes on the same instance.
 # acquire() is non-blocking in the endpoint; released by _scrape_and_notify when done.
@@ -58,11 +58,7 @@ def register_routes(app: FastAPI) -> None:
         x_internal_key: str = Header(None),
         notify_start: bool = Query(True),
     ) -> dict:
-        expected = os.environ.get("INTERNAL_API_KEY", "").strip()
-        if not expected or x_internal_key != expected:
-            log_event(logger, logging.WARNING, "menus_refresh_auth_rejected",
-                      key_present=(x_internal_key is not None))
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        check_internal_key(x_internal_key)
 
         if not _scrape_lock.acquire(blocking=False):
             log_event(logger, logging.INFO, "menus_refresh_already_running")

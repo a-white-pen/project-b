@@ -41,3 +41,4 @@ class InboundMessage:
     file_bytes: bytes | None = None  # media bytes pre-fetched by the router (bare-photo intent classification) so the handler need not re-download; None otherwise
     media_group_file_ids: list[str] | None = None  # all photo file_ids in a Telegram album (media_group), oldest-first; set by the webhook. Only the expense domain consumes >1; other domains use file_id alone.
     media_group_id: str | None = None  # Telegram album id shared by all photos sent together; set by the normalizer. Lets the expense domain merge late-arriving album photos into one spend row.
+    callback_query_id: str | None = None  # Telegram callback_query.id (CALLBACK_QUERY only); set by the normalizer so handlers can answerCallbackQuery to dismiss the button spinner.

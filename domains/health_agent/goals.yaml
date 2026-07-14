@@ -1,0 +1,119 @@
+# domains/health_agent/goals.yaml — personal config for the agentic health planner.
+# TRACKED intentionally (B opted in; repo is public) — ships in-tree so deploys read it. Authored from agentic/BRIEF.md §11.
+# Read via domains/health_agent/goals.py::load_goals(). Rules + windows live in the BRIEF (§5/§7/§11);
+# this file holds the VALUES the deterministic code + LLM prompts consume.
+
+person:
+  sex: F
+  height_cm: 161
+  ethnicity: southern_chinese
+  location: Bangkok
+  bmi_ref: asian_who           # healthy 18.5-23
+  weigh_in: first-morning, post-poop, pre-food (lowest-noise; trust but smooth)
+
+# The 3 goals — weighted EQUALLY. Serve all three; never trade one off for another.
+goals:
+  maintain_weight: >
+    Maintain body weight 54-56 kg (mid 55) via lean recomp (hold weight while adding muscle).
+    Currently at the top of the band, so the controller gently cuts toward mid — "maintain" and
+    "cut" are not two modes; the cut is just what the controller does while above mid.
+  build_muscle: >
+    Gain muscle + strength via progressive overload, balanced-physique bias. 1-2 RIR on the last
+    set; bump load when a set is easy; bias volume to glutes / hamstrings / back / shoulders / core
+    (athletic, non-bulky).
+  run_sub_60_10k: >
+    Improve running + stay injury-free; target a sub-1-hour 10 km. Injury-free is part of the goal:
+    no heavy lower-body right before/after a hard run; keep legs fresh around running days.
+
+# Macro calibration — REPLACES the deprecated kcal_per_kg model. See BRIEF §7 for the formula.
+nutrition:
+  weight_band_kg: [54, 56]     # the standing MAINTAIN band (mid 55); at the top now -> cutting toward mid
+  band_mid_kg: 55
+  deadband_kg: 0.2
+  DEFICIT: 160                  # seed 1950 - 160 = 1790 cold-start weekly-avg target
+  SURPLUS: 100                  # gentler on the gain side (asymmetric: cut harder than bulk)
+  FLAT: 0.2                     # |week-over-week 7d-avg delta| under this = a "flat week"
+  MAX_LOSS: 0.30               # kg/wk safety brake -> ease the deficit
+  seed_maintenance: 1950       # cold-start until >=2 flat weeks exist (backtest showed ~2010)
+  protein_floor_g: 100         # absolute hard minimum (g)
+  protein_g_per_kg: { default: [1.8, 2.2], strength: [2.0, 2.4] }   # LEAN-RECOMP target: g/kg x bodyweight (use upper range to protect/build muscle), floored at protein_floor_g
+  fat_floor_g: 85
+  fibre_g: 20                  # stretch 25
+  fibre_stretch_g: 25
+  hard_floor_kcal: 1450
+  kcal_band_kcal: 125          # TUNABLE: day target +/- this = {low, high} band
+  atwater: { protein: 4, carb: 4, fat: 9 }   # kcal per GRAM; carbs = remainder (no floor)
+  day_split_kcal: { cardio: 180, strength: 100 }   # fixed PREFERENCE add-on by day type; nets to zero (BRIEF §7 STEP 3)
+
+# Workout fuel — pre/post-workout food eaten around the ~1pm session, i.e. AFTER the 11am meal plan,
+# so it is RESERVED at plan time: remaining_for_meals = day_target - logged_today - this_day's_fuel.
+# Each item has a self-resolving `marker` so logging it supersedes its reserve (no double-count).
+# NOT reserved here: breakfast / fruit — eaten before 11am, so they're either already logged (counted)
+# or not eaten at all (then lunch/dinner simply get the room). Per B: only ACTUAL logs count for those.
+fixed_intake:
+  run_fuel:                    # reserved on cardio/run days (pre + post run)
+    - { item: banana, qty: 2, kcal: 210, protein_g: 2.6, carbs_g: 54.0, fat_g: 0.7, fibre_g: 6.0, marker: banana }   # est. (no label; self-corrects on logging)
+    - { item: cereal_drink, qty: 1, kcal: 99, protein_g: 2.4, carbs_g: 19.2, fat_g: 1.5, fibre_g: 2.7, marker: cereal_drink }   # label: 25g serving
+  strength_fuel:               # reserved on strength days (pre + post)
+    - { item: flaxseed, qty_g: 10, kcal: 53, protein_g: 1.8, carbs_g: 3.0, fat_g: 4.2, fibre_g: 2.7, marker: flaxseed }   # est.
+    - { item: whey_scoop, qty: 1, kcal: 120, protein_g: 24.0, carbs_g: 3.0, fat_g: 1.5, fibre_g: 0.0, marker: protein_powder }   # ON Gold Standard, 30.4g/scoop
+    - { item: full_cream_milk, qty_ml: 200, kcal: 128, protein_g: 6.8, carbs_g: 9.6, fat_g: 7.2, fibre_g: 0.0, marker: milk }   # est. full-cream
+
+# Meal constraints — the VALUES (rules + windows + hard/soft live in BRIEF §5).
+meal_constraints:
+  same_shop: true
+  grain_max: 2                 # per calendar week (cap)
+  grain_min: 1                 # per calendar week (soft floor) -> 1–2 Grain days/wk (B 2026-06-28)
+  jones_min: 1                 # per 9 bot-planning days
+  no_repeat: true              # exact dish, Mon-Fri week
+  protein_rotation: { beef: ">=1", pork: ">=1", fish: "1-2", duck: ">=1 per 2wk" }   # Mon-Sun; rotation token = "fish" ONLY
+  protein_source_vocab: [beef, pork, chicken, duck, lamb, mutton, fish, other_seafood, egg, cheese, plant_other]   # food_log.protein_source tokens; only "fish" counts toward the rotation, "other_seafood" (shellfish/prawns/squid) does NOT
+  veg_day: 1                   # Mon-Fri
+  # HARD allowlist: the ONLY shops the assigner may put on a vegetarian day (B 2026-07-01). A meat-only
+  # shop (Chicken Breast Kitchen, FitFish) or a keto/meat-forward one (Freshies) is never used on veg day.
+  veg_day_shops: ["Jones Salad", "FitFuel by Grain", "Leanlicious", "Budder Clean Food", "KIN Healthy", "Deelizz On Table"]
+  eggs_min: 10                 # Mon-Sun, by quantity
+  budget_sgd_per_meal: 6.50    # weekly avg; THB->SGD at the flat rate below; finances uses real fx
+  fx_thb_per_sgd_planning: 25
+  home_staples:                # always-stocked fridge items, co-equal with shop dishes; macros are PER
+                               # serving, max_servings = the per-day cap (B-confirmed 2026-06-25)
+    boiled_egg:    { serving: "1 egg",  max_servings: 3, kcal: 78,  protein_g: 6.3, carbs_g: 0.6, fat_g: 5.3, fibre_g: 0 }
+    greek_yoghurt: { serving: "150 g",  max_servings: 1, kcal: 130, protein_g: 11,  carbs_g: 7,   fat_g: 6,   fibre_g: 0 }
+    cow_milk:      { serving: "200 ml", max_servings: 1, kcal: 128, protein_g: 6.8, carbs_g: 9.6, fat_g: 7.2, fibre_g: 0 }
+    edamame:       { serving: "150 g",  max_servings: 1, kcal: 188, protein_g: 17,  carbs_g: 14,  fat_g: 8,   fibre_g: 8 }
+    natto:         { serving: "50 g",   max_servings: 1, kcal: 100, protein_g: 8,   carbs_g: 6,   fat_g: 5,   fibre_g: 3 }
+
+# Strength training (BRIEF §11).
+strength:
+  duration_min: 80
+  duration_range_min: [70, 90]
+  order: gym-first then apartment-last; compound first
+  sets_per_muscle_per_week: [10, 20]
+  sets_per_exercise: [2, 4]
+  rules:
+    - "Hip Thrust only immediately after Seated Cable Row"
+    - "prefer the dumbbell triceps extension over the cable pushdown; don't program both triceps isolations in the same session"
+    - "bias volume to glutes / hamstrings / back / shoulders / core"
+  fit_encoding: { reps: top_of_range, rest: midpoint, weight: kg }   # the LLM decides each exercise's rep/rest RANGE from evidence + B's data (NOT a catalog table); the .fit stores top-of-reps / midpoint-of-rest, weight in kg
+  image_weight_units: [kg, lb]
+
+# Running — toward sub-60 10k (BRIEF §11).
+running:
+  default_surface: treadmill
+  types:
+    easy:    { distance_km: 5.5, speed_kmh: 7.5 }
+    long:    { distance_km: 8.0, speed_kmh: 7.5 }
+    quality: { distance_km: 6.0, speed_kmh: 8.0 }
+    fartlek: { distance_km: 6.0, speed_kmh: 8.0 }
+
+# Weekly training (BRIEF §11).
+weekly_training:
+  cardio_per_week: 2
+  strength_per_week: 2
+  min_sessions: 3
+  avoid_weekends: true         # social
+  min_rest_days: 1
+  rules:
+    - "never two hard days back-to-back"
+    - "no heavy lower before a hard run"
+    - "keep legs fresh around running days"

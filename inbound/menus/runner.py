@@ -11,10 +11,15 @@ FX rate (THB → SGD) is fetched once from frankfurter.app at run start and appl
 to all items with a THB price. The rate and fetch timestamp are stored in item meta.
 
 Usage:
-    python3 -m inbound.menus.runner              # all sources
+    python3 -m inbound.menus.runner              # DEFAULT sources (jones excluded — frozen, see below)
     python3 -m inbound.menus.runner wongnai      # one source
-    python3 -m inbound.menus.runner jones
+    python3 -m inbound.menus.runner jones        # explicit opt-in ONLY (re-scraping UNDOES the price freeze)
     python3 -m inbound.menus.runner fitfuel
+
+Jones Salad is FROZEN (B 2026-07-02): its source page publishes no prices, so the 2026-06-25 batch was
+one-off price-matched from WongNai and menu_current keeps serving it (per-restaurant-latest view).
+Default runs skip jones; a manual jones run would append a fresh PRICE-LESS batch that becomes the
+latest and evicts the priced one — only do that deliberately, to reverse the freeze.
 """
 
 import logging
@@ -102,10 +107,15 @@ def _apply_sgd_prices(items: list[MenuItem], rate: float, fetched_at: str) -> No
 def run_all(sources: list[str] | None = None) -> dict:
     available = {
         "fitfuel": fitfuel.scrape_all,
-        "jones":   jones.scrape_all,
+        "jones":   jones.scrape_all,     # kept importable/manually runnable — NOT in the default run
         "wongnai": wongnai.scrape_all,
     }
-    targets = sources or list(available.keys())
+    # Jones frozen 2026-07-02 (source publishes no prices; menu_current serves the one-off-priced
+    # 2026-06-25 batch forever via per-restaurant-latest). Excluded from DEFAULT runs only — explicit
+    # opt-in still works: run_all(["jones"]) or `python3 -m inbound.menus.runner jones` (that UNDOES
+    # the freeze by appending a price-less batch — see module docstring).
+    default_sources = [s for s in available if s != "jones"]
+    targets = sources or default_sources
 
     scraped_at = datetime.now(tz=timezone.utc)
     summary: dict = {}

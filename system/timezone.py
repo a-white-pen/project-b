@@ -7,10 +7,12 @@ need to render timestamps in local time (attention, sleep correction, future: nu
 
 Functions:
   get_timezone(as_of) — returns ZoneInfo for B at as_of, or Asia/Singapore fallback
+  get_local_today(now_utc) — B's local (date, tz_name) as-of now_utc (default: now). The planner
+      day-boundary helper — every planner/cron computes "today" the same way.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from system.db import get_connection
@@ -76,3 +78,11 @@ def get_timezone(as_of: datetime | None = None) -> ZoneInfo:
             as_of=as_of.isoformat() if as_of else None,
         )
     return _FALLBACK_TZ
+
+
+# B's local "today" + tz name as-of now_utc (default: now). Wraps get_timezone so every planner and
+# cron derives the local day-boundary identically. Output: (date, tz_name_str).
+def get_local_today(now_utc: datetime | None = None) -> tuple:
+    now = now_utc or datetime.now(timezone.utc)
+    tz = get_timezone(now)
+    return now.astimezone(tz).date(), str(tz)

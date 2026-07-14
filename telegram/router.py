@@ -49,6 +49,13 @@ from domains.expense.service import handle_expense_log
 from domains.food.correction import handle_food_correction
 from domains.food.service import handle_food_log
 from domains.general.service import handle_general_ask
+from domains.health_agent.plan_command import (
+    dispatch_plan_subcommand,
+    handle_meal_eaten,
+    handle_plan,
+    handle_plan_correction,
+    handle_week_view,
+)
 from domains.location.service import handle_location
 from domains.query.service import handle_query_data
 from domains.sleep.correction import handle_sleep_wake_correction
@@ -66,6 +73,7 @@ from system.llm import (
 from system.logging import log_event, log_failure
 from system.messages import InboundMessage, MessageType
 from telegram.files import get_file_bytes
+from telegram.replies import pin_kind_for
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +93,8 @@ class Intent(str, Enum):
     ASK_GENERAL = "ask_general"         # general question — use as an LLM, unrelated to personal data
     CORRECT = "correct"                 # correction to a previously logged item (quoted bot reply)
     REFRESH_MENUS = "refresh_menus"     # trigger full menu scrape across all sources
+    VIEW_WEEK = "view_week"             # /week — read-only weekly plan view (+ Plan Week button)
+    PLAN = "plan"                       # /plan — hub: run / strength / meal
     UNKNOWN = "unknown"                 # cannot determine intent
 
 
@@ -96,6 +106,8 @@ _COMMAND_MAP: dict[str, Intent] = {
     "/refresh_menus": Intent.REFRESH_MENUS,
     "/aligner_status": Intent.ALIGNER_STATUS,
     "/attention_status": Intent.ATTENTION_STATUS,
+    "/week": Intent.VIEW_WEEK,
+    "/plan": Intent.PLAN,
 }
 
 # Maps the exact aligner reply-keyboard button labels to intents — like slash commands,
@@ -202,7 +214,7 @@ def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
         quoted_message_id=msg.quoted_message_id,
     )
     if msg.message_type == MessageType.CALLBACK_QUERY:
-        return [_route_callback(msg)]
+        return _route_callback(msg)
     # Location is always deterministic — no LLM needed.
     if msg.message_type == MessageType.LOCATION:
         if msg.location:
@@ -264,10 +276,12 @@ def route(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     return _dispatch(intent, msg)
 
 
-# Routes a callback_query update deterministically from callback_data.
+# Routes a callback_query update deterministically from callback_data (no LLM).
+# Planner buttons: `plan:<sub>` -> the /plan sub-planners (run/strength/meal/week); `meal_ate:<...>`
+# -> meal/staple completion. Handlers dismiss the spinner (answer_callback_query) themselves.
 # Inputs: InboundMessage with message_type=CALLBACK_QUERY.
-# Outputs: (reply, None). No LLM call — callback_data is explicit, not ambiguous.
-def _route_callback(msg: InboundMessage) -> tuple[str, None]:
+# Outputs: list of (reply, state) bubbles (a handler may self-send its message and return []).
+def _route_callback(msg: InboundMessage) -> list[tuple[str, dict | None]]:
     log_event(
         logger,
         logging.INFO,
@@ -275,9 +289,13 @@ def _route_callback(msg: InboundMessage) -> tuple[str, None]:
         update_id=msg.update_id,
         callback_data=msg.callback_data,
     )
-    # No inline buttons implemented yet — all callback_data falls through to stub.
-    # When buttons are added, dispatch here by callback_data value.
-    return ("button press captured — not implemented yet", None)
+    data = msg.callback_data or ""
+    if data.startswith("plan:"):
+        return dispatch_plan_subcommand(data.split(":", 1)[1], msg)
+    if data.startswith("meal_ate:"):
+        return handle_meal_eaten(msg)
+    # Unknown callback_data — acknowledge without action.
+    return [("button press captured — not implemented yet", None)]
 
 
 # Extracts a slash command from the message text and maps it to an Intent.
@@ -463,6 +481,21 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
         )
         return None
     if state is None:
+        # No saved correction-state — but PROACTIVE / summary / all-eaten cards NEVER save it (only the
+        # interactive /plan card does). If the quoted message is a tracked PIN, route by its kind so a quote
+        # (especially a menu photo/album to the pinned MEAL card, to re-plan) reaches the planner instead of
+        # falling through to the food/expense photo classifier — the 2026-07-07 bug where a menu album got
+        # logged as food + an ignored expense. Only meal/week route (exercise = ambiguous run vs strength).
+        try:
+            pin_kind = pin_kind_for(msg.quoted_message_id)
+        except Exception as e:
+            log_failure(logger, logging.WARNING, "route_pin_fallback_lookup_failed", e,
+                        update_id=msg.update_id, quoted_message_id=msg.quoted_message_id)
+            pin_kind = None
+        if pin_kind in ("meal", "week"):
+            log_event(logger, logging.INFO, "route_correction_pin_fallback",
+                      update_id=msg.update_id, quoted_message_id=msg.quoted_message_id, kind=pin_kind)
+            return handle_plan_correction(msg, {"domain": "plan", "context": {"kind": pin_kind}})
         return None
     domain = state.get("domain")
     if domain == "food":
@@ -477,6 +510,8 @@ def _try_correction(msg: InboundMessage) -> list[tuple[str, dict | None]] | None
         return [handle_weight_correction(msg, state)]
     if domain == "expense":
         return [handle_expense_correction(msg, state)]
+    if domain == "plan":
+        return handle_plan_correction(msg, state)  # already returns list; splits by context.kind
     # Other domains: not implemented yet — fall through to normal routing
     log_event(
         logger,
@@ -526,4 +561,8 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | Non
         return [handle_general_ask(msg)]
     if intent == Intent.REFRESH_MENUS:
         return [handle_refresh_menus(msg)]
+    if intent == Intent.VIEW_WEEK:
+        return handle_week_view(msg)  # already returns list
+    if intent == Intent.PLAN:
+        return handle_plan(msg)  # already returns list (hub picker)
     return [("not sure what to do with that yet", None)]

@@ -130,43 +130,60 @@ def register_routes(app: FastAPI) -> None:
         # Telegram would retry and then skip as a duplicate).
         album_file_ids: list[str] | None = None
         media_group_id = _extract_media_group_id(payload)
+        reply_present = bool((payload.get("message") or {}).get("reply_to_message"))  # a quoted correction
         if media_group_id is not None:
             try:
                 await asyncio.sleep(_ALBUM_SETTLE_SECONDS)  # let closely-arriving siblings store
                 photos = await asyncio.to_thread(_get_media_group_photos, media_group_id)
                 spend_id, processed_files = await asyncio.to_thread(get_media_group_progress, media_group_id)
                 is_min = bool(photos) and photos[0][0] == update_id
-                if spend_id is None and not is_min:
-                    # No expense row yet and we are not the first update. The min update may still be
-                    # creating the merged row (expense albums make ONE row from all photos). Poll for
-                    # it so a sibling arriving during the first photo's LLM call is not lost.
-                    waited = 0.0
-                    while spend_id is None and waited < _ALBUM_STRAGGLER_WAIT_SECONDS:
-                        await asyncio.sleep(_ALBUM_POLL_INTERVAL_SECONDS)
-                        waited += _ALBUM_POLL_INTERVAL_SECONDS
-                        spend_id, processed_files = await asyncio.to_thread(
-                            get_media_group_progress, media_group_id)
-                    if spend_id is not None:
-                        photos = await asyncio.to_thread(_get_media_group_photos, media_group_id)
-                # Only expense albums merge into one row (the first update creates it, later updates
-                # append). If this is the first update (is_min) or an expense row exists, take the
-                # album-merge path. Otherwise no expense row materialised — this is NOT an expense
-                # album (e.g. a food album), so fall through and process THIS photo on its own (the
-                # domain logs one entry per photo) rather than discarding it.
-                if is_min or spend_id is not None:
-                    current_files = {fid for _, fid in photos}
-                    if spend_id is not None and current_files <= processed_files:
-                        # Every album photo is already in the spend's thread — nothing new to add.
-                        log_event(logger, logging.INFO, "webhook_media_group_no_new_photos",
-                                  update_id=update_id, media_group_id=media_group_id)
-                        return {"ok": True}
-                    album_file_ids = [fid for _, fid in photos] or None
-                    log_event(logger, logging.INFO, "webhook_media_group_processing",
-                              update_id=update_id, media_group_id=media_group_id,
-                              photo_count=len(album_file_ids or []), existing_spend_id=spend_id)
-                else:
-                    log_event(logger, logging.INFO, "webhook_media_group_non_expense_single",
+                # A quoted-reply correction sent as a photo ALBUM (e.g. menu screenshots to "choose from
+                # these") has NO expense row. Aggregate ALL its photos onto the FIRST (min) update and drop
+                # the siblings, so exactly ONE correction fires over the whole board (not one per photo).
+                # Handled BEFORE the expense straggler poll so a sibling doesn't wait 20s for a spend row
+                # that will never appear. reply_present gates this so bare food albums are unaffected.
+                correction_album = reply_present and spend_id is None
+                if correction_album and not is_min:
+                    log_event(logger, logging.INFO, "webhook_media_group_correction_sibling_dropped",
                               update_id=update_id, media_group_id=media_group_id)
+                    return {"ok": True}
+                if correction_album:
+                    album_file_ids = [fid for _, fid in photos] or None
+                    log_event(logger, logging.INFO, "webhook_media_group_correction_aggregated",
+                              update_id=update_id, media_group_id=media_group_id,
+                              photo_count=len(album_file_ids or []))
+                else:
+                    if spend_id is None and not is_min:
+                        # No expense row yet and we are not the first update. The min update may still be
+                        # creating the merged row (expense albums make ONE row from all photos). Poll for
+                        # it so a sibling arriving during the first photo's LLM call is not lost.
+                        waited = 0.0
+                        while spend_id is None and waited < _ALBUM_STRAGGLER_WAIT_SECONDS:
+                            await asyncio.sleep(_ALBUM_POLL_INTERVAL_SECONDS)
+                            waited += _ALBUM_POLL_INTERVAL_SECONDS
+                            spend_id, processed_files = await asyncio.to_thread(
+                                get_media_group_progress, media_group_id)
+                        if spend_id is not None:
+                            photos = await asyncio.to_thread(_get_media_group_photos, media_group_id)
+                    # Only expense albums merge into one row (the first update creates it, later updates
+                    # append). If this is the first update (is_min) or an expense row exists, take the
+                    # album-merge path. Otherwise no expense row materialised — this is NOT an expense
+                    # album (e.g. a food album), so fall through and process THIS photo on its own (the
+                    # domain logs one entry per photo) rather than discarding it.
+                    if is_min or spend_id is not None:
+                        current_files = {fid for _, fid in photos}
+                        if spend_id is not None and current_files <= processed_files:
+                            # Every album photo is already in the spend's thread — nothing new to add.
+                            log_event(logger, logging.INFO, "webhook_media_group_no_new_photos",
+                                      update_id=update_id, media_group_id=media_group_id)
+                            return {"ok": True}
+                        album_file_ids = [fid for _, fid in photos] or None
+                        log_event(logger, logging.INFO, "webhook_media_group_processing",
+                                  update_id=update_id, media_group_id=media_group_id,
+                                  photo_count=len(album_file_ids or []), existing_spend_id=spend_id)
+                    else:
+                        log_event(logger, logging.INFO, "webhook_media_group_non_expense_single",
+                                  update_id=update_id, media_group_id=media_group_id)
             except Exception as e:
                 # Transient DB error during album resolution — do NOT lose the update. Fall back to
                 # processing this single photo; the rebuild can incorporate siblings on a later touch.
