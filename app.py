@@ -20,6 +20,7 @@ configure_logging()
 from api.data_visualisation import register_routes as register_data_vis_routes
 from api.limiter import limiter
 from api.menus import register_routes as register_menus_routes
+from api.planner_jobs import register_routes as register_planner_routes
 from inbound.strava.webhook import register_routes as register_strava_routes
 
 # Garmin inbound — waiting to build (Phase 3)
@@ -41,7 +42,7 @@ def create_app() -> FastAPI:
     register_strava_routes(app)
     register_data_vis_routes(app)
     register_menus_routes(app)
-    # register_garmin_routes(app)   # Phase 3 — waiting to build
+    register_planner_routes(app)
     # register_gmail_routes(app)    # future — waiting to build
     return app
 
