@@ -81,7 +81,8 @@ cp .env.example .env
 # Fill in values — see .env.example for what's required
 
 # Cloud SQL Auth Proxy (binary is gitignored — install via Homebrew)
-cloud-sql-proxy awhitepen-project-b:asia-southeast1:projectb-db
+# Connection name: your GCP console → SQL → instance → "Connection name"
+cloud-sql-proxy <PROJECT_ID>:<REGION>:<INSTANCE>
 
 # Run locally
 uvicorn app:app --reload

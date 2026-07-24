@@ -589,26 +589,43 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
                     if candidate_result is not None:
                         return candidate_result
 
-    # Handle skip_structured_source (LLM escape) — re-estimate without structured source.
+    # Handle skip_structured_source (LLM escape) — re-estimate the item FRESH from its name +
+    # quantity. Two things matter here: (1) do NOT anchor on the rejected structured-source macros
+    # (that wrong match is exactly what B is escaping), and (2) do NOT feed the bare menu letter
+    # ("h") as the correction instruction. Both would drag the bad estimate along.
     if skip_structured_source and not any("food_item" in ci for ci in correction_items if ci.get("action") != "delete"):
         quoted_item = next((r for r in current_items if r["food_log_id"] in food_log_ids), None)
         if quoted_item is not None:
-            reestimated = _reestimate_item(quoted_item, correction_text, msg.update_id, correction_history)
+            # Null out the rejected macros so _reestimate_item estimates from name + quantity alone,
+            # not from the wrong numbers B just rejected.
+            clean_item = {**quoted_item, "kcal": None, "protein_g": None, "carbs_g": None,
+                          "fat_g": None, "fibre_g": None, "sugar_g": None, "sodium_mg": None}
+            reestimated = _reestimate_item(
+                clean_item,
+                "Estimate this item's macros from your own nutrition knowledge — the previous database match was wrong.",
+                msg.update_id, correction_history)
             if reestimated is not None:
                 fid = quoted_item["food_log_id"]
-                updates: dict = {
-                    "macro_method": "llm",
-                    "macro_input": "description",
+                # Underscore-prefixed provenance so _apply_corrections actually writes it (it reads
+                # _macro_*), and _skip_provenance so the enrichment loop below does NOT re-derive
+                # provenance — these macros are LLM estimates, not user-stated values. macro_meta
+                # carries no field_sources, so every field renders "llm est." via the macro_method
+                # fallback (macro_method="llm").
+                skip_item = {
+                    "food_log_id": fid,
+                    "action": "update",
+                    "_macro_input": "description",
+                    "_macro_method": "llm",
                     "_macro_meta": {
                         "model": MODEL_FLASH,
                         "correction_update_id": msg.update_id,
                         "skip_structured_source": True,
                     },
+                    "_skip_provenance": True,
                 }
                 for col in ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg"):
                     if reestimated.get(col) is not None:
-                        updates[col] = reestimated[col]
-                skip_item = {"food_log_id": fid, "action": "update", **updates}
+                        skip_item[col] = reestimated[col]
                 # Inject as the sole correction item and fall through to _apply_corrections.
                 correction_items = [skip_item]
 
@@ -646,6 +663,12 @@ def handle_food_correction(msg: InboundMessage, state: dict) -> list[tuple[str, 
 
     for item in correction_items:
         if item.get("action") == "delete":
+            continue
+
+        # LLM-escape ("Use LLM estimate") item: macros are fresh LLM estimates with provenance
+        # already set to llm. Skip the user_stated inference below — its plain macro keys are
+        # estimates, not values B typed, so treating them as user_stated would mislabel them "manual".
+        if item.pop("_skip_provenance", False):
             continue
 
         # Snapshot explicit macro values before any re-estimation merge.
