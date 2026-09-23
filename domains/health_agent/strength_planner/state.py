@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from domains.health_agent.strength_planner import catalog
 from system.db import get_connection
-from domains.health_agent.goals import load_goals
+from domains.health_agent.goals import load_goals, mode_config
 from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
@@ -222,6 +222,7 @@ def build_state(plan_date, tz_name: str, correction: str | None = None,
     state = {
         "today": plan_date.isoformat(),
         "weekday": plan_date.strftime("%A"),
+        "venue": mode_config().get("preferred_gym") or catalog.default_venue(),
         "note": note,
         "correction": correction,
         "weight": weight,

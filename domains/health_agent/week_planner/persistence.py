@@ -13,7 +13,7 @@ adversarially. Pure helpers (_run_seed/_meal_status/_active_note) are trivial an
 
 Functions:
   save_week(days, meta) -> None
-  add_note(plan_date, text, kind, activity_type, run_surface) -> None   # pin/context from a correction
+  add_note(plan_date, text, kind, activity_type, run_surface, run_type) -> None   # pin/context from a correction
   read_shop_pool(cap_sgd) -> list[dict]   # eligible-shop snapshot for meal_assign.assign_shops
   read_week(start_date, end_date, today) -> list[dict]   # render-shape day dicts
 """
@@ -103,11 +103,17 @@ def save_week(days: list[dict], meta: dict | None = None) -> None:
                             (d["date"],),
                         )
                     if "cardio" in at:
+                        # run_surface COALESCEs: assemble days never carry surface (only a pin or the
+                        # day-of planner sets it), so a plain overwrite would NULL a just-pinned
+                        # "outdoor" on the very re-plan the pin triggers. run_type IS carried through
+                        # the pin pipeline (state -> _apply_pins), so it writes verbatim.
                         cur.execute(
                             "INSERT INTO exercise.cardio_plan (plan_date, status, run_type, run_surface) "
                             "VALUES (%s, 'planned', %s, %s) "
                             "ON CONFLICT (plan_date) DO UPDATE SET "
-                            "  run_type = EXCLUDED.run_type, run_surface = EXCLUDED.run_surface, updated_at = now() "
+                            "  run_type = EXCLUDED.run_type, "
+                            "  run_surface = COALESCE(EXCLUDED.run_surface, exercise.cardio_plan.run_surface), "
+                            "  updated_at = now() "
                             "WHERE exercise.cardio_plan.status = 'planned'",
                             (d["date"], d.get("run_type"), d.get("run_surface")),
                         )
@@ -118,13 +124,16 @@ def save_week(days: list[dict], meta: dict | None = None) -> None:
 
 # Appends a correction note to daily_plan.notes (jsonb array). A PIN (activity_type given) also LOCKS
 # the day to that activity — trigger-safe: the spine activity_type is set FIRST (firing cleanup_satellites
-# for any removed kind), then the satellites for the kinds present; a cardio pin carries run_surface.
+# for any removed kind), then the satellites for the kinds present; a cardio pin carries run_surface AND
+# run_type (B naming the run kind — "easy run Tuesday" — must survive into the pin; build_week_state
+# reads the pin's run_type back off cardio_plan, and planner._apply_pins forces it over the LLM).
 # A CONTEXT note (activity_type None) never changes activity; the row is created as a rest day only if
 # absent (a note needs a row to live on). The pin's `locked`/activity is re-read by state.build_week_state
 # (it reads pins off daily_plan.notes + the row's activity_type), so the next re-plan honours it.
-# Input: the day, the note text, kind 'pin'|'context', the pinned activity_type, optional run_surface.
+# Input: the day, the note text, kind 'pin'|'context', the pinned activity_type, optional run_surface/run_type.
 def add_note(plan_date, text: str, kind: str = "context",
-             activity_type: list | None = None, run_surface: str | None = None) -> None:
+             activity_type: list | None = None, run_surface: str | None = None,
+             run_type: str | None = None) -> None:
     note = [{"at": datetime.now(timezone.utc).isoformat(), "text": text,
              "active": True, "kind": kind, "source": "correction"}]
     conn = get_connection()
@@ -143,13 +152,19 @@ def add_note(plan_date, text: str, kind: str = "context",
                         (plan_date, activity_type, psycopg2.extras.Json(note)),
                     )
                     if "cardio" in activity_type:
+                        # run_type writes VERBATIM (NULL clears): a cardio pin's run_type is always
+                        # intentional (_normalise_edits nulls it unless B named the run kind), so a
+                        # walk/hike pin must CLEAR a stale run_type left by a prior plan — COALESCE
+                        # would lock the walk day to e.g. "quality". run_surface keeps COALESCE (an
+                        # unspecified surface should not clear one B set earlier).
                         cur.execute(
-                            "INSERT INTO exercise.cardio_plan (plan_date, status, run_surface) "
-                            "VALUES (%s, 'planned', %s) "
+                            "INSERT INTO exercise.cardio_plan (plan_date, status, run_type, run_surface) "
+                            "VALUES (%s, 'planned', %s, %s) "
                             "ON CONFLICT (plan_date) DO UPDATE SET "
+                            "  run_type = EXCLUDED.run_type, "
                             "  run_surface = COALESCE(EXCLUDED.run_surface, exercise.cardio_plan.run_surface), "
                             "  updated_at = now() WHERE exercise.cardio_plan.status = 'planned'",
-                            (plan_date, run_surface),
+                            (plan_date, run_type, run_surface),
                         )
                     if "strength" in activity_type:
                         cur.execute(

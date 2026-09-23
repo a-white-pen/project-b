@@ -3,6 +3,15 @@
 # Read via domains/health_agent/goals.py::load_goals(). Rules + windows live in the BRIEF (§5/§7/§11);
 # this file holds the VALUES the deterministic code + LLM prompts consume.
 
+# Location mode — ONE switch that flips B's whole venue setup when she travels BKK<->SG. Set it (by hand
+# or "ask Claude") on arrival; effective on the NEXT DEPLOY (goals.yaml is baked into the Cloud Run image).
+# goals.py::mode_config() expands `city` into the three correlated venue toggles the planners consume:
+#   bangkok   -> gym=bangkok_condo, avoid_weekends=true,  bot plans shop meals + veg-day
+#   singapore -> gym=singapore_gym, avoid_weekends=false, B self-orders delivery, bot only tops up staples
+# (An explicit preferred_gym/avoid_weekends/b_extended_plans_meals here still overrides, if B ever mixes.)
+mode:
+  city: bangkok        # bangkok | singapore  — the single location switch
+
 person:
   sex: F
   height_cm: 161
@@ -87,11 +96,12 @@ meal_constraints:
 strength:
   duration_min: 80
   duration_range_min: [70, 90]
-  order: gym-first then apartment-last; compound first
+  order: compound first, then accessory/isolation; core last
   sets_per_muscle_per_week: [10, 20]
   sets_per_exercise: [2, 4]
   rules:
-    - "Hip Thrust only immediately after Seated Cable Row"
+    # Hip-Thrust-after-Row is venue-specific (bangkok_condo) — carried by the catalog's pairs_after_at
+    # + the per-venue catalog block, NOT here (this block goes to the model unscoped at every venue).
     - "prefer the dumbbell triceps extension over the cable pushdown; don't program both triceps isolations in the same session"
     - "bias volume to glutes / hamstrings / back / shoulders / core"
   fit_encoding: { reps: top_of_range, rest: midpoint, weight: kg }   # the LLM decides each exercise's rep/rest RANGE from evidence + B's data (NOT a catalog table); the .fit stores top-of-reps / midpoint-of-rest, weight in kg
@@ -111,8 +121,7 @@ weekly_training:
   cardio_per_week: 2
   strength_per_week: 2
   min_sessions: 3
-  avoid_weekends: true         # social
-  min_rest_days: 1
+  min_rest_days: 1             # avoid_weekends moved to the top-level `mode:` block (per-venue toggle)
   rules:
     - "never two hard days back-to-back"
     - "no heavy lower before a hard run"
