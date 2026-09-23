@@ -1,14 +1,7 @@
-"""
-Builds the Gemini Pro prompt for the weekly reflection's narrative + carry-forward directives.
-
-The deterministic numbers (maintenance/target/goal stats) are computed in code and are FINAL — the
-LLM only writes the prose narrative B reads, the machine `directives` the planners carry forward
-(running focus, strength emphasis, protein note), and two SHORT per-goal nudges shown in the spec-H
-message. Stable SYSTEM prefix first (goals + schema), dynamic week-state JSON after — so Gemini's
-implicit caching can hit. Pro via generate_json_reasoning (initial-plan model).
+"""Builds the model prompt for weekly reflection text and planning guidance.
 
 Functions:
-  build_reflection_prompt(data, goals) -> str
+  build_reflection_prompt — combines final weekly facts with the writing instructions
 """
 
 import json
@@ -21,8 +14,8 @@ warmth. Keep it short and dry. Plain text only — no HTML, no markdown, no angl
 
 The numbers below are already computed and FINAL — do NOT recompute, round, or contradict them. \
 Your job is only the words:
-1. narrative: 2-3 dry sentences B reads — what the week's data says across her 3 EQUAL goals \
-(maintain weight via lean recomp / build muscle / sub-60 10k). Honest, specific, no fluff.
+1. narrative: 2-3 dry sentences B reads — what the week's data says about build muscle, sub-60 10k, \
+and the logged habits. Honest, specific, no fluff. Do not infer a calorie or weight direction.
 2. directives: machine carry-forward for next week's planners — concrete short phrases or null: \
 running_focus, strength_emphasis, protein_note.
 3. run / muscle_status: ONE short nudge each for the message (e.g. run = "add 1 tempo/wk", \
@@ -37,19 +30,13 @@ Output STRICT JSON only:
 "protein_note": str|null}}, "run": str|null, "muscle_status": str|null}}"""
 
 
-# Builds the Pro prompt: stable SYSTEM (goals + schema) first, then the week's computed state JSON.
-# Input: the assembled render data dict (the FINAL numbers) + the goals dict. Output: prompt string.
-def build_reflection_prompt(data: dict, goals: dict) -> str:
+# Adds the computed weekly facts to the reflection instructions.
+def build_reflection_prompt(data: dict) -> str:
     system = _SYSTEM.format(goals=goals_prompt_block())
     state = {
         "week": data.get("week_num"),
-        "weight": data.get("weight"),
-        "maintenance_kcal": data.get("maintenance"),
-        "next_week_target_kcal": data.get("target"),
-        "direction": data.get("direction"),
-        "sub60_10k": data.get("run"),            # {est_label, min_to_go} or None (no quality run yet)
-        "build_muscle": data.get("muscle"),       # {summary} or None (no strength logged)
-        "weight_band": data.get("weight_goal"),
+        "sub60_10k": data.get("run"),
+        "build_muscle": data.get("muscle"),
         "eggs": data.get("eggs"),
         "fish": data.get("fish_note"),
     }

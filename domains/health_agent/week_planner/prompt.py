@@ -1,18 +1,7 @@
-"""
-Builds the Gemini Pro prompt for the WEEK SCAFFOLD / re-plan. The model proposes only the week SHAPE
-— the code (enforce + macros) guarantees the rules + computes the macro targets (§2 enforcement
-boundary), so the prompt tells it NOT to compute calories or force counts. Stable SYSTEM prefix
-(goals + rules + schema) first, dynamic state JSON after, for implicit caching.
-
-The weekend-avoidance clause and the vegetarian-day rule/field are toggled by the mode flags
-(mode.avoid_weekends, mode.b_extended_plans_meals) so the model isn't asked to plan a concept B has
-turned off — e.g. in Singapore any day is fine and B self-orders meals, so there's no veg day.
-
-state shape (state.py produces it):
-  {today, horizon: [date], weekly_target, weight_kg, directives, recent_training, pins, existing}
+"""Builds the model prompt for proposing a weekly training plan.
 
 Functions:
-  build_prompt(state) -> str
+  build_prompt — combines weekly rules, location settings, and current plan state
 """
 
 import json
@@ -30,7 +19,7 @@ Aim for (code will enforce/relax + report what bent):
   quality/fartlek run). No heavy lower-body the day before a hard run (keep legs fresh for running).{veg_clause}
 - Honor B's PINS exactly — a pinned day is fixed; plan around it.
 
-B's 3 EQUAL goals + the carry-forward directives steer emphasis (run focus, strength emphasis):
+B's two training goals + the carry-forward directives steer emphasis (run focus, strength emphasis):
 {goals}
 
 For EACH day in the horizon, output: activity_type (a subset of rest|cardio|strength|other — usually
@@ -45,10 +34,7 @@ status_line = one dry line for the re-plan header, e.g. "Reshuffled 3 days — s
 """
 
 
-# Builds the scaffold prompt: stable SYSTEM (goals + rules + schema) first, then the week state JSON.
-# The weekend + vegetarian clauses are gated by mode.avoid_weekends / mode.b_extended_plans_meals so the
-# model never plans a turned-off concept (saves tokens + avoids stale guidance). Input: the state dict
-# (state.py). Output: the prompt string (dates serialised via default=str).
+# Builds the weekly prompt using the active weekend and meal-planning settings.
 def build_prompt(state: dict) -> str:
     mode = mode_config()
     weekend_clause = ("Avoid weekends (social)." if mode.get("avoid_weekends", True)
