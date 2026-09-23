@@ -711,7 +711,7 @@ The 7-day spine: one row per planned day. Holds the day's activity kinds, the me
 | `plan_date` | `date` | no |  | Calendar day. UNIQUE; satellites FK to this. |
 | `activity_type` | `text[]` | no | ARRAY['rest'::text] | The day's activities (array; supports a 2-a-day e.g. {strength,cardio}). Vocab: rest \| cardio (run/hash/hike/cycle/swim — all count toward the cardio target) \| strength \| other (yoga/pilates/climbing — no satellite). A strength_plan/cardio_plan row may only exist when the matching value is present (enforced by trigger). |
 | `is_vegetarian_day` | `boolean` | yes |  | TRUE on the single vegetarian day the Sun scaffold picks each Mon-Fri week (B can move it). Set week-ahead so /week shows it BEFORE meals are planned day-of; the 11am planner honours it. |
-| `macro_target` | `jsonb` | yes |  | Derived cache of the day's macro budget: {"kcal":{low,target,high},"protein_g":{low,high},"fat_g":{min},"carbs_g":{target},"fibre_g":{target,stretch},"day_type"}. kcal low/high = target ± kcal_band_kcal (125); carbs = remainder (no floor). Recomputed when activity changes + refreshed day-of. NULL until computed. |
+| `macro_target` | `jsonb` | yes |  | Cached per-day nutrition target. Current meal planning reads only the kcal and protein_g ranges. Existing rows may also contain legacy fat_g, carbs_g, fibre_g, and day_type values; these are retained but ignored. NULL means no nutrition target was generated for the day. |
 | `meal_plan_provider` | `text` | yes |  | The day's ONE shop (same_shop). Canonical external_data menu restaurant_name. NULL on own-food/weekend. |
 | `meal_spend_id` | `integer` | yes |  | Loose link to finances.spend_entries — the day's meal order. Set by the expense reconciler when a meal-category spend's merchant matches meal_plan_provider. ON DELETE SET NULL. |
 | `notes` | `jsonb` | no | '[]'::jsonb | B's free-text edits as a timestamped array: [{"at":ts,"text":str,"active":bool,"kind":"pin\|context"}]. The edit handler (Flash) auto-classifies: a PIN changes the day's activity/shop and deterministically LOCKS that day (a re-plan/scaffold must NOT move a day with an active pin — the pin IS the lock signal, no separate column); a CONTEXT note only informs the LLM. Notes are ONE-OFF (this week; treated as expired once the horizon passes — no standing rules, those get coded directly). An active pin outranks every other constraint. Editable/removable via Telegram; shown as a note line in /week + /plan week. |
@@ -720,18 +720,14 @@ The 7-day spine: one row per planned day. Holds the day's activity kinds, the me
 | `updated_at` | `timestamp with time zone` | yes |  | Last mutation; set ONLY on a real change (never a blanket update). |
 
 ### Table: `health_agent.weekly_reflections`
-One row per ISO week. The Sun cron computes maintenance (mean intake over flat-weight weeks) + the 3-4wk weight trend, sets next week's target (= maintenance − a band-aware deficit), and writes the narrative + carry-forward directives. No 7700, no Garmin, no kcal/kg, no regression — maintenance is the flat-week intake MEAN (the regression intercept; PERIOD weeks excluded); the band controller + 3-4wk trend pick cut/hold/gain. Frozen during cuts (carries last value), re-measures when stable.
+One row per ISO week. Stores the weekly health reflection narrative and carry-forward planner guidance. Weight is read separately for display and does not determine calorie targets or planning direction.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
 | `weekly_reflection_id` | `integer` | no | nextval('health_agent.weekly_reflections_weekly_reflection_id_seq'::regclass) |  |
 | `iso_week` | `text` | no |  | ISO year-week, format IYYY-"W"IW (e.g. 2026-W26, 2026-W52, 2027-W01). UNIQUE. MUST use IYYY (ISO-year) not YYYY (calendar-year): they diverge in late-Dec/early-Jan, so YYYY would mislabel the turn-of-year week. Rolls into next year with no collisions since the ISO year is in the key. |
-| `maintenance_kcal` | `integer` | yes |  | Mean daily intake over trailing flat-weight weeks (\|Δ7d-avg\| < 0.2 kg). |
-| `target_kcal` | `integer` | yes |  | Daily weekly-AVERAGE target set for next week (redistributed across cardio/strength/rest days). |
-| `weight_trend_kg` | `numeric(4,2)` | yes |  | 3-4wk slope of the 7d-avg weight (kg/week) — the calibration anchor. |
-| `narrative` | `text` | yes |  | Prose B reads. |
-| `directives` | `jsonb` | no | '{}'::jsonb | Machine carry-forward for the daily planners (cautions, focus). |
-| `meta` | `jsonb` | no | '{}'::jsonb | Audit of the inputs. |
+| `narrative` | `text` | yes |  | Weekly reflection prose shown to B. |
+| `directives` | `jsonb` | no | '{}'::jsonb | Guidance carried into later planning. Shape: {"running_focus":string\|null,"strength_emphasis":string\|null,"protein_note":string\|null}. |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 | `updated_at` | `timestamp with time zone` | yes |  | Last mutation. |
 

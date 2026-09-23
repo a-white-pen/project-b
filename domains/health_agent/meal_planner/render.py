@@ -1,24 +1,26 @@
 """
-Renders the day-of meal result (plan_meals output) for Telegram — the Message Workbook "Order Card"
-redesign. HTML (bold/italic + <pre> "copy boxes"): the shop name and each slot's dish names sit in
-<pre> blocks so Telegram renders them as tap-to-copy (handy for ordering Thai dish names), with
-macros/price OUTSIDE the boxes. A Thai-script dish gets a SECOND copy box underneath holding its English
-gloss (name_en, from the cheap Flash-Lite translation pass in service._attach_name_en) — Thai stays
-cleanly copyable on top, English readable below. A WongNai shop also gets a second copy box with its Thai
-listing title under the English name (_SHOP_TH). Per-slot macros are P·C·F. Then an
-activity-aware "Around your run" / "Around your strength" fuel line and the shared hybrid day block
-(_day_block): an aligned box of PER-MEAL rows (Breakfast / Lunch / Snack / … + the meals being ordered +
-fuel) -> rule -> Total so far, then BOLD Target [ranges] + Still-to-eat lines beneath (still-to-eat counts
-down to the LOW of each range). Columns kcal·P·C·F·Fib. ALL dynamic content is html.escape()'d.
+Renders meal plans, own-food guidance, and Singapore staple suggestions for Telegram.
 
-The ✓ Ate buttons are PER-DISH (one per main dish + one per staple, B 2026-06-28); the handler removes each on tap
-(BRIEF §6). Short-circuits (all_eaten / at_limit / compose_failed) stay one-liners; own-food days
-render the eating-on-your-own guide (spec G, suggest2 redesign).
+Shop and dish names use copyable HTML blocks. The daily table shows recorded calories, protein,
+carbohydrate, fat, and fibre, while its target lines show only calories and protein. Dynamic text is
+escaped before it is inserted into HTML.
 
 Functions:
-  render_meal_card(result) -> (text, reply_markup|None)
-  render_suggest(result) -> str    # spec G — eating-on-your-own guide
-  render_staple_topup(result) -> str   # Singapore staple top-up card (no shop, no buttons)
+  _padR — pads a table label on the right
+  _padL — pads a table value on the left
+  _sum_macros — totals nutrition values across items
+  _fuel_header — builds the workout-food heading
+  _meal_label — formats a meal type for display
+  _meal_rows — builds ordered meal rows for the daily table
+  _day_row — formats one daily-table row
+  _tfloor — reads the main calorie target value
+  _tlow — reads a target's lower bound
+  _trange — formats a protein target range
+  _day_block — builds the daily nutrition summary
+  _day_table — wraps the shared nutrition summary for cards
+  render_meal_card — renders a planned or unavailable meal state
+  render_suggest — renders guidance for a day without shop planning
+  render_staple_topup — renders Singapore staple suggestions
 """
 
 from domains.health_agent.meal_planner import solver
@@ -26,9 +28,7 @@ from system.text import esc as _esc, is_thai as _is_thai
 
 _MK = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g")   # macro keys
 
-# WongNai shops -> their full WongNai listing title (Thai), shown in a 2nd copy box UNDER the English name
-# so B can find/order them in the app. Keys = the canonical restaurant_name (the join key everywhere);
-# sourced once from the WongNai pages (B 2026-06-28). Non-WongNai shops (FitFuel by Grain, Jones) get none.
+# Thai WongNai listing names keyed by the canonical restaurant name.
 _SHOP_TH = {
     "Freshies Clean Ketogenic": "Freshies Clean Ketogenic วงศ์สว่าง",
     "KIN Healthy": "KIN Healthy อาหารคลีน ประชาชื่น",
@@ -39,19 +39,17 @@ _SHOP_TH = {
     "Leanlicious": "Leanlicious อาหารคลีน เดอะมอลล์ งามวงศ์วาน",
 }
 
-# Order-card header day-type phrasing (B 2026-06-28). day_type ∈ {cardio, strength, rest}; default "today".
-_DAY_TYPE_LABEL = {"cardio": "cardio today", "strength": "weight-training today", "rest": "rest day today"}
-
-
-# Monospace column padding for the <pre> day-table (right-pad label, left-pad numbers; truncate to width).
+# Pads or truncates a label to a fixed width. Returns the formatted string.
 def _padR(s, n: int) -> str:
     return (str(s) + " " * n)[:n]
 
 
+# Left-pads a value to a fixed width. Returns the formatted string.
 def _padL(s, n: int) -> str:
     return (" " * n + str(s))[-n:]
 
 
+# Adds nutrition values across a list of meal items. Returns one total per tracked value.
 def _sum_macros(items: list[dict]) -> dict:
     return {k: sum(i.get(k) or 0 for i in items) for k in _MK}
 
@@ -59,34 +57,35 @@ def _sum_macros(items: list[dict]) -> dict:
 _DAY_KEYS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g")   # the 5 macros shown in the day table
 
 
-# "Around your run" / "Around your strength" header, from the day's workout_label.
+# Returns the workout-food heading from the stored workout label.
 def _fuel_header(workout_label) -> str:
     return "Around your strength" if "strength" in (workout_label or "").lower() else "Around your run"
 
 
-# Day-order for the "📊 Your day" per-meal rows (mirrors the dashboard today.js); unknown types sort last.
+# Display order for meal rows. Unknown meal types sort last.
 _MEAL_ORDER = ("breakfast", "brunch", "lunch", "snack", "pre_workout", "post_workout", "dinner", "supper")
 
 
+# Formats a meal type such as post_workout as a readable label.
 def _meal_label(mt: str) -> str:
     return str(mt or "other").replace("_", " ").title()        # "post_workout" -> "Post Workout"
 
 
-# {meal_type: macros} -> ordered [(label, macros)] rows for the day table (Breakfast / Lunch / Snack / …).
+# Converts meal totals into ordered rows for the daily table.
 def _meal_rows(by_meal: dict) -> list:
     items = list((by_meal or {}).items())
     items.sort(key=lambda kv: (_MEAL_ORDER.index(kv[0]) if kv[0] in _MEAL_ORDER else len(_MEAL_ORDER), kv[0]))
     return [(_meal_label(mt), m) for mt, m in items]
 
 
-# One aligned monospace row for the day box: label + kcal·P·C·F·Fib.
+# Formats one row of the daily nutrition table.
 def _day_row(label: str, m: dict, W: int = 13) -> str:
     g = lambda k: round(m.get(k) or 0)  # noqa: E731
     return (_padR(label, W) + _padL(g("kcal"), 6) + _padL(g("protein_g"), 5)
             + _padL(g("carbs_g"), 5) + _padL(g("fat_g"), 5) + _padL(g("fibre_g"), 5))
 
 
-# The floor (minimum to hit) of a macro target, for the Target-line headline: target -> low -> min.
+# Returns the main display value from a target definition.
 def _tfloor(td) -> float:
     if isinstance(td, dict):
         for k in ("target", "low", "min"):
@@ -95,8 +94,7 @@ def _tfloor(td) -> float:
     return 0
 
 
-# The LOWER bound of a macro target, for the still-to-eat math: low -> min -> target. B 2026-06-28:
-# still-to-eat counts down to the BOTTOM of the band, not the middle (vs _tfloor, which prefers target).
+# Returns the lower bound used for the remaining amount.
 def _tlow(td) -> float:
     if isinstance(td, dict):
         for k in ("low", "min", "target"):
@@ -105,8 +103,7 @@ def _tlow(td) -> float:
     return 0
 
 
-# Target DISPLAY for a non-kcal macro: "low–high" when a real range exists (protein), else the single
-# value (fat = its min, fibre = its target).
+# Formats the protein range for the target line.
 def _trange(td) -> str:
     if isinstance(td, dict):
         lo, hi = td.get("low"), td.get("high")
@@ -118,33 +115,21 @@ def _trange(td) -> str:
     return "0"
 
 
-# The shared hybrid day block (Order Card + own-food guide): an aligned <pre> box (component rows + a
-# rule + "Total so far"; an empty day shows just the Total line) THEN a blank line
-# and bold "🎯 Target" + "▸ Still to eat" lines OUTSIDE the box (Telegram can't bold inside <pre>). No
-# "📊 Your day" title (B 2026-06-28 — the box is self-evident). Columns kcal·P·F·Fib (carbs flexible).
-# `target` is the RAW range structure ({kcal:{low,target,high}, protein_g:{low,high}, fat_g:{min},
-# fibre_g:{target,stretch}}): the Target line shows the kcal middle + (low–high) and the range where one
-# exists (protein low–high; fat min; fibre target). Still-to-eat counts down to the LOW (bottom of the
-# band) for EVERY macro (B 2026-06-28); for kcal, once total reaches the low it's "0 kcal" and "over" only
-# triggers past the TOP of the band (high) — inside the band reads "0 kcal", not over. Protein/fat/fibre =
-# low - total, clamped >= 0, never "over". Columns kcal·P·C·F·Fib (carbs shown; still a flexible guide).
-# Input: rows = [(label, macros)], total, target.
+# Builds the daily nutrition table and the calorie and protein target lines.
 def _day_block(rows: list, total: dict, target: dict) -> str:
     W = 13
     hdr = _padR("", W) + _padL("kcal", 6) + _padL("P", 5) + _padL("C", 5) + _padL("F", 5) + _padL("Fib", 5)
-    if rows:                                            # per-meal rows -> rule -> Total. B 2026-06-28:
-        box = ([hdr] + [_day_row(lbl, m, W) for lbl, m in rows]      # always break down, even one meal
+    if rows:
+        box = ([hdr] + [_day_row(lbl, m, W) for lbl, m in rows]
                + ["─" * len(hdr), _day_row("Total so far", total, W)])
-    else:                                               # nothing logged yet -> just the Total line
+    else:
         box = [hdr, _day_row("Total so far", total, W)]
     g = lambda d, k: round(d.get(k) or 0)  # noqa: E731
     tk = target.get("kcal") or {}
     klo, khi = tk.get("low"), tk.get("high")
     kcal_tgt = f"{round(_tfloor(tk))} kcal" + (
         f" ({round(klo)}–{round(khi)})" if klo is not None and khi is not None and round(klo) != round(khi) else "")
-    # kcal still-to-eat counts down to the LOW (bottom of the band); once total reaches the low it's 0,
-    # and "over" only triggers past the TOP of the band (high) — inside the band is "0 kcal", not over
-    # (B 2026-06-28: still-to-eat uses the lower bound of the range, not the middle).
+    # Remaining calories reach zero at the lower bound; "over" starts above the upper bound.
     low_k, tot_k = round(_tlow(tk)), g(total, "kcal")
     hi_k = round(tk["high"]) if tk.get("high") is not None else low_k
     if tot_k <= low_k:
@@ -157,37 +142,29 @@ def _day_block(rows: list, total: dict, target: dict) -> str:
     return "\n".join([
         f"<pre>{chr(10).join(box)}</pre>",
         "",
-        f"<b>🎯 Target · {kcal_tgt}</b> · "
-        f"{_trange(target.get('protein_g') or {})}P | {_trange(target.get('carbs_g') or {})}C | "
-        f"{_trange(target.get('fat_g') or {})}F | {_trange(target.get('fibre_g') or {})}fib",
+        f"<b>🎯 Target · {kcal_tgt}</b> · {_trange(target.get('protein_g') or {})}P",
         "",
-        f"<b>Still to eat · {kcal_txt}</b> · {still('protein_g')}P | {still('carbs_g')}C | "
-        f"{still('fat_g')}F | {still('fibre_g')}fib",
+        f"<b>Still to eat · {kcal_txt}</b> · {still('protein_g')}P",
     ])
 
 
-# The shared "your day so far" block (per-meal box + Target + Still-to-eat), built from a plan_meals
-# result. Reused by the own-food guide AND the all_eaten / at_limit cards so B can always see where her
-# day stands vs target — even when there's nothing left to order (B 2026-06-28).
+# Builds the daily nutrition block shared by all meal-card states.
 def _day_table(result: dict) -> str:
     eaten = result.get("eaten") or {}
     reserved = result.get("reserved") or {}
     sofar = {k: (eaten.get(k) or 0) + (reserved.get(k) or 0) for k in _MK}
-    day_rows = _meal_rows(result.get("eaten_by_meal"))          # Breakfast / Lunch / Snack / … logged so far
-    if any((reserved.get(k) or 0) for k in _DAY_KEYS):          # add the fuel row only when there IS fuel
+    day_rows = _meal_rows(result.get("eaten_by_meal"))
+    if any((reserved.get(k) or 0) for k in _DAY_KEYS):
         day_rows.append((result.get("workout_label") or "Run food", reserved))
     return _day_block(day_rows, sofar, result.get("target_macros") or {})
 
 
-# Renders a plan_meals result. Returns (message_text, reply_markup). reply_markup is the ✓ Ate keyboard
-# for a 'planned' card, else None. HTML (copy boxes + table); dynamic content is escaped.
+# Renders a meal-planning result and returns its text and optional buttons.
 def render_meal_card(result: dict) -> tuple:
     status = result.get("status")
-    # all_eaten (both meals logged) / at_limit (no budget left): nothing more to order, but STILL show the
-    # day table so B can see where she landed vs target (B 2026-06-28).
     if status == "all_eaten":
         return ("<b>✓ Both meals logged today</b> 🎉\n\n" + _day_table(result)
-                + "\n<i>P · F are daily minimums · carbs flexible</i>"), None
+                + "\n<i>calories + protein are the goals · carbs, fat and fibre are flexible</i>"), None
     if status == "compose_failed":
         return "⚠️ Couldn't put a meal together just now — tap 🍽️ Meal again in a moment.", None
     if status == "own_food":
@@ -203,14 +180,13 @@ def render_meal_card(result: dict) -> tuple:
         else:
             head = f"<b>🍽️ Basically at your budget for today</b> — skip {slots}, or a light staple {staples}."
         return (head + "\n\n" + _day_table(result)
-                + "\n<i>P · F are daily minimums · carbs flexible</i>"), None
+                + "\n<i>calories + protein are the goals · carbs, fat and fibre are flexible</i>"), None
 
-    # status == 'planned' -> the Order Card
+    # A planned result includes the shop, dishes, nutrition table, and logging buttons.
     slots = result.get("slots", {})
-    day_label = _DAY_TYPE_LABEL.get(result.get("day_type"), "today")
-    lines = [f"<b>Order from</b> · <i>{_esc(day_label)}</i>", f"<pre>{_esc(result.get('shop'))}</pre>"]
+    lines = ["<b>Order from</b>", f"<pre>{_esc(result.get('shop'))}</pre>"]
     shop_th = _SHOP_TH.get(result.get("shop"))
-    if shop_th:                                                  # WongNai: Thai title below the English box
+    if shop_th:
         lines.append(f"<pre>{_esc(shop_th)}</pre>")
     lines.append("")
     meal_btns, staple_btns = [], []
@@ -221,23 +197,22 @@ def render_meal_card(result: dict) -> tuple:
         if not items:
             continue
         if not first_slot:
-            lines.append("")                                    # blank line between Lunch and Dinner
+            lines.append("")
         first_slot = False
         mains = [i for i in items if i.get("role") != "staple"]
         staples = [i for i in items if i.get("role") == "staple"]
-        m = _sum_macros(items)                                   # slot macros (incl staples you eat)
-        price = round(sum(i.get("price_thb") or 0 for i in items))  # staples carry no ฿
+        m = _sum_macros(items)
+        price = round(sum(i.get("price_thb") or 0 for i in items))
         lines.append(f"<b>{slot.capitalize()}</b> · {round(m['kcal'])} kcal · "
                      f"{round(m['protein_g'])}P · {round(m['carbs_g'])}C · {round(m['fat_g'])}F · <b>฿{price}</b>")
-        lines.append(f"<pre>{_esc(', '.join(i['item_name'] for i in mains)) or '—'}</pre>")  # dishes to order
-        # If any main is Thai script, add a SECOND copy box below with the English glosses (name_en),
-        # so Thai stays cleanly copyable on top and B can read the English underneath.
+        lines.append(f"<pre>{_esc(', '.join(i['item_name'] for i in mains)) or '—'}</pre>")
+        # Add English names below Thai dish names when available.
         if any(_is_thai(i["item_name"]) and i.get("name_en") for i in mains):
             en = ", ".join((i.get("name_en") or i["item_name"]) for i in mains)
-            lines.append(f"<pre>{_esc(en)}</pre>")               # English, below the Thai
-        if staples:                                             # e.g. "+ edamame 150 g · 2× boiled_egg (home)"
+            lines.append(f"<pre>{_esc(en)}</pre>")
+        if staples:
             lines.append("+ " + " · ".join(_esc(solver.staple_label(s)) for s in staples) + " <i>(home)</i>")
-        for idx, mn in enumerate(mains):                        # one ✓ button per main dish (B 2026-06-28)
+        for idx, mn in enumerate(mains):
             meal_btns.append({"text": f"✓ Ate {solver.dish_label(mn)}",
                               "callback_data": f"meal_ate:d:{slot}:{idx}"})
         for s in staples:
@@ -253,8 +228,8 @@ def render_meal_card(result: dict) -> tuple:
                   _esc(" · ".join(fuel))]
 
     reserved = result.get("reserved") or {}
-    by_meal = dict(result.get("eaten_by_meal") or {})            # logged so far, by meal type
-    for slot in ("lunch", "dinner"):                             # + the meals being ordered now
+    by_meal = dict(result.get("eaten_by_meal") or {})
+    for slot in ("lunch", "dinner"):
         if slots.get(slot):
             by_meal[slot] = _sum_macros(slots[slot])
     day_rows = _meal_rows(by_meal)
@@ -265,7 +240,7 @@ def render_meal_card(result: dict) -> tuple:
         lines.append(f"<b>⚠️</b> {_esc('; '.join(result['report']))}")
     if result.get("note"):
         lines.append(f"<b>📝</b> <i>{_esc(result['note'])}</i>")
-    if result.get("week_refit"):          # future days re-balanced after a shop swap (silent DB; note here)
+    if result.get("week_refit"):
         n = result["week_refit"]
         lines.append(f"<i>↻ Re-balanced this week's shops · {n} day{'' if n == 1 else 's'} updated</i>")
 
@@ -273,17 +248,13 @@ def render_meal_card(result: dict) -> tuple:
     return "\n".join(lines), ({"inline_keyboard": rows} if rows else None)
 
 
-# Spec G — eating-on-your-own guide (own-food/weekend days), suggest2 redesign. HTML: a one-line header
-# (bold title · italic day-type), the shared hybrid day block (_day_block — aligned box of PER-MEAL rows
-# [+ workout fuel] -> Total so far, then bold Target [with ranges] + Still-to-eat lines), then the
-# prioritise + home-staples lines and the activity-aware "Around your run/strength" fuel line. No rows
-# written, no buttons.
+# Renders guidance for a day without a shop meal plan. No rows are written and no buttons are shown.
 def render_suggest(result: dict) -> str:
     lines = [
-        f"<b>🍴 Eating on your own</b> · <i>{_esc(result.get('day_type') or 'rest')} day</i>",
+        "<b>🍴 Eating on your own</b>",
         "",
         _day_table(result),
-        "<i>P · F are daily minimums · carbs flexible</i>",
+        "<i>calories + protein are the goals · carbs, fat and fibre are flexible</i>",
         "",
     ]
     owed = result.get("owed") or []
@@ -299,16 +270,13 @@ def render_suggest(result: dict) -> str:
     return "\n".join(lines)
 
 
-# Staple top-up card (Singapore mode — b_extended doesn't plan shop meals). Shows the shared day block
-# (eaten + reserved fuel vs target / still-to-eat) then a concrete home-staple suggestion to close the
-# remaining protein/fibre + what it adds. No shop, no buttons — B self-orders lunch/dinner + logs them.
+# Renders a Singapore home-staple suggestion for the remaining protein.
 def render_staple_topup(result: dict) -> str:
-    day_label = _DAY_TYPE_LABEL.get(result.get("day_type"), "today")
     lines = [
-        f"<b>🏠 Fridge top-up</b> · <i>{_esc(day_label)}</i>",
+        "<b>🏠 Fridge top-up</b>",
         "",
         _day_table(result),
-        "<i>protein &amp; fibre are the priority · carbs flexible</i>",
+        "<i>calories + protein are the goals · carbs, fat and fibre are flexible</i>",
         "",
     ]
     topup = result.get("topup") or []
@@ -317,16 +285,15 @@ def render_staple_topup(result: dict) -> str:
         add = result.get("topup_added") or {}
         lines.append(f"<b>➕ Top up with</b> · {picks}")
         lines.append(f"<i>adds ~{round(add.get('protein_g') or 0)}P · "
-                     f"{round(add.get('fibre_g') or 0)} fib · {round(add.get('kcal') or 0)} kcal</i>")
+                     f"{round(add.get('kcal') or 0)} kcal</i>")
     else:
         rem = result.get("remaining") or {}
         prot_gap = round((rem.get("protein_g") or {}).get("low") or 0)
-        fib_gap = round((rem.get("fibre_g") or {}).get("target") or 0)
-        if prot_gap or fib_gap:      # empty because nothing fits under the kcal ceiling — NOT because covered
-            lines.append(f"<b>⚠️ No calorie room to top up</b> — still short {prot_gap}P · {fib_gap} fib, "
-                         "but you're at today's kcal ceiling.")
+        if prot_gap:
+            lines.append(f"<b>⚠️ No calorie room to top up</b> — still short {prot_gap}P, "
+                         "but you're at today's calorie ceiling.")
         else:
-            lines.append("<b>✓ No fridge top-up needed</b> — protein &amp; fibre are covered.")
+            lines.append("<b>✓ No fridge top-up needed</b> — protein is covered.")
     fuel = result.get("fuel_items") or []
     if fuel:
         lines += ["", f"<b>{_fuel_header(result.get('workout_label'))}</b> <i>· not eaten yet</i>",

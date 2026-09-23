@@ -181,7 +181,7 @@ GET /api/data-visualisation/sleep            reads sleep_visualisation → {"ref
 
 ### Flow 7 — Agentic health planner (spine + satellite)
 
-The health planner (`domains/health_agent/`) turns B's goals + actuals into a rolling weekly plan and day-of meal/exercise cards. **Design principle: the LLM only *proposes*; deterministic code *guarantees* every hard constraint.** Gemini drafts the week shape, dish picks, and run/strength detail; the code decides feasibility, clamps to the constraints, and reports any *soft* rule it had to bend. Initial plans use **Gemini 2.5 Pro** (`generate_json_reasoning`); the meal composition and **all** corrections use **Flash** (the deterministic solver validates the picks, so a weaker model degrades gracefully). The full design rationale — the calibration derivation, the decisions log — lives in `agentic/BRIEF.md`, which is kept out of git (gitignored); this section is the how-it-works, grounded in the code.
+The health planner (`domains/health_agent/`) turns B's goals and actuals into a rolling weekly plan and day-of meal/exercise cards. The model proposes plans; deterministic code validates constraints and reports any soft rule it had to bend. Weekly plans and multi-day week corrections use **Gemini 2.5 Pro** (`generate_json_reasoning` or structured Pro extraction). Meal composition and day-of meal, run, and strength corrections use **Flash**.
 
 **Data model — spine + satellites** (`schema/data_dictionary.md` is the contract):
 ```
@@ -189,7 +189,7 @@ health_agent.daily_plan        SPINE — 1 row/planned day: activity_type[] + me
    ├─ exercise.strength_plan   1/day  ↔ exercise.strength_sessions   (Garmin actuals)
    ├─ exercise.cardio_plan     1/day  ↔ exercise.cardio_activities   (Strava actuals)
    └─ nutrition.meal_plan      lunch+dinner  →  nutrition.food_log    (consumed)
-health_agent.weekly_reflections  1/ISO week — maintenance + target + weight trend
+health_agent.weekly_reflections  1/ISO week — narrative + carry-forward directives
 ```
 - Satellites FK to `daily_plan.plan_date` (`ON DELETE CASCADE`); two DB triggers (`assert_activity`, `cleanup_satellites`) stop a strength/cardio plan row existing unless its activity is in `activity_type[]`.
 - `activity_type` is `text[]` (an AM-lift + PM-cardio day is one row). `cardio` = run / hash / hike / cycle / swim — **all count** toward the weekly cardio target; `other` = yoga / pilates / climbing (no satellite).
@@ -206,42 +206,42 @@ health_agent.weekly_reflections  1/ISO week — maintenance + target + weight tr
 
 `/plan week` is deliberately NOT a command — the rolling re-plan is reachable only via the button, so it can't be hit by accident.
 
-**Crons — Cloud Scheduler → internal endpoints** (`api/planner_jobs.py::register_routes`; auth = `system.internal_auth.check_internal_key`: `X-Internal-Key` header vs `INTERNAL_API_KEY` env, constant-time, 503 if the key is unset). Each endpoint doubles as a manual `curl` test trigger and resolves times via point-in-time Bangkok tz.
+**Crons — Cloud Scheduler → internal endpoints** (`api/planner_jobs.py::register_routes`; auth = `system.internal_auth.check_internal_key`: `X-Internal-Key` header vs `INTERNAL_API_KEY` env, constant-time, 503 if the key is unset). Each endpoint also supports manual testing and resolves dates in B's active local timezone.
 
 | Schedule | Endpoint | Job |
 |---|---|---|
-| Sun 2pm BKK | `/internal/planner/weekly-reflection`, then `/scaffold` | reflect on last week (calibrate + 3-goal review) → roll the forward scaffold |
+| Sun 2pm BKK | `/internal/planner/weekly-reflection`, then `/scaffold` | reflect on training + habits → roll the forward scaffold |
 | 11am daily | `/internal/planner/meals` | sweep yesterday's unresolved slots → plan today's meal (shop card) or `/suggest_food` |
 | 1pm daily | `/internal/planner/strength`, `/run` | only if today has that activity: regenerate detail → Garmin push → pin `kind='exercise'` |
 
 **The meal solver — deterministic, two layers** (`meal_planner/{service,solver,persistence}.py`):
 - *Sunday scaffold* (`week_planner/meal_assign.py`) assigns each Mon–Fri order-day a shop that satisfies the week-level **hard** rules (one shop/day, Grain ≤ 2 in a rolling 7d, budget, veg day → only a veg-capable shop from `goals.yaml veg_day_shops`) while best-efforting the soft ones (Jones ≥ 1).
-- *Day-of (11am)* computes `remaining = macro_target − logged-by-11am`, deterministically **filters** the shop's menu to dishes that fit (kcal band, protein/fat floors, lunch ≠ dinner, price), then Gemini **composes** lunch + dinner from that already-valid palette + home staples; code does the final macro check + enforces staple caps. The LLM never sees an infeasible option.
+- *Day-of (11am)* computes `remaining = macro_target − logged-so-far`, filters the shop's menu to dishes that fit the remaining calorie limit, then Gemini composes lunch + dinner from that menu + home staples. Daily food totals run from the first wake on the plan date to the first wake on the following date, with a local 4am fallback when a wake is missing. Code checks the calorie and protein ranges and enforces staple limits.
 - Budget is SGD at a **flat `฿25 = S$1`** planning rate (real fx lives in finances only); cap = `$6.50 × planned meals`, weekly average. Prices display in ฿.
 - Re-running `/plan meals` re-plans only the not-yet-eaten slots (eaten/bought are locked); a correction that flags specific dishes keeps the un-flagged slots verbatim (`solver.slots_to_keep`).
 - **Sold-out memory + menu photos:** a correction can name a dish unavailable in text OR by attaching photo(s) of the shop's board today; the dishes are recorded on `daily_plan.unavailable_items` (`{shop:[names]}`, day-scoped) and stripped from the palette so they can't be re-offered. A board vision judges *complete* becomes the menu of record (≥3 confirmed matches guard against a blurry shot). Board↔DB matching is promo-tolerant (`solver._match_known`). A menu album is aggregated into ONE correction by `telegram/webhook.py`.
 - **Protein rotation** (beef/pork/fish/duck) is day-of best-effort: each pick is nudged toward still-owed proteins and away from already-met ones (compose receives the week's tally; duck is judged over a 2-week window via `solver.owed_proteins_split`).
 - No feasible pair from the assigned shop → swap to an alternative shop that still satisfies the hard rules, and flag the swap; if none fits, closest-fit + flag.
 
-**Calibration — n=1, no Garmin, no 7700** (`calibration.py`, run every Sunday by `weekly_reflection/`):
-- **maintenance** = mean daily intake over the trailing-8-week set of weeks whose 7-day-avg weight held flat (`|Δ| < 0.2 kg`, period weeks excluded); carries the last value / seed (1950) until ≥2 flat weeks exist. It already includes habitual training — there is no per-session burn term, and it does not track down mid-cut (measure-at-rest).
-- **weekly target** = maintenance − 160 above the 55 kg mid-band / + 100 below / hold in-band, plus a safety brake if losing > 0.30 kg/wk.
-- **day targets** = a fixed preference split (+180 cardio, +100 strength, rest-day carries the balance) that nets to zero against the weekly target.
-- Stored in `health_agent.weekly_reflections` (maintenance, target, 4-week weight-trend slope, narrative, directives). The reflection also scores the 3 equal goals: sub-60 10k via a Riegel projection from the most recent quality/fartlek run (**display only — never used to plan runs**); muscle via `strength_sets` load/volume deltas; weight-band position + trend.
+**Fixed nutrition targets** (`goals.yaml`, loaded by `goals.py`):
+- Every day targets **1,600–1,700 kcal** (1,650 midpoint) and **90–110 g protein**.
+- Fibre has a **20 g soft reference** (25 g stretch), but the meal planner does not try to close a fibre gap. Fibre, fat, and carbohydrate remain recorded facts.
+- Body weight does not influence meals, the week scaffold, strength planning, or calorie targets. The weekly reflection only shows the current 7-day average against the **54–56 kg reference band**; it does not calculate a trend, maintenance estimate, or cut/hold/gain direction.
+- `weekly_reflections` now stores narrative + carry-forward directives only. Its three nullable calibration columns remain in the live schema until the separate database cleanup is applied.
 
-**Reconcile — tally follows reality** (`week_planner/reconcile.py`): each past planned day is matched to actuals on the local BKK date — a same-kind actual → `done` + link; none by 22:00 → `skipped`. The weekly 2+2 tally counts **actual sessions by kind, planned or not** (an unplanned run still counts; a planned strength done as cardio = strength skipped + cardio counted). It drives nudges only — calibration no longer uses session count.
+**Reconcile — tally follows reality** (`week_planner/reconcile.py`): each past planned day is matched to actuals on its local date — a same-kind actual → `done` + link; none by 22:00 → `skipped`. The weekly 2+2 tally counts **actual sessions by kind, planned or not** (an unplanned run still counts; a planned strength done as cardio = strength skipped + cardio counted). It drives the next scaffold's remaining-session count.
 
 **✓ Ate buttons** (`meal_planner/completion.py`): a tap posts the planned item(s) into `nutrition.food_log` through the food module's own pipeline (so the confirmation card, macro gap-fill, and quoted corrections are identical to a normal food log — editable + deletable), marks the slot `ate`, and edits the pinned card to drop that row. Each home staple has its OWN button and posts that staple alone. Idempotent (a server-side guard refuses a repeat); no Skip button.
 
 **Next-day sweep** (part of the 11am `meals` job, `meal_planner/persistence.sweep_meals`): yesterday's `planned` (never bought/ate) → `skipped`; `bought` (not ate) → `ate` and its items are posted to `food_log` **stamped on the meal's own planned day** (not the sweep day).
 
-**Corrections** (quoted-reply; routed by `conversation_state` domain='plan' + `context.kind`; all Flash): reply to `/week` → classify a **pin** (lock a day) vs a **context** note; reply to the meal card → re-pick within the feasible set; reply to run/strength → regenerate type-locked + re-push to Garmin (same-name replace); reply to a `✓ Ate` log → the food module handles it. **Pin fallback:** proactive/summary cards carry no saved `conversation_state`, so `router._try_correction` looks the quoted message up in `system.pinned_messages` (`replies.pin_kind_for`) and routes by pin kind (`meal`/`week`) — this is what stops a menu photo quoting the pinned card from falling through to the food/expense classifier.
+**Corrections** (quoted-reply; routed by `conversation_state` domain='plan' + `context.kind`): reply to `/week` → extract every day-specific **pin** (locks a day) and **context** note, then replan once around all pins; reply to the meal card → re-pick within the feasible set; reply to run/strength → regenerate type-locked + re-push to Garmin (same-name replace); reply to a `✓ Ate` log → the food module handles it. Week corrections use Pro for reliable multi-day extraction; meal, run, and strength corrections use Flash. **Pin fallback:** proactive/summary cards carry no saved `conversation_state`, so `router._try_correction` looks the quoted message up in `system.pinned_messages` (`replies.pin_kind_for`) and routes by pin kind (`meal`/`week`).
 
 **Kind-scoped pins** (`system.pinned_messages(kind PK)`, `telegram/replies.pin_kept`): the `meal`, `exercise`, and `week` pins coexist, each self-replacing within its kind (Telegram's native single-pin would evict the others). `pin_kept` pins the new card FIRST, then retires the old and advances the DB row only on success, under a per-kind `pg_advisory_xact_lock` so the two 1pm jobs (run + strength, both `kind='exercise'`) can't race into two live pins.
 
-**Spend → meal auto-mark is DISABLED** (2026-07-08): a food-category spend no longer flips the day's meals to `bought` (it silently produced a non-editable "✓ Both meals logged" card for dishes B may not have ordered). Meals are marked only via the ✓ Ate buttons or the next-day sweep. `domains/expense/service._reconcile_food_spend` early-returns; the body is kept for easy re-enable (which must then also re-send the meal card).
+**Spend does not mark meals as eaten:** food-category spending does not change meal status. Meals are marked only through the ✓ Ate buttons or the next-day sweep.
 
-**Build status (2026-07):** the day-of meal / strength / run flows, the reconcilers, the calibration, and the internal cron endpoints are live in testing (deployed from `agentic-module`); the `/week` read-render (`plan_command.handle_week_view`) is still being finalised.
+**Build status:** the week, meal, strength, run, reconciliation, and internal cron flows are implemented. Nutrition targets are fixed in config; the weekly reflection keeps weight as display-only context.
 
 ---
 

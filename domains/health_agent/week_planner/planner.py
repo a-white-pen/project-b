@@ -1,20 +1,18 @@
-"""
-Week-scaffold brain. Gemini Pro PROPOSES a week shape; the deterministic pipeline here makes it real:
-normalise -> enforce (week_planner.enforce — the hard floor) -> per-day macro_target
-(calibration.compute_day_targets gives the day-split kcal, macros.build_macro_target the full target).
-Code owns feasibility; the LLM only proposes (§2 enforcement boundary).
-
-The post-LLM pipeline `assemble_week` (+ `_parse`/`_apply_pins`) is PURE + unit-tested; the LLM call
-`plan_week` is the thin untestable glue (state.py provides its input).
+"""Turns a proposed week into an enforced weekly plan.
 
 Functions:
-  assemble_week(proposed_days, weekly_target, weight_kg, cfg, rules) -> dict   # pure: enforce + macros
-  plan_week(state, cfg, rules) -> dict                                         # LLM glue: propose -> assemble
+  _is_rest — checks whether a day has active training
+  _normalise_day — normalizes one proposed day
+  _summary — builds the weekly activity-count summary
+  assemble_week — normalizes days, enforces rules, and adds nutrition targets
+  _to_date — converts stored values to dates
+  _apply_pins — applies fixed day instructions
+  plan_week — asks the model for a week and assembles the result
 """
 
 from datetime import date as _date
 
-from domains.health_agent import calibration, macros
+from domains.health_agent.goals import build_nutrition_target
 from domains.health_agent.week_planner import prompt as wk_prompt
 from domains.health_agent.week_planner.enforce import enforce_week
 from system.llm import MODEL_PRO, generate_json_reasoning, parse_json_response
@@ -23,13 +21,12 @@ _KINDS = {"rest", "cardio", "strength", "other"}
 _RUN_TYPES = {"easy", "long", "quality", "fartlek"}
 
 
+# Returns True when a day contains no active training.
 def _is_rest(day) -> bool:
     return not [a for a in day["activity_type"] if a != "rest"]
 
 
-# Validates one proposed day to the activity_type / run_type vocab; defaults the unknowns. Pure.
-# run_type only survives on a cardio day. Output: a clean day dict (date/activity_type/run_type/
-# strength_focus/is_vegetarian_day/note/locked).
+# Normalizes one proposed day to the supported activity and run types.
 def _normalise_day(day: dict) -> dict:
     at = [a for a in day.get("activity_type", []) if a in _KINDS] or ["rest"]
     rt = day.get("run_type") if day.get("run_type") in _RUN_TYPES else None
@@ -46,27 +43,15 @@ def _normalise_day(day: dict) -> dict:
     }
 
 
-# Picks (day_kcal, macro_day_type) for a day from the week's day_targets split.
-# cardio (incl. a 2-a-day) -> cardio kcal (the bigger fuel); any strength -> the strength protein
-# band; otherwise rest. Input: the day's activity_type + the {cardio,strength,rest} kcal dict.
-def _macro_inputs(activity_type: list, day_targets: dict) -> tuple[int, str]:
-    has_c = "cardio" in activity_type
-    has_s = "strength" in activity_type
-    kcal = day_targets["cardio"] if has_c else (day_targets["strength"] if has_s else day_targets["rest"])
-    mt_type = "strength" if has_s else ("cardio" if has_c else "rest")
-    return kcal, mt_type
-
-
+# Builds the short activity-count summary shown with a weekly plan.
 def _summary(n_cardio: int, n_strength: int) -> str:
     return f"{n_strength} strength + {n_cardio} run{'s' if n_cardio != 1 else ''} this week"
 
 
-# Turns the LLM's PROPOSED days into the enforced, macro-targeted canonical week. PURE (no LLM/DB).
-# Input: proposed days (each {date, activity_type, run_type, strength_focus, is_vegetarian_day,
-# locked?}), the weekly-avg target (from weekly_reflections), current bodyweight, the nutrition cfg,
-# and the weekly_training rules. Output: {days, report, summary, day_counts}.
-def assemble_week(proposed_days: list[dict], weekly_target: int, weight_kg: float | None,
-                  cfg: dict, rules: dict, done_this_week: dict | None = None) -> dict:
+# Enforces the proposed days and adds the fixed nutrition target to each day.
+# Returns the final days, enforcement report, summary, and activity counts.
+def assemble_week(proposed_days: list[dict], cfg: dict, rules: dict,
+                  done_this_week: dict | None = None) -> dict:
     days = [_normalise_day(d) for d in proposed_days]
     enforced, report = enforce_week(days, rules, done_this_week)
 
@@ -74,10 +59,8 @@ def assemble_week(proposed_days: list[dict], weekly_target: int, weight_kg: floa
     n_strength = sum(1 for d in enforced if "strength" in d["activity_type"])
     n_rest = sum(1 for d in enforced if _is_rest(d))
 
-    day_targets = calibration.compute_day_targets(weekly_target, n_cardio, n_strength, n_rest, cfg)
     for d in enforced:
-        kcal, mt_type = _macro_inputs(d["activity_type"], day_targets)
-        d["macro_target"] = macros.build_macro_target(kcal, mt_type, weight_kg, cfg)
+        d["macro_target"] = build_nutrition_target(cfg)
 
     return {
         "days": enforced,
@@ -87,13 +70,12 @@ def assemble_week(proposed_days: list[dict], weekly_target: int, weight_kg: floa
     }
 
 
+# Converts a stored or serialized date to a date object.
 def _to_date(v):
     return v if isinstance(v, _date) else _date.fromisoformat(str(v)[:10])
 
 
-# Overlays B's pins onto the proposed days: a pinned date's activity is FIXED (overrides the LLM) and
-# the day is locked so enforce_week never moves it. Pure. Input: proposed days + pins
-# (each {date, activity_type?, run_type?, strength_focus?, note?}). Output: days with dates coerced.
+# Applies fixed day instructions to proposed days before rule enforcement.
 def _apply_pins(proposed: list[dict], pins: list[dict] | None) -> list[dict]:
     by_date = {_to_date(p["date"]): p for p in (pins or [])}
     out = []
@@ -115,15 +97,12 @@ def _apply_pins(proposed: list[dict], pins: list[dict] | None) -> list[dict]:
     return out
 
 
-# LLM glue: Gemini Pro proposes the week shape -> parse -> overlay pins -> assemble (enforce + macros).
-# Input: the state dict (state.py), nutrition cfg, weekly_training rules. Output: assemble_week()'s
-# dict + the LLM's `rationale` and `status_line`. NOT unit-tested (LLM call).
+# Generates a proposed week, applies pins, and returns the enforced plan.
 def plan_week(state: dict, cfg: dict, rules: dict) -> dict:
     raw = generate_json_reasoning(wk_prompt.build_prompt(state), model=MODEL_PRO)
     parsed = parse_json_response(raw)
     proposed = _apply_pins(parsed.get("days", []), state.get("pins"))
-    result = assemble_week(proposed, state["weekly_target"], state.get("weight_kg"), cfg, rules,
-                           done_this_week=state.get("done_this_week"))
+    result = assemble_week(proposed, cfg, rules, done_this_week=state.get("done_this_week"))
     result["rationale"] = parsed.get("rationale")
     result["status_line"] = parsed.get("status_line")
     return result

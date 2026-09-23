@@ -1,22 +1,24 @@
-"""
-Week-planner service — the interactive orchestration behind /week, the 🗓️ Plan Week button, and
-quoted-reply week corrections. plan_command.py delegates here (router.py stays untouched).
-
-  handle_week_view       — /week read view (spec A) + the [🗓️ Plan Week] button.
-  handle_plan_week       — the rolling re-plan: build state -> Gemini Pro proposes -> enforce + macros
-                           -> save (spine + satellites) -> spec-B diff render. Fired by `plan:week`.
-  handle_week_correction — a quoted-reply edit. Pro extracts EVERY day-instruction in B's message
-                           (a single reply often covers several days — B 2026-07-26), each as a PIN
-                           (lock that day, with its OWN short note) or CONTEXT (informs, doesn't lock);
-                           all pins are persisted per-day, then ONE re-plan honours them all.
-
-The deterministic pieces it calls (planner.assemble_week, calibration, macros, enforce, render) are
-unit-tested in their modules; this glue (DB + LLM + Telegram) is exercised live, reviewed adversarially.
+"""Handles weekly plan views, replanning, and quoted corrections.
 
 Functions:
-  handle_week_view(msg) -> list[tuple]
-  handle_plan_week(msg) -> list[tuple]
-  handle_week_correction(msg, state) -> list[tuple]
+  _rules — reads weekly training rules
+  _plain — removes angle brackets from model text
+  handle_week_view — sends the current week and its planning button
+  _missing_day — builds an unplanned day for display
+  _summary — summarizes visible activity counts
+  handle_plan_week — rebuilds, saves, and sends the rolling weekly plan
+  _send_week_card — sends, pins, and registers a week card
+  _place_weekly_veg — keeps one vegetarian order day per week
+  _replan_and_save — builds and saves the rolling plan
+  run_scaffold — creates and sends the scheduled weekly plan
+  _interim — sends a temporary progress message
+  _send — sends and pins a scheduled week card
+  _assign_shops — assigns shops to eligible days
+  _to_render_day — converts a planned day for display
+  handle_week_correction — saves day-specific edits and replans around them
+  _classify_edits — extracts weekly pin and context records
+  _normalise_edits — normalizes extracted weekly edits
+  _resolve_date — resolves an edit date within the allowed horizon
 """
 
 import logging
@@ -33,72 +35,63 @@ from telegram.replies import get_latest_chat_id, send_logged, send_reply
 
 logger = logging.getLogger(__name__)
 
-_HORIZON_DAYS = 8                  # the rolling re-plan window: today .. today+7
+_HORIZON_DAYS = 8
 _KINDS = {"rest", "cardio", "strength"}
 _RUN_TYPES = {"easy", "long", "quality", "fartlek"}
 
-# Conversation state stamped on every plan message so a quoted reply routes to the week corrector.
+# Routes replies to a weekly plan back to this service.
 _PLAN_STATE = {"domain": "plan", "context": {"kind": "week"}}
 
-# The 🗓️ Plan Week button under /week — the only entry point to the re-plan.
+# Starts weekly replanning from the week view.
 _PLAN_WEEK_KEYBOARD = {"inline_keyboard": [[{"text": "🗓️ Plan Week", "callback_data": "plan:week"}]]}
 
 
-# The weekly_training floor the enforcer guarantees (from goals.yaml).
+# Reads the weekly training rules enforced after model planning.
 def _rules() -> dict:
     wt = load_goals().get("weekly_training", {})
     return {
         "cardio_per_week": wt.get("cardio_per_week", 2),
         "strength_per_week": wt.get("strength_per_week", 2),
         "min_rest_days": wt.get("min_rest_days", 1),
-        "avoid_weekends": mode_config().get("avoid_weekends", True),   # default matches prompt.py (legacy BKK)
+        "avoid_weekends": mode_config().get("avoid_weekends", True),
     }
 
 
-# Strips angle brackets from LLM text we may show (defensive vs Telegram's HTML auto-detect).
+# Removes angle brackets before model text is placed in a Telegram message.
 def _plain(s):
     return s.replace("<", "").replace(">", "").strip() if isinstance(s, str) else s
 
 
-# ---- /week read view (spec A) ----
-
-# Handles /week: reads the current ISO week (Mon-Sun) and renders spec A with the Plan-Week button.
-# The populated view SELF-SENDS + pins kind='week' (shared with the Sun scaffold + /plan week — latest
-# wins) + registers its correction-state, returning []. The "nothing planned yet" case has no week card
-# to pin, so it returns the bubble for the router to send.
-# Input: the /week InboundMessage. Output: [] (self-sent) or one (reply, state, reply_markup) bubble.
+# Sends the current calendar week plus the next seven days.
+# Returns a fallback reply only when no plan exists yet.
 def handle_week_view(msg) -> list[tuple]:
     today, _ = get_local_today()
-    # Lazy reconcile (BRIEF §6): stamp past planned days against device actuals before rendering, so
-    # /week shows real done/skipped + captures unplanned activity. Best-effort — never break the view.
+    # Refreshes completed and skipped activity statuses before rendering.
     try:
         reconcile.reconcile_exercise()
     except Exception as e:
         log_failure(logger, logging.WARNING, "week_view_reconcile_failed", e,
                     update_id=getattr(msg, "update_id", None))
-    # Window = this week's Monday (so the Done block shows the week's completed days, where the Mon-Sun
-    # 2+2 tally lives) through the next 7 days (rolling, may cross into next week). Days in the forward
-    # range with no daily_plan row render as "not planned yet" — never fabricated.
+    # Includes completed days from Monday and a rolling seven-day forward view.
     monday = today - timedelta(days=today.isoweekday() - 1)
     sunday = monday + timedelta(days=6)
     end = today + timedelta(days=_HORIZON_DAYS - 1)
     existing = {d["date"]: d for d in persistence.read_week(monday, end, today)}
     if not existing:
         return [("🗓️ Nothing planned yet — tap to build your week.", _PLAN_STATE, _PLAN_WEEK_KEYBOARD)]
-    days = [existing[d] for d in sorted(existing) if d < today]                 # Done (this week)
-    days.append(existing.get(today) or _missing_day(today, is_today=True))      # Today
-    for i in range(1, _HORIZON_DAYS):                                           # Coming up (next 7 days)
+    days = [existing[d] for d in sorted(existing) if d < today]
+    days.append(existing.get(today) or _missing_day(today, is_today=True))
+    for i in range(1, _HORIZON_DAYS):
         dt = today + timedelta(days=i)
         days.append(existing.get(dt) or _missing_day(dt))
-    summary = _summary([d for d in existing.values() if d["date"] <= sunday])   # "this week" = Mon-Sun
+    summary = _summary([d for d in existing.values() if d["date"] <= sunday])
     log_event(logger, logging.INFO, "week_view_rendered", update_id=getattr(msg, "update_id", None),
               planned=len(existing))
     _send_week_card(msg, render.render_week(days, summary), reply_markup=_PLAN_WEEK_KEYBOARD)
     return []
 
 
-# A placeholder for a forward day with no daily_plan row yet — rendered as "not planned yet" (never
-# fabricated). Carries every key render_week reads so it renders without a KeyError.
+# Builds the display shape for a day that has not been planned yet.
 def _missing_day(dt, is_today: bool = False) -> dict:
     return {"date": dt, "is_today": is_today, "status": None, "activity_type": [],
             "run_type": None, "run_detail": None, "strength_focus": None, "meal_provider": None,
@@ -106,7 +99,7 @@ def _missing_day(dt, is_today: bool = False) -> dict:
             "missing": True}
 
 
-# "2 strength + 2 runs this week" from the visible (non-skipped) days.
+# Summarizes visible, non-skipped strength and cardio days.
 def _summary(days: list[dict]) -> str:
     counted = [d for d in days if d.get("status") != "skipped"]
     n_s = sum(1 for d in counted if "strength" in d["activity_type"])
@@ -114,23 +107,15 @@ def _summary(days: list[dict]) -> str:
     return f"{n_s} strength + {n_c} run{'s' if n_c != 1 else ''} this week"
 
 
-# ---- Plan Week re-plan (spec B) ----
-
-# Handles the 🗓️ Plan Week tap (and re-plans after a pin): builds state, Gemini Pro proposes a shape,
-# the deterministic pipeline enforces + macro-targets it, saves spine+satellites, and renders the
-# spec-B diff vs the prior week. The caller (dispatch_plan_subcommand) already dismissed the spinner.
-# Input: the InboundMessage. Output: [] on success (the card SELF-SENDS + pins kind='week' + registers
-# its correction-state); a planning failure -> a fallback bubble + the current /week view.
+# Rebuilds the rolling weekly plan and sends the changed week card.
+# On failure, keeps saved edits and sends the current plan instead.
 def handle_plan_week(msg) -> list[tuple]:
     today, tz_name = get_local_today()
-    # The Pro re-plan takes ~30s; the callback spinner clears immediately, so without this the chat
-    # looks dead. Fire an instant interim message so B knows it's working (best-effort).
+    # Sends a short progress message while the plan is generated.
     _interim(msg, "🗓️ Re-planning your week — give me ~30s…")
     message = _replan_and_save(today, tz_name, msg)
     if message is None:
-        # Re-plan failed (the dominant X1: an unretried Gemini 500). Note it, then fall back to the
-        # current week (which self-sends + pins). send_reply (not a returned bubble) keeps the order
-        # error-then-view, since handle_week_view now self-sends the view itself.
+        # Sends the failure notice before the current week card.
         chat_id = getattr(msg, "chat_id", None)
         if chat_id:
             try:
@@ -140,16 +125,11 @@ def handle_plan_week(msg) -> list[tuple]:
                 log_failure(logger, logging.WARNING, "plan_week_fallback_send_failed", e,
                             update_id=getattr(msg, "update_id", None))
         return handle_week_view(msg)
-    _send_week_card(msg, message)        # self-send + pin kind='week' + register week correction-state
+    _send_week_card(msg, message)
     return []
 
 
-# Self-sends a week card (the /week view, the /plan week re-plan diff, or the post-correction view),
-# PINS it kind='week' (the third coexisting pin — meal + exercise + week, each self-replacing within its
-# kind: the Sun scaffold, /plan week, and /week all share kind='week', so the LATEST wins), and registers
-# its quoted-reply correction-state (domain='plan', context.kind='week' — same as _PLAN_STATE, so quoting
-# the card routes to handle_week_correction). reply_markup carries the [🗓️ Plan Week] button for the
-# /week view (the re-plan diff has none). All best-effort — a send/pin hiccup never crashes the handler.
+# Sends, pins, and registers a week card for quoted corrections.
 def _send_week_card(msg, message: str, reply_markup: dict | None = None) -> None:
     chat_id = getattr(msg, "chat_id", None)
     if not chat_id:
@@ -161,27 +141,21 @@ def _send_week_card(msg, message: str, reply_markup: dict | None = None) -> None
                   update_id=getattr(msg, "update_id", None), context={"kind": "week"})
 
 
-# Guarantees EXACTLY ONE veg day per CALENDAR week across the horizon (B wants the indication every week,
-# 2026-07-01) — "LLM proposes, code guarantees". The model proposes veg days; this enforces one per week:
-#   • CURRENT week + B already ate veg this week (week_had_veg) -> clear ALL veg (the week's quota is met;
-#     don't double it on the remainder).
-#   • any other case -> keep the model's FIRST veg day that week (clear extras); if it proposed none, PLACE
-#     one on a soft day (prefer rest, then an easy/long run, else the first order-day — never a hard day).
-# Runs BEFORE shop assignment so assign_shops can put the veg day on a veg-capable shop. Only Mon-Fri
-# order-days are eligible. Pure; mutates + returns the days. B 2026-07-01.
+# Keeps one vegetarian order day per calendar week when meal planning is active.
+# Uses an easier weekday when the model did not propose one.
 def _place_weekly_veg(days: list[dict], today, week_had_veg: bool) -> list[dict]:
     this_week = today.isocalendar()[:2]
     by_week: dict = {}
     for d in days:
-        if d["date"].weekday() < 5:                       # Mon-Fri order-days only
+        if d["date"].weekday() < 5:
             by_week.setdefault(d["date"].isocalendar()[:2], []).append(d)
     for wk, wdays in by_week.items():
-        if wk == this_week and week_had_veg:              # quota already met this week -> no veg on remainder
+        if wk == this_week and week_had_veg:
             for d in wdays:
                 d["is_vegetarian_day"] = False
             continue
         veg = [d for d in wdays if d.get("is_vegetarian_day")]
-        if veg:                                           # keep the first, clear any duplicates
+        if veg:
             for d in veg[1:]:
                 d["is_vegetarian_day"] = False
             continue
@@ -193,39 +167,28 @@ def _place_weekly_veg(days: list[dict], today, week_had_veg: bool) -> list[dict]
     return days
 
 
-# Core roll shared by the button (handle_plan_week) and the Sunday cron (run_scaffold): build state ->
-# Gemini Pro proposes the shape -> enforce + macro-target -> shop pre-assign -> save spine+satellites ->
-# render the spec-B diff. Locks already-acted days to reality (plans around them, never rewrites them).
-# Returns the spec-B message, or None if the (Pro) planning step failed. msg is None for the cron.
+# Builds and saves the rolling plan for the button and scheduled run.
+# Preserves completed or skipped days and returns the rendered changes.
 def _replan_and_save(today, tz_name, msg=None) -> str | None:
     end = today + timedelta(days=_HORIZON_DAYS - 1)
-    prior_days = persistence.read_week(today, end, today)   # for the diff + acted-day locks
+    prior_days = persistence.read_week(today, end, today)
     prior = {d["date"]: d for d in prior_days}
-    # Already-acted days in the forward horizon (at most today) are LOCKED to reality so the roll plans
-    # AROUND them and never rewrites a done/skipped day (the reconciler, step 4, owns status).
-    # NOTE (step 4 / reconciler): `acted` is satellite-status-only. Once the reconciler writes ad-hoc
-    # reality into the spine (a hike as a cardio day with NO cardio_plan row, status=None), broaden this
-    # lock to "any plan_date <= today" so a completed-but-unsatelited day can't be rewritten. Latent now.
+    # Keeps days already marked done or skipped unchanged during replanning.
     acted = {d["date"] for d in prior_days if d.get("status") in ("done", "skipped")}
     state = state_mod.build_week_state(today, tz_name, _HORIZON_DAYS)
     state["pins"] = (state.get("pins") or []) + [
         {"date": prior[d]["date"], "activity_type": prior[d]["activity_type"],
          "run_type": prior[d].get("run_type")} for d in acted
     ]
-    # The roll hits Gemini Pro (the dominant X1 failure: unretried 500s). Return None on failure so the
-    # caller degrades gracefully (button -> /week fallback; cron -> log + no send) instead of 500-ing.
+    # Returns None when planning fails so callers can keep the existing plan.
     try:
         result = planner.plan_week(state, nutrition_config(), _rules())
-        # Veg-day + shop assignment only when b_extended plans meals (Bangkok). In Singapore B self-orders
-        # lunch/dinner, so the week carries no veg day / shop — save_week persists None and the card shows
-        # neither (render degrades on absent data). This also saves the shop-pool DB read + LLM tokens.
+        # Adds vegetarian-day and shop choices only when the active location uses meal planning.
         if mode_config().get("b_extended_plans_meals", True):
-            # Guarantee one veg day per calendar week BEFORE shops so the veg day gets a veg-capable shop. A
-            # mid-week re-plan can't see that THIS week already had a veg day (it's before the window), so if B
-            # already ate veg this week we drop it from the remainder; every other week is guaranteed one.
+            # Places the vegetarian day before assigning a suitable shop.
             _place_weekly_veg(result["days"], today, persistence.week_has_actual_veg_day(today, tz_name))
-            _assign_shops(result["days"], msg, today)       # deterministic shop pre-assignment (soft)
-            for d in result["days"]:                        # preserve an acted day's real shop
+            _assign_shops(result["days"], msg, today)
+            for d in result["days"]:
                 if d["date"] in acted and d["date"] in prior:
                     d["meal_plan_provider"] = prior[d["date"]].get("meal_provider")
         persistence.save_week(result["days"], meta={"source": "plan_week", "as_of": str(today)})
@@ -233,7 +196,7 @@ def _replan_and_save(today, tz_name, msg=None) -> str | None:
         log_failure(logger, logging.WARNING, "plan_week_failed", e,
                     update_id=getattr(msg, "update_id", None))
         return None
-    # Acted days render from reality (the proposal lacks day-of detail); others render as diffs.
+    # Uses saved data for completed days and proposed data for future days.
     render_days = [prior[d["date"]] if d["date"] in acted and d["date"] in prior
                    else _to_render_day(d, today, prior) for d in result["days"]]
     header = result.get("status_line") or result["summary"]
@@ -243,10 +206,8 @@ def _replan_and_save(today, tz_name, msg=None) -> str | None:
     return message
 
 
-# Sunday-cron scaffold (brief §8): rolls the forward window (same op as the button) and proactively
-# sends the resulting week to B. Runs AFTER the weekly reflection (which writes the target/directives
-# build_week_state reads; absent that, build_week_state falls back to the seed target). Best-effort:
-# on a planning failure it logs and sends nothing. Returns the sent message (or None).
+# Builds and sends the scheduled weekly plan.
+# Returns the message, or None when planning fails.
 def run_scaffold(now_utc=None) -> str | None:
     now_utc = now_utc or datetime.now(timezone.utc)
     tz = get_timezone(now_utc)
@@ -261,8 +222,7 @@ def run_scaffold(now_utc=None) -> str | None:
     return message
 
 
-# Fires an instant interim message to B's chat (best-effort) so a slow handler doesn't look dead.
-# Not stored/state-saved — it's a transient "working on it" note. Skipped if there's no chat_id.
+# Sends a temporary progress message without saving correction state.
 def _interim(msg, text: str) -> None:
     chat_id = getattr(msg, "chat_id", None)
     if not chat_id:
@@ -274,11 +234,7 @@ def _interim(msg, text: str) -> None:
                     update_id=getattr(msg, "update_id", None))
 
 
-# Sends a proactive planner message to B (no reply-to — the cron initiates it), logs it outbound, and
-# PINS it kind='week' — the third coexisting pin (meal + exercise + week), each self-replacing within
-# its kind, so a midweek /plan week re-plan replaces this scaffold's week pin and vice-versa. The
-# proactive message is NOT quote-correctable (conversation_state needs a triggering inbound update);
-# B adjusts via /week or /plan week, whose messages ARE correctable. Re-running re-sends (cron no-retry).
+# Sends and pins a scheduled week card without quoted-reply state.
 def _send(message: str) -> None:
     chat_id = get_latest_chat_id()
     if not chat_id:
@@ -286,21 +242,16 @@ def _send(message: str) -> None:
         return
     message_id = send_logged(chat_id, message)
     if message_id is not None:
-        register_card(chat_id, message_id, pin_kind="week")   # pin only (proactive -> not correctable)
+        register_card(chat_id, message_id, pin_kind="week")
 
 
-# Deterministic Sunday shop pre-assignment, best-effort: sets meal_plan_provider on the week's days
-# in place. Shops are a SOFT layer (the day-of planner swaps if needed), so a menu-table hiccup must
-# not abort the re-plan — any failure is logged and the days simply ship without shops.
+# Assigns shops to eligible days without failing the weekly plan when menu data is unavailable.
 def _assign_shops(days: list[dict], msg, today) -> None:
     meal_cfg = load_goals().get("meal_constraints", {})
     cap_thb = float(meal_cfg.get("budget_sgd_per_meal", 6.5)) * float(meal_cfg.get("fx_thb_per_sgd_planning", 25))
     try:
         pool = persistence.read_shop_pool(cap_thb)
-        # Feed THIS week's PAST order-days (locked) so the per-week Grain count is Monday-anchored, not
-        # today-anchored (B 2026-07-01): a Grain already assigned earlier this week counts toward the
-        # 1–2/week floor+cap. Past days aren't re-assigned or saved — they only inform the current week's
-        # count. (Weekends carry no shop; assign_shops ignores them.)
+        # Includes earlier weekdays so weekly shop limits cover the full calendar week.
         monday = today - timedelta(days=today.isoweekday() - 1)
         past = ([{"date": r["date"], "is_vegetarian_day": bool(r.get("is_vegetarian_day")),
                   "meal_plan_provider": r.get("meal_provider")}
@@ -316,7 +267,7 @@ def _assign_shops(days: list[dict], msg, today) -> None:
                     update_id=getattr(msg, "update_id", None))
 
 
-# Converts an assemble_week day into a render-shape day, tagging prev_label when it changed vs prior.
+# Converts a planned day to the shape used by the week renderer.
 def _to_render_day(d: dict, today, prior: dict) -> dict:
     rd = {
         "date": d["date"],
@@ -326,7 +277,7 @@ def _to_render_day(d: dict, today, prior: dict) -> dict:
         "run_type": d.get("run_type"),
         "run_detail": persistence._run_seed(d.get("run_type")),
         "strength_focus": d.get("strength_focus"),
-        "meal_provider": d.get("meal_plan_provider"),   # the assigned shop -> shown per day on the card
+        "meal_provider": d.get("meal_plan_provider"),
         "meal_status": None,
         "meal_eaten": False,
         "is_vegetarian_day": d.get("is_vegetarian_day", False),
@@ -334,11 +285,9 @@ def _to_render_day(d: dict, today, prior: dict) -> dict:
     }
     p = prior.get(d["date"])
     if p and render._activity_label(p) != render._activity_label(rd):
-        rd["prev_label"] = render._activity_label(p)   # already HTML-safe; render_replan won't re-escape
+        rd["prev_label"] = render._activity_label(p)
     return rd
 
-
-# ---- quoted-reply correction (Pro extraction -> per-day pins) ----
 
 _EDIT_SYSTEM = """B quoted a training-plan message and wrote a correction. It may contain instructions for
 SEVERAL different days — extract EVERY day-specific instruction as its own edit. Never combine
@@ -376,25 +325,20 @@ Output STRICT JSON only:
 B's correction: {text}"""
 
 
-# Routes a quoted Telegram reply about the weekly plan through structured extraction and replanning.
-# Input: the normalized inbound message and the quoted reply's conversation state. Pro extracts each
-# day-specific instruction into a separate pin or context note; pins are persisted per day before one
-# re-plan applies them together. Classifier failures become non-locking context notes. Returns the reply
-# bubbles produced by the refreshed week view or re-plan.
+# Extracts every day-specific correction, saves each note, and replans once around all pins.
+# Returns the refreshed weekly plan replies.
 def handle_week_correction(msg, state: dict) -> list[tuple]:
     text = (getattr(msg, "text", None) or "").strip()
     if not text:
         return [("✏️ Tell me what to change about the week.", _PLAN_STATE)]
     today, _ = get_local_today()
-    # 2 trailing PAST days ride along so a "didn't do X yesterday/Sun" report resolves to the REAL past
-    # date (recorded as a note, never re-planned) instead of locking next week's same weekday.
+    # Includes two past days so recent activity reports resolve to the correct date.
     past = [today - timedelta(days=i) for i in (2, 1)]
     horizon = [today + timedelta(days=i) for i in range(_HORIZON_DAYS)]
     parsed = _classify_edits(text, past, horizon)
     pins, contexts, unresolved = _normalise_edits(parsed, past + horizon, today, text)
 
-    # Contexts BEFORE pins: daily_plan.notes readers (_active_note — the /week card + the day-of
-    # planners) take the LAST active note, so on a same-day collision the pin's instruction must win.
+    # Saves context first so a same-day pin remains the latest active instruction.
     for c in contexts:
         persistence.add_note(c["date"], c["note"], kind="context")
     for p in pins:
@@ -403,7 +347,7 @@ def handle_week_correction(msg, state: dict) -> list[tuple]:
     log_event(logger, logging.INFO, "week_edits_applied", update_id=getattr(msg, "update_id", None),
               pins=len(pins), contexts=len(contexts), unresolved=len(unresolved))
 
-    if unresolved:   # a pin-intent we couldn't date — don't fail silently (#9); kept as context note(s).
+    if unresolved:
         chat_id = getattr(msg, "chat_id", None)
         if chat_id:
             try:
@@ -414,14 +358,12 @@ def handle_week_correction(msg, state: dict) -> list[tuple]:
                 log_failure(logger, logging.WARNING, "week_context_note_send_failed", e,
                             update_id=getattr(msg, "update_id", None))
     if pins:
-        return handle_plan_week(msg)   # ONE re-plan around ALL the new pins -> spec B diff
-    return handle_week_view(msg)   # self-sends + pins the refreshed view (now showing the notes)
+        return handle_plan_week(msg)
+    return handle_week_view(msg)
 
 
-# Classifier for a week edit — multi-edit contract ({"edits": [...]}). PRO, not Flash (B 2026-07-27,
-# EXCEPTION to the Pro-plans/Flash-corrections convention, THIS extractor only): a multi-day message
-# must extract perfectly — a missed day silently free-plans it, the exact live bug this fixes. Meal +
-# strength corrections stay Flash. Best-effort: any failure -> one context note (safe, never locks).
+# Extracts separate pin or context records from a weekly correction.
+# Falls back to one context note when extraction fails.
 def _classify_edits(text: str, past: list, horizon: list) -> dict:
     horizon_lines = "\n".join([f"- {d.isoformat()} {d:%a} (past)" for d in past]
                               + [f"- {d.isoformat()} {d:%a}" for d in horizon])
@@ -434,20 +376,12 @@ def _classify_edits(text: str, past: list, horizon: list) -> dict:
         return {"edits": [{"kind": "context", "date": None, "note": text}]}
 
 
-# Normalises the classifier output into (pins, contexts, unresolved_pin_notes). PURE (unit-testable).
-# Tolerates the legacy single-edit shape ({"kind": ...}) and malformed entries. `horizon` = the ALLOWED
-# dates incl. the trailing past days: a pin dated BEFORE today degrades to a context note on that day
-# (what-happened reports never re-plan the past — the reconciler owns it); a pin with no resolvable
-# date degrades to a context note on today + an `unresolved` entry (so the handler can tell B). Pins
-# dedupe by date (LAST wins). run_type / run_surface survive only on a cardio pin; activity_type is
-# vocab-filtered, defaulting to rest. Notes are per-edit and truncated: the full-message fallback
-# applies ONLY to a single-edit reply (in a batch it would re-lump the whole message onto one day —
-# the exact live bug this module fixes); a note-less edit in a batch gets a short derived label, and a
-# note-less context in a batch carries no information and is skipped.
+# Normalizes extracted edits into future pins, context notes, and unresolved pin text.
+# Past pins become context notes, and the latest pin for a date wins.
 def _normalise_edits(parsed, horizon: list, today, fallback_text: str) -> tuple[list, list, list]:
     edits = parsed.get("edits") if isinstance(parsed, dict) else None
     if edits is None and isinstance(parsed, dict) and parsed.get("kind"):
-        edits = [parsed]                                   # legacy single-edit reply shape
+        edits = [parsed]
     if not isinstance(edits, list) or not edits:
         edits = [{"kind": "context", "date": None, "note": fallback_text}]
     single = len(edits) == 1
@@ -467,20 +401,20 @@ def _normalise_edits(parsed, horizon: list, today, fallback_text: str) -> tuple[
                             " + ".join(at) + (f" · {rt}" if rt else ""))
             pins_by_date[d] = {"date": d, "activity_type": at, "run_type": rt,
                                "run_surface": surface, "note": note[:200]}
-        elif e.get("kind") == "pin" and d:                 # past-day report — note it, never re-plan it
+        elif e.get("kind") == "pin" and d:
             contexts.append({"date": d, "note": (note or (fallback_text if single else "reported"))[:200]})
-        elif e.get("kind") == "pin":                       # pin-intent, no resolvable day
+        elif e.get("kind") == "pin":
             note = note or (fallback_text if single else "couldn't place this day")
             unresolved.append(note[:200])
             contexts.append({"date": today, "note": note[:200]})
         else:
             if not note and not single:
-                continue                                   # a note-less context in a batch says nothing
+                continue
             contexts.append({"date": d or today, "note": (note or fallback_text)[:200]})
     return list(pins_by_date.values()), contexts, unresolved
 
 
-# Coerces the classifier's date to one of the horizon dates (guards a hallucinated out-of-range day).
+# Resolves an extracted date only when it falls within the allowed horizon.
 def _resolve_date(value, horizon: list):
     if not value:
         return None

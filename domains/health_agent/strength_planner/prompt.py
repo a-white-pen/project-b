@@ -1,20 +1,10 @@
-"""
-Gemini Pro prompt for the day-of STRENGTH session (BRIEF §11). The model decides EVERYTHING about
-the prescription — which exercises, how many sets, the rep range, the rest range, the target weight —
-from best evidence (hypertrophy/strength science) AND B's own data in the state packet (recent
-working loads, recovery, running load, weight). NOTHING about reps/sets/rest is hardcoded; the
-catalog below is STRUCTURAL only (what each exercise is + where she does it + how it loads).
-
-"LLM proposes, code guarantees": the planner (planner.py) then validates the model's picks against
-the catalog, resolves + rounds weights to loadable increments, applies wide sanity clamps, and
-enforces the deterministic rules (compound-first ordering, venue-scoped pairings). So this prompt GUIDES; it
-does not need to be perfectly obeyed.
-
-Stable SYSTEM prefix first (goals + conventions + catalog + output contract), dynamic state JSON
-after — so Gemini implicit caching can hit across days.
+"""Builds the model prompt for a day-of strength session.
 
 Functions:
-  build_prompt(state) -> str
+  _catalog_block — formats exercises available at the active venue
+  _conventions_block — formats configured strength rules
+  _system — builds the stable instruction section
+  build_prompt — combines training guidance, the exercise catalog, and current state
 """
 
 import json
@@ -23,9 +13,7 @@ from domains.health_agent.strength_planner import catalog
 from domains.health_agent.goals import goals_prompt_block, load_goals
 
 
-# One model-friendly line per catalog exercise AT THE ACTIVE VENUE — STRUCTURAL facts only (no
-# rep/rest/set numbers). The model reads pattern/role/equipment to balance the session and decides
-# the prescription. Dumbbell loads show the venue's real unit (kg in Singapore, lb in Bangkok).
+# Formats the exercises available at the active venue for the prompt.
 def _catalog_block(venue: str) -> str:
     venues = catalog.load_catalog()["meta"].get("venues", {})
     db_unit = ((venues.get(venue, {}) or {}).get("dumbbell", {}) or {}).get("unit", "kg")
@@ -40,18 +28,18 @@ def _catalog_block(venue: str) -> str:
         if anchor and venue in (e.get("pairs_after_at") or [venue]):
             flags.append(f"only-with:{anchor}")
         seed = e.get("seed_weight")
-        fixed = catalog.active_fixed_weight(e, venue)         # venue-scoped fixed load (e.g. BKK 3 kg pair)
+        fixed = catalog.active_fixed_weight(e, venue)
         if e.get("equipment") == "bodyweight":
             load = "bodyweight"
         elif e.get("equipment") == "dumbbell":
             load = f"dumbbell({db_unit})"
         else:
             load = f"{e.get('equipment')}({e.get('load_unit')})"
-        if fixed:                                             # forced, non-progressing weight — say so, skip seed
+        if fixed:
             load += f", fixed {fixed.get('value')}{fixed.get('unit')}"
             flags.append("fixed-weight")
         elif load != "bodyweight" and seed and seed.get("unit") != "bodyweight":
-            sv, su = seed.get("value"), seed.get("unit")          # show the seed in this line's display unit
+            sv, su = seed.get("value"), seed.get("unit")
             disp = db_unit if e.get("equipment") == "dumbbell" else "kg"
             if sv is not None and su != disp:
                 sv = round(catalog.lb_to_kg(sv), 1) if su == "lb" else round(catalog.kg_to_lb(sv), 1)
@@ -62,7 +50,7 @@ def _catalog_block(venue: str) -> str:
     return "\n".join(lines)
 
 
-# Compact YAML of the strength conventions (duration, weekly volume, rules) for the prompt.
+# Formats the configured strength conventions for the prompt.
 def _conventions_block() -> str:
     import yaml
     s = load_goals().get("strength", {})
@@ -86,10 +74,11 @@ Use target_weight_kg=null for bodyweight and fixed-weight exercises. For loaded 
 exercise_history.recent_top_kg in the state (progress conservatively — small jumps, ~1-2 reps in reserve)."""
 
 
+# Builds the stable instruction section of the strength prompt.
 def _system(state: dict) -> str:
     return f"""You are B's strength coach. Plan ONE strength session for {state['today']} ({state['weekday']}).
 
-B's three goals are weighted EQUALLY (lean recomp, build balanced muscle, run sub-60 10k injury-free):
+B's two training goals are weighted equally (build balanced muscle, run sub-60 10k injury-free):
 {goals_prompt_block()}
 
 Conventions (science-based; the system also enforces the hard ones):
@@ -117,8 +106,6 @@ Choose exercises ONLY from this catalog (B's active gym), by EXACT name:
 {_OUTPUT_SCHEMA}"""
 
 
-# Builds the full prompt: stable SYSTEM (goals + conventions + catalog + output contract), then the
-# dynamic state packet (recent loads, recovery, running, weight) as JSON.
-# Input: the state dict from state.build_state. Output: the prompt string.
+# Adds the current strength state to the instruction prompt.
 def build_prompt(state: dict) -> str:
     return _system(state) + "\n\nSTATE (B's live data):\n" + json.dumps(state, ensure_ascii=False, default=str)
