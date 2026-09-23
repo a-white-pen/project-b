@@ -5,8 +5,10 @@ quoted-reply week corrections. plan_command.py delegates here (router.py stays u
   handle_week_view       — /week read view (spec A) + the [🗓️ Plan Week] button.
   handle_plan_week       — the rolling re-plan: build state -> Gemini Pro proposes -> enforce + macros
                            -> save (spine + satellites) -> spec-B diff render. Fired by `plan:week`.
-  handle_week_correction — a quoted-reply edit: Flash classifies PIN (lock a day, then re-plan around
-                           it) vs CONTEXT (a note that informs but does not lock), persists it.
+  handle_week_correction — a quoted-reply edit. Pro extracts EVERY day-instruction in B's message
+                           (a single reply often covers several days — B 2026-07-26), each as a PIN
+                           (lock that day, with its OWN short note) or CONTEXT (informs, doesn't lock);
+                           all pins are persisted per-day, then ONE re-plan honours them all.
 
 The deterministic pieces it calls (planner.assemble_week, calibration, macros, enforce, render) are
 unit-tested in their modules; this glue (DB + LLM + Telegram) is exercised live, reviewed adversarially.
@@ -23,8 +25,8 @@ from datetime import datetime, timedelta, timezone
 from domains.health_agent.cards import register_card
 from domains.health_agent.week_planner import meal_assign, persistence, planner, reconcile, render
 from domains.health_agent.week_planner import state as state_mod
-from domains.health_agent.goals import load_goals, nutrition_config
-from system.llm import MODEL_FLASH, generate_text, parse_json_response
+from domains.health_agent.goals import load_goals, mode_config, nutrition_config
+from system.llm import MODEL_PRO, generate_text, parse_json_response
 from system.logging import log_event, log_failure
 from system.timezone import get_local_today, get_timezone
 from telegram.replies import get_latest_chat_id, send_logged, send_reply
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 _HORIZON_DAYS = 8                  # the rolling re-plan window: today .. today+7
 _KINDS = {"rest", "cardio", "strength"}
+_RUN_TYPES = {"easy", "long", "quality", "fartlek"}
 
 # Conversation state stamped on every plan message so a quoted reply routes to the week corrector.
 _PLAN_STATE = {"domain": "plan", "context": {"kind": "week"}}
@@ -48,7 +51,7 @@ def _rules() -> dict:
         "cardio_per_week": wt.get("cardio_per_week", 2),
         "strength_per_week": wt.get("strength_per_week", 2),
         "min_rest_days": wt.get("min_rest_days", 1),
-        "avoid_weekends": wt.get("avoid_weekends", True),
+        "avoid_weekends": mode_config().get("avoid_weekends", True),   # default matches prompt.py (legacy BKK)
     }
 
 
@@ -213,14 +216,18 @@ def _replan_and_save(today, tz_name, msg=None) -> str | None:
     # caller degrades gracefully (button -> /week fallback; cron -> log + no send) instead of 500-ing.
     try:
         result = planner.plan_week(state, nutrition_config(), _rules())
-        # Guarantee one veg day per calendar week BEFORE shops so the veg day gets a veg-capable shop. A
-        # mid-week re-plan can't see that THIS week already had a veg day (it's before the window), so if B
-        # already ate veg this week we drop it from the remainder; every other week is guaranteed one.
-        _place_weekly_veg(result["days"], today, persistence.week_has_actual_veg_day(today, tz_name))
-        _assign_shops(result["days"], msg, today)           # deterministic shop pre-assignment (soft)
-        for d in result["days"]:                            # preserve an acted day's real shop
-            if d["date"] in acted and d["date"] in prior:
-                d["meal_plan_provider"] = prior[d["date"]].get("meal_provider")
+        # Veg-day + shop assignment only when b_extended plans meals (Bangkok). In Singapore B self-orders
+        # lunch/dinner, so the week carries no veg day / shop — save_week persists None and the card shows
+        # neither (render degrades on absent data). This also saves the shop-pool DB read + LLM tokens.
+        if mode_config().get("b_extended_plans_meals", True):
+            # Guarantee one veg day per calendar week BEFORE shops so the veg day gets a veg-capable shop. A
+            # mid-week re-plan can't see that THIS week already had a veg day (it's before the window), so if B
+            # already ate veg this week we drop it from the remainder; every other week is guaranteed one.
+            _place_weekly_veg(result["days"], today, persistence.week_has_actual_veg_day(today, tz_name))
+            _assign_shops(result["days"], msg, today)       # deterministic shop pre-assignment (soft)
+            for d in result["days"]:                        # preserve an acted day's real shop
+                if d["date"] in acted and d["date"] in prior:
+                    d["meal_plan_provider"] = prior[d["date"]].get("meal_provider")
         persistence.save_week(result["days"], meta={"source": "plan_week", "as_of": str(today)})
     except Exception as e:
         log_failure(logger, logging.WARNING, "plan_week_failed", e,
@@ -331,85 +338,146 @@ def _to_render_day(d: dict, today, prior: dict) -> dict:
     return rd
 
 
-# ---- quoted-reply correction (Flash: pin vs context) ----
+# ---- quoted-reply correction (Pro extraction -> per-day pins) ----
 
-_EDIT_SYSTEM = """B quoted a training-plan message and wrote a correction. Classify it and extract the change.
+_EDIT_SYSTEM = """B quoted a training-plan message and wrote a correction. It may contain instructions for
+SEVERAL different days — extract EVERY day-specific instruction as its own edit. Never combine
+instructions for different days into one note.
 
+Each edit is:
 "pin"  = B fixes ONE specific day to a specific activity or to rest, and wants it LOCKED.
-         e.g. "I need Friday off" -> kind=pin, that Friday, activity_type=["rest"].
-              "run outdoors Thursday" -> kind=pin, that Thursday, activity_type=["cardio"],
-                                         run_surface="outdoor", note="run outdoors".
+         e.g. "I need Friday off" -> that Friday, activity_type=["rest"].
+              "Tuesday I can do an easy run" -> that Tuesday, activity_type=["cardio"], run_type="easy".
+              "run outdoors Thursday" -> that Thursday, activity_type=["cardio"], run_surface="outdoor".
+         A day B reports as ALREADY happened ("didn't do strength today, went to X") is a pin to what
+         actually happened (rest if nothing), note = the reason.
 "context" = info that should INFORM planning but does NOT lock a day.
          e.g. "legs are sore", "work is busy this week" -> kind=context, date=null.
 
 Rules:
+- ONE edit per day B gives an instruction about. NEVER merge different days into one edit.
 - date: resolve any weekday/relative reference to one of the horizon dates below; null if none is meant.
-- activity_type: a subset of rest|cardio|strength (null for a pure context note).
+  Days marked (past) are for what-happened reports ("didn't run yesterday") — use the PAST date, never
+  next week's same weekday; the system records it as a note without re-planning that day.
+- activity_type: a subset of rest|cardio|strength (null for a pure context note). A walk / hike /
+  walk-run counts as ["cardio"].
+- run_type: easy|long|quality|fartlek ONLY when B names the kind of run; else null (a walk/hike is null).
 - run_surface: outdoor|treadmill only if B says where to run, else null.
-- note: a short phrase in B's words to remember (always provide one).
+- note: a SHORT phrase in B's OWN words about THAT day only (always provide one).
+- "plan normally from <day> onwards" (or similar) means those days are FREE — emit NO edit for them.
 
 Horizon days:
 {horizon}
 
 Output STRICT JSON only:
-{{"kind":"pin"|"context","date":"YYYY-MM-DD"|null,"activity_type":[str]|null,
-"run_surface":"outdoor"|"treadmill"|null,"note":str}}
+{{"edits": [{{"kind":"pin"|"context","date":"YYYY-MM-DD"|null,"activity_type":[str]|null,
+"run_type":"easy"|"long"|"quality"|"fartlek"|null,"run_surface":"outdoor"|"treadmill"|null,"note":str}}]}}
 
 B's correction: {text}"""
 
 
-# Routes a quoted-reply week edit. Flash decides PIN vs CONTEXT; a PIN locks the day (activity +
-# optional surface + note) and re-plans the week around it (spec B); a CONTEXT note is attached to the
-# day (or today, week-level) and the refreshed /week view is returned. On any classifier failure it
-# falls back to a non-destructive context note (never wrongly locks/re-plans).
-# Input: the quoting InboundMessage + the quoted message's conversation_state. Output: reply bubbles.
+# Routes a quoted Telegram reply about the weekly plan through structured extraction and replanning.
+# Input: the normalized inbound message and the quoted reply's conversation state. Pro extracts each
+# day-specific instruction into a separate pin or context note; pins are persisted per day before one
+# re-plan applies them together. Classifier failures become non-locking context notes. Returns the reply
+# bubbles produced by the refreshed week view or re-plan.
 def handle_week_correction(msg, state: dict) -> list[tuple]:
     text = (getattr(msg, "text", None) or "").strip()
     if not text:
         return [("✏️ Tell me what to change about the week.", _PLAN_STATE)]
     today, _ = get_local_today()
+    # 2 trailing PAST days ride along so a "didn't do X yesterday/Sun" report resolves to the REAL past
+    # date (recorded as a note, never re-planned) instead of locking next week's same weekday.
+    past = [today - timedelta(days=i) for i in (2, 1)]
     horizon = [today + timedelta(days=i) for i in range(_HORIZON_DAYS)]
-    parsed = _classify_edit(text, horizon)
-    kind = parsed.get("kind")
-    edit_date = _resolve_date(parsed.get("date"), horizon)
-    note = _plain(parsed.get("note")) or text
+    parsed = _classify_edits(text, past, horizon)
+    pins, contexts, unresolved = _normalise_edits(parsed, past + horizon, today, text)
 
-    if kind == "pin" and edit_date:
-        at = [a for a in (parsed.get("activity_type") or []) if a in _KINDS] or ["rest"]
-        surface = parsed.get("run_surface") if "cardio" in at else None
-        persistence.add_note(edit_date, note, kind="pin", activity_type=at, run_surface=surface)
-        log_event(logger, logging.INFO, "week_pin_applied", update_id=getattr(msg, "update_id", None),
-                  date=str(edit_date), activity=at, surface=surface)
-        return handle_plan_week(msg)   # re-plan around the new pin -> spec B diff
+    # Contexts BEFORE pins: daily_plan.notes readers (_active_note — the /week card + the day-of
+    # planners) take the LAST active note, so on a same-day collision the pin's instruction must win.
+    for c in contexts:
+        persistence.add_note(c["date"], c["note"], kind="context")
+    for p in pins:
+        persistence.add_note(p["date"], p["note"], kind="pin", activity_type=p["activity_type"],
+                             run_surface=p.get("run_surface"), run_type=p.get("run_type"))
+    log_event(logger, logging.INFO, "week_edits_applied", update_id=getattr(msg, "update_id", None),
+              pins=len(pins), contexts=len(contexts), unresolved=len(unresolved))
 
-    # No lockable day — keep it as a context note (informs planning, doesn't lock).
-    persistence.add_note(edit_date or today, note, kind="context")
-    log_event(logger, logging.INFO, "week_context_noted", update_id=getattr(msg, "update_id", None),
-              date=str(edit_date or today), wanted_pin=kind == "pin")
-    if kind == "pin":   # B meant to lock a day but we couldn't pin one — don't fail silently (#9). Send
-        chat_id = getattr(msg, "chat_id", None)   # the note FIRST (handle_week_view self-sends the view).
+    if unresolved:   # a pin-intent we couldn't date — don't fail silently (#9); kept as context note(s).
+        chat_id = getattr(msg, "chat_id", None)
         if chat_id:
             try:
-                send_reply(chat_id, "📝 Noted — but I couldn't tell which day to lock, so I kept it as "
-                                    "a note. Quote the week and name the day to pin it.")
+                send_reply(chat_id, "📝 Couldn't tell which day for: "
+                           + "; ".join(f"“{u}”" for u in unresolved[:3])
+                           + " — kept as notes. Quote the week and name the day to pin.")
             except Exception as e:
                 log_failure(logger, logging.WARNING, "week_context_note_send_failed", e,
                             update_id=getattr(msg, "update_id", None))
-    return handle_week_view(msg)   # self-sends + pins the refreshed view (now showing the note)
+    if pins:
+        return handle_plan_week(msg)   # ONE re-plan around ALL the new pins -> spec B diff
+    return handle_week_view(msg)   # self-sends + pins the refreshed view (now showing the notes)
 
 
-# Flash classifier for a week edit. Best-effort: any failure -> a context note (safe, never locks).
-# Output: {kind, date, activity_type, run_surface, note}.
-def _classify_edit(text: str, horizon: list) -> dict:
-    horizon_lines = "\n".join(f"- {d.isoformat()} {d:%a}" for d in horizon)
+# Classifier for a week edit — multi-edit contract ({"edits": [...]}). PRO, not Flash (B 2026-07-27,
+# EXCEPTION to the Pro-plans/Flash-corrections convention, THIS extractor only): a multi-day message
+# must extract perfectly — a missed day silently free-plans it, the exact live bug this fixes. Meal +
+# strength corrections stay Flash. Best-effort: any failure -> one context note (safe, never locks).
+def _classify_edits(text: str, past: list, horizon: list) -> dict:
+    horizon_lines = "\n".join([f"- {d.isoformat()} {d:%a} (past)" for d in past]
+                              + [f"- {d.isoformat()} {d:%a}" for d in horizon])
     prompt = _EDIT_SYSTEM.format(horizon=horizon_lines, text=text)
     try:
-        raw = generate_text(prompt, model=MODEL_FLASH)
-        out = parse_json_response(raw)
-        return out
+        raw = generate_text(prompt, model=MODEL_PRO)
+        return parse_json_response(raw)
     except Exception as e:
         log_failure(logger, logging.WARNING, "week_edit_classify_failed", e)
-        return {"kind": "context", "date": None, "note": text}
+        return {"edits": [{"kind": "context", "date": None, "note": text}]}
+
+
+# Normalises the classifier output into (pins, contexts, unresolved_pin_notes). PURE (unit-testable).
+# Tolerates the legacy single-edit shape ({"kind": ...}) and malformed entries. `horizon` = the ALLOWED
+# dates incl. the trailing past days: a pin dated BEFORE today degrades to a context note on that day
+# (what-happened reports never re-plan the past — the reconciler owns it); a pin with no resolvable
+# date degrades to a context note on today + an `unresolved` entry (so the handler can tell B). Pins
+# dedupe by date (LAST wins). run_type / run_surface survive only on a cardio pin; activity_type is
+# vocab-filtered, defaulting to rest. Notes are per-edit and truncated: the full-message fallback
+# applies ONLY to a single-edit reply (in a batch it would re-lump the whole message onto one day —
+# the exact live bug this module fixes); a note-less edit in a batch gets a short derived label, and a
+# note-less context in a batch carries no information and is skipped.
+def _normalise_edits(parsed, horizon: list, today, fallback_text: str) -> tuple[list, list, list]:
+    edits = parsed.get("edits") if isinstance(parsed, dict) else None
+    if edits is None and isinstance(parsed, dict) and parsed.get("kind"):
+        edits = [parsed]                                   # legacy single-edit reply shape
+    if not isinstance(edits, list) or not edits:
+        edits = [{"kind": "context", "date": None, "note": fallback_text}]
+    single = len(edits) == 1
+
+    pins_by_date: dict = {}
+    contexts, unresolved = [], []
+    for e in edits:
+        if not isinstance(e, dict):
+            continue
+        note = _plain(e.get("note"))
+        d = _resolve_date(e.get("date"), horizon)
+        if e.get("kind") == "pin" and d and d >= today:
+            at = [a for a in (e.get("activity_type") or []) if a in _KINDS] or ["rest"]
+            rt = e.get("run_type") if (e.get("run_type") in _RUN_TYPES and "cardio" in at) else None
+            surface = e.get("run_surface") if "cardio" in at else None
+            note = note or (fallback_text if single else
+                            " + ".join(at) + (f" · {rt}" if rt else ""))
+            pins_by_date[d] = {"date": d, "activity_type": at, "run_type": rt,
+                               "run_surface": surface, "note": note[:200]}
+        elif e.get("kind") == "pin" and d:                 # past-day report — note it, never re-plan it
+            contexts.append({"date": d, "note": (note or (fallback_text if single else "reported"))[:200]})
+        elif e.get("kind") == "pin":                       # pin-intent, no resolvable day
+            note = note or (fallback_text if single else "couldn't place this day")
+            unresolved.append(note[:200])
+            contexts.append({"date": today, "note": note[:200]})
+        else:
+            if not note and not single:
+                continue                                   # a note-less context in a batch says nothing
+            contexts.append({"date": d or today, "note": (note or fallback_text)[:200]})
+    return list(pins_by_date.values()), contexts, unresolved
 
 
 # Coerces the classifier's date to one of the horizon dates (guards a hallucinated out-of-range day).

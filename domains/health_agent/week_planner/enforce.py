@@ -49,6 +49,7 @@ def enforce_week(days: list[dict], rules: dict, done_this_week: dict | None = No
     days = copy.deepcopy(days)
     report: list[str] = []
     done_this_week = done_this_week or {}
+    avoid_wk = rules.get("avoid_weekends")     # bias demotion/rest toward weekends ONLY when avoiding them
     # The rolling window can span two calendar weeks; the 2+2 cap is PER week. done_this_week applies
     # only to the window's EARLIEST (current) week — future weeks start fresh.
     current_wk = min((d["date"].isocalendar()[:2] for d in days), default=None)
@@ -65,7 +66,9 @@ def enforce_week(days: list[dict], rules: dict, done_this_week: dict | None = No
             excess = len(idxs) - cap
             if excess > 0:
                 free = [i for i in idxs if not days[i].get("locked")]
-                free.sort(key=lambda i: (days[i]["date"].weekday() < 5, -days[i]["date"].weekday()))
+                # weekends first (only when avoiding them), then the latest day
+                free.sort(key=lambda i: ((days[i]["date"].weekday() < 5) if avoid_wk else 0,
+                                         -days[i]["date"].weekday()))
                 for i in free[:excess]:
                     _demote(days[i], kind)
                     report.append(f"dropped a {kind} on {days[i]['date']} (week's {weekly_cap}/wk target met)")
@@ -76,7 +79,9 @@ def enforce_week(days: list[dict], rules: dict, done_this_week: dict | None = No
     min_rest = rules.get("min_rest_days", 1)
     if sum(1 for d in days if _is_rest(d)) < min_rest:
         free_training = [i for i, d in enumerate(days) if not d.get("locked") and not _is_rest(d)]
-        free_training.sort(key=lambda i: (days[i]["date"].weekday() < 5, _is_hard(days[i])))
+        # rest the least-costly free day: weekend first ONLY when avoiding weekends, then a non-hard day
+        free_training.sort(key=lambda i: ((days[i]["date"].weekday() < 5) if avoid_wk else False,
+                                          _is_hard(days[i])))
         if free_training:
             i = free_training[0]
             days[i]["activity_type"] = ["rest"]

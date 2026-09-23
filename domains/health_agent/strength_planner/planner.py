@@ -6,7 +6,7 @@ prescription, then GUARANTEES a valid session in pure, unit-tested code:
   parse JSON -> per exercise: map to a known catalog name (drop unknowns), clamp sets/reps/rest to
   wide sanity bounds, resolve + round the weight to a loadable increment, compute the .fit values
   (reps = TOP of the range, rest = MIDPOINT) -> enforce pairings (Hip Thrust only/immediately after
-  Seated Cable Row) -> order gym-first then apartment-last -> canonical plan dict.
+  Seated Cable Row, scoped to its venue) -> order compounds-first (by role) -> canonical plan dict.
 
 The reps/rest RANGES come from the model (evidence + B's data), NOT a catalog table — the only
 numeric guarantees here are WIDE safety clamps so a malformed reply can't emit a nonsense .fit.
@@ -35,6 +35,7 @@ MIN_REPS, MAX_REPS, DEFAULT_REPS = 1, 30, 10
 MIN_REST_S, MAX_REST_S, DEFAULT_REST_S = 15, 300, 90
 MAX_EXERCISES = 12
 _FOCI = {"full_body", "upper", "lower", "push", "pull"}
+_ROLE_RANK = {"compound": 0, "accessory": 1, "isolation": 2, "core": 3}
 
 
 def _as_int(v, default: int) -> int:
@@ -63,14 +64,15 @@ def _clamp_range(low: int, high: int, mn: int, mx: int) -> tuple[int, int]:
 
 
 # Resolves an exercise's working weight to a {kg_low, kg_high, basis} dict (or None for bodyweight).
-# Chain: fixed apartment weight -> model's target_weight_kg -> B's recent_top_kg from history ->
-# catalog seed -> None. The chosen target is rounded to a loadable increment via catalog.round_weight_kg.
+# Chain: venue-scoped fixed weight -> model's target_weight_kg -> B's recent_top_kg from history ->
+# catalog seed -> None. The chosen target is rounded to the active venue's loadable increment.
 def _resolve_weight(item: dict, entry: dict, name: str, state: dict) -> dict | None:
     basis = entry.get("weight_basis")
+    venue = state.get("venue")
     if entry.get("equipment") == "bodyweight":
         return None
-    if entry.get("fixed_weight"):                       # apartment 3 kg dumbbells — forced
-        kg = catalog.round_weight_kg(0, entry)
+    if catalog.active_fixed_weight(entry, venue):       # venue-scoped forced load (e.g. BKK 3 kg pair)
+        kg = catalog.round_weight_kg(0, entry, venue)
         return {"kg_low": kg, "kg_high": kg, "basis": basis} if kg is not None else None
 
     target = _as_float(item.get("target_weight_kg"))
@@ -87,7 +89,7 @@ def _resolve_weight(item: dict, entry: dict, name: str, state: dict) -> dict | N
             target = float(sv)
     if target is None:
         return None
-    kg = catalog.round_weight_kg(target, entry)
+    kg = catalog.round_weight_kg(target, entry, venue)
     if kg is None:
         return None
     return {"kg_low": kg, "kg_high": kg, "basis": basis}
@@ -103,6 +105,9 @@ def _build_exercise(item: dict, state: dict) -> dict | None:
     if not name or not catalog.is_known(name):
         return None
     entry = catalog.get_exercise(name)
+    venue = state.get("venue") or catalog.default_venue()
+    if venue and venue not in (entry.get("available_at") or []):
+        return None                                    # not available at the active venue — drop
 
     sets = _clamp(_as_int(item.get("sets"), DEFAULT_SETS), MIN_SETS, MAX_SETS)
     rl = _as_int(item.get("reps_low"), DEFAULT_REPS)
@@ -116,7 +121,6 @@ def _build_exercise(item: dict, state: dict) -> dict | None:
     return {
         "name": name,
         "watch_label": entry.get("watch_label", name),
-        "location": entry.get("location", "gym"),
         "garmin": entry.get("garmin"),
         "sets": sets,
         "reps": {"low": rl, "high": rh},
@@ -129,16 +133,30 @@ def _build_exercise(item: dict, state: dict) -> dict | None:
     }
 
 
-# Enforces catalog `pairs_after` constraints (today: Hip Thrust only/immediately after Seated Cable
-# Row — they share the bench at the cable-row station). A dependent whose anchor is absent is DROPPED;
-# one whose anchor is present is re-sequenced to immediately follow it. Generalises to any pairs_after.
-def _enforce_pairings(built: list[dict]) -> list[dict]:
+# Returns an exercise's ACTIVE pairs_after anchor at the given venue, or None. A catalog `pairs_after`
+# may be scoped with `pairs_after_at: [venues]` — outside those venues the pairing does not apply
+# (Hip Thrust pairs after Seated Cable Row only at bangkok_condo; at singapore_gym it's standalone).
+def _active_pairs_after(name: str, venue: str | None) -> str | None:
+    entry = catalog.get_exercise(name)
+    anchor = entry.get("pairs_after")
+    if not anchor:
+        return None
+    scope = entry.get("pairs_after_at")
+    if scope and venue not in scope:
+        return None
+    return anchor
+
+
+# Enforces catalog `pairs_after` constraints active at the venue (e.g. Hip Thrust only/immediately
+# after Seated Cable Row at bangkok_condo). A dependent whose anchor is absent is DROPPED; one whose
+# anchor is present is re-sequenced to immediately follow it. Generalises to any pairs_after.
+def _enforce_pairings(built: list[dict], venue: str | None) -> list[dict]:
     present = {e["name"] for e in built}
     deferred: dict[str, list[dict]] = {}
     base: list[dict] = []
     dropped: list[str] = []
     for ex in built:
-        anchor = catalog.get_exercise(ex["name"]).get("pairs_after")
+        anchor = _active_pairs_after(ex["name"], venue)
         if not anchor:
             base.append(ex)
         elif anchor in present:
@@ -159,11 +177,11 @@ def _enforce_pairings(built: list[dict]) -> list[dict]:
 # Final safety net AFTER the MAX_EXERCISES truncation: drops any dependent whose pairs_after anchor
 # got cut by the cap (anchors carry no pairs_after, so they are never dropped here) — guarantees the
 # pairing invariant holds in the emitted plan even when the model proposes more than the cap.
-def _drop_orphaned_pairs(exercises: list[dict]) -> list[dict]:
+def _drop_orphaned_pairs(exercises: list[dict], venue: str | None) -> list[dict]:
     names = {e["name"] for e in exercises}
     kept, dropped = [], []
     for ex in exercises:
-        anchor = catalog.get_exercise(ex["name"]).get("pairs_after")
+        anchor = _active_pairs_after(ex["name"], venue)
         if anchor and anchor not in names:
             dropped.append(ex["name"])
         else:
@@ -171,6 +189,13 @@ def _drop_orphaned_pairs(exercises: list[dict]) -> list[dict]:
     if dropped:
         log_event(logger, logging.INFO, "strength_pairing_dropped_post_truncation", exercises=dropped)
     return kept
+
+
+# Stable ordering by exercise role — compounds first, core last (replaces the old gym/apartment split
+# now that B trains at one venue). Python's stable sort preserves the model's relative order within a
+# role, so a pairing (anchor + dependent, made adjacent by _enforce_pairings, same role tier) stays put.
+def _order_by_role(built: list[dict]) -> list[dict]:
+    return sorted(built, key=lambda e: _ROLE_RANK.get(catalog.get_exercise(e["name"]).get("role"), 2))
 
 
 # Rough session duration estimate (minutes): per set, ~3.5s/rep work (bounded) + the rest, +45s setup
@@ -201,11 +226,10 @@ def plan_session(state: dict, model: str = MODEL_PRO) -> dict:
         seen.add(ex["name"])
         built.append(ex)
 
-    built = _enforce_pairings(built)
-    gym = [e for e in built if e["location"] != "apartment"]
-    apartment = [e for e in built if e["location"] == "apartment"]
-    ordered = (gym + apartment)[:MAX_EXERCISES]         # gym first, apartment last
-    ordered = _drop_orphaned_pairs(ordered)             # the cap must not strand a dependent from its anchor
+    venue = state.get("venue") or catalog.default_venue()
+    built = _enforce_pairings(built, venue)
+    ordered = _order_by_role(built)[:MAX_EXERCISES]     # compounds first, core last (one venue, no home split)
+    ordered = _drop_orphaned_pairs(ordered, venue)      # the cap must not strand a dependent from its anchor
     if not ordered:
         raise ValueError("planner produced no valid exercises")
 

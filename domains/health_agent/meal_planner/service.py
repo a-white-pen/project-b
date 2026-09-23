@@ -27,7 +27,7 @@ from domains.health_agent.meal_planner import persistence, render, solver
 from domains.health_agent.meal_planner import prompt as meal_prompt
 from domains.health_agent.week_planner import meal_assign
 from domains.health_agent.week_planner import persistence as week_persistence
-from domains.health_agent.goals import fixed_intake_config, load_goals, nutrition_config
+from domains.health_agent.goals import fixed_intake_config, load_goals, mode_config, nutrition_config
 from system.llm import (MODEL_FLASH, MODEL_FLASH_LITE, generate_json,
                         generate_json_reasoning, generate_with_image, generate_with_images,
                         parse_json_response)
@@ -44,7 +44,7 @@ _MACROS = ("kcal", "protein_g", "carbs_g", "fat_g", "fibre_g")
 # Statuses whose card is pinned kind='meal' (each carries the "your day" table): a real order, the
 # own-food guide, and the all-eaten / at-limit end-of-day summaries. compose_failed (an error) is NOT
 # pinned. Only 'planned' is quote-correctable (nothing to re-plan once eaten / at limit).
-_PINNED_STATUSES = ("planned", "own_food", "all_eaten", "at_limit")
+_PINNED_STATUSES = ("planned", "own_food", "all_eaten", "at_limit", "staple_topup")
 
 
 # Display label for one fixed-intake fuel item, e.g. "banana ×2", "flaxseed 10g", "full cream milk".
@@ -217,13 +217,13 @@ def _gap_fill_staples(slots: dict) -> None:
                 it.pop("food_item", None)            # don't persist the temp anchor into meal_plan.items
 
 
-# Plans the day's un-eaten meal slots. Output dict always has: status, shop, remaining, report. When
-# status=='planned' it also has slots {slot:[items]}, projected {macros}, note. The card/persist layer
-# (next module) renders + writes from this. status in:
-#   planned     -> a shop card to render + meal_plan rows to write
-#   all_eaten   -> both slots already recorded; nothing to do
-#   own_food    -> no shop today -> /suggest_food guidance (spec G)
-#   at_limit    -> no budget / nothing fits -> suggest skip or a light staple
+# Plans the day's un-eaten meal slots. Output dict has status + remaining + report; the shop-planning
+# statuses also carry shop/slots/projected/note. status in:
+#   planned      -> a shop card to render + meal_plan rows to write
+#   all_eaten    -> both slots already recorded; nothing to do
+#   own_food     -> no shop today -> /suggest_food guidance (spec G)
+#   at_limit     -> no budget / nothing fits -> suggest skip or a light staple
+#   staple_topup -> Singapore mode (b_extended_plans_meals off): a fridge staple top-up; NO shop key
 #   compose_failed -> the compose LLM call failed (caller falls back to guidance)
 def plan_meals(plan_date, tz_name: str, notify=None, correction: str | None = None,
                model: str = MODEL_FLASH, avoid_current_shop: bool = False,
@@ -265,6 +265,22 @@ def plan_meals(plan_date, tz_name: str, notify=None, correction: str | None = No
     target = inp["macro_target"] or macros.build_macro_target(
         int(cfg["seed_maintenance"]) - int(cfg["DEFICIT"]), "rest", None, cfg)
     remaining = solver.compute_remaining(target, consumed)
+
+    # Singapore mode (b_extended doesn't plan shop meals): B self-orders lunch+dinner and logs them, so
+    # /plan meals is a deterministic STAPLE TOP-UP advisor — suggest home staples to fill the day's
+    # remaining protein/fibre within the kcal ceiling, from what's logged so far + today's reserved fuel.
+    # Skips the whole shop/palette/rotation/LLM path. Today-only, on demand (the 11am cron is paused in SG).
+    if not mode_config().get("b_extended_plans_meals", True):
+        topup = solver.suggest_staples(remaining, staples)
+        projected = {m: round((consumed.get(m) or 0) + (topup["added"].get(m) or 0)) for m in _MACROS}
+        log_event(logger, logging.INFO, "meal_staple_topup", plan_date=str(plan_date),
+                  staples=[s["item_name"] for s in topup["staples"]])
+        return {"status": "staple_topup", "remaining": remaining, "topup": topup["staples"],
+                "topup_added": topup["added"], "projected": projected, "report": [],
+                "eaten": inp["consumed"], "eaten_by_meal": inp["eaten_by_meal"], "reserved": reserved,
+                "target_macros": target, "day_type": target.get("day_type"),
+                "fuel_items": _fuel_items(inp["activity_type"], fixed),
+                "workout_label": "Strength food" if "strength" in (inp["activity_type"] or []) else "Run food"}
 
     # Protein rotation state (BRIEF §5): weekly proteins are judged Mon-Sun; a ">=1 per 2wk" spec (duck)
     # over LAST Monday..this Sunday — the same split the weekly reflection uses, so duck eaten last week

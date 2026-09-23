@@ -18,6 +18,7 @@ render the eating-on-your-own guide (spec G, suggest2 redesign).
 Functions:
   render_meal_card(result) -> (text, reply_markup|None)
   render_suggest(result) -> str    # spec G — eating-on-your-own guide
+  render_staple_topup(result) -> str   # Singapore staple top-up card (no shop, no buttons)
 """
 
 from domains.health_agent.meal_planner import solver
@@ -191,6 +192,8 @@ def render_meal_card(result: dict) -> tuple:
         return "⚠️ Couldn't put a meal together just now — tap 🍽️ Meal again in a moment.", None
     if status == "own_food":
         return render_suggest(result), None
+    if status == "staple_topup":
+        return render_staple_topup(result), None
     if status == "at_limit":
         slots = " + ".join(result.get("slots_to_plan") or []) or "the rest of today"
         staples = "(2 boiled eggs · 150g greek yoghurt · edamame)"
@@ -289,6 +292,41 @@ def render_suggest(result: dict) -> str:
         lines.append(f"<b>🥩 Prioritise</b> {_esc(pretty)} <i>(still owed this week)</i>")
     if result.get("staples"):
         lines.append("<b>🏠 Home staples</b> · 2–3 boiled eggs · 150g greek yoghurt · edamame")
+    fuel = result.get("fuel_items") or []
+    if fuel:
+        lines += ["", f"<b>{_fuel_header(result.get('workout_label'))}</b> <i>· not eaten yet</i>",
+                  _esc(" · ".join(fuel))]
+    return "\n".join(lines)
+
+
+# Staple top-up card (Singapore mode — b_extended doesn't plan shop meals). Shows the shared day block
+# (eaten + reserved fuel vs target / still-to-eat) then a concrete home-staple suggestion to close the
+# remaining protein/fibre + what it adds. No shop, no buttons — B self-orders lunch/dinner + logs them.
+def render_staple_topup(result: dict) -> str:
+    day_label = _DAY_TYPE_LABEL.get(result.get("day_type"), "today")
+    lines = [
+        f"<b>🏠 Fridge top-up</b> · <i>{_esc(day_label)}</i>",
+        "",
+        _day_table(result),
+        "<i>protein &amp; fibre are the priority · carbs flexible</i>",
+        "",
+    ]
+    topup = result.get("topup") or []
+    if topup:
+        picks = " · ".join(_esc(solver.staple_label(s)) for s in topup)
+        add = result.get("topup_added") or {}
+        lines.append(f"<b>➕ Top up with</b> · {picks}")
+        lines.append(f"<i>adds ~{round(add.get('protein_g') or 0)}P · "
+                     f"{round(add.get('fibre_g') or 0)} fib · {round(add.get('kcal') or 0)} kcal</i>")
+    else:
+        rem = result.get("remaining") or {}
+        prot_gap = round((rem.get("protein_g") or {}).get("low") or 0)
+        fib_gap = round((rem.get("fibre_g") or {}).get("target") or 0)
+        if prot_gap or fib_gap:      # empty because nothing fits under the kcal ceiling — NOT because covered
+            lines.append(f"<b>⚠️ No calorie room to top up</b> — still short {prot_gap}P · {fib_gap} fib, "
+                         "but you're at today's kcal ceiling.")
+        else:
+            lines.append("<b>✓ No fridge top-up needed</b> — protein &amp; fibre are covered.")
     fuel = result.get("fuel_items") or []
     if fuel:
         lines += ["", f"<b>{_fuel_header(result.get('workout_label'))}</b> <i>· not eaten yet</i>",

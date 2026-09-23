@@ -20,6 +20,7 @@ Functions:
   select_items(meal_row, kind, ref) -> (items, already)   # ✓Ate: which items to post + idempotency (ref=dish idx/staple name)
   owed_proteins(tally, rotation_cfg) -> list   # proteins still owed this week (rotation nudge / suggest)
   owed_proteins_split(week_tally, fortnight_tally, rotation_cfg) -> list   # "per 2wk" specs judged on the fortnight
+  suggest_staples(remaining, staples_cfg) -> dict   # Singapore top-up: staples to fill remaining protein/fibre
   parse_serving(serving) -> (amount, unit)     # "150 g" -> (150.0, "g"); "1 egg" -> (1.0, "egg")
   staple_label(item) -> str                    # card/button label, e.g. "edamame 150 g" / "2× boiled_egg"
   dish_label(item) -> str                      # main-dish button label, e.g. "B10 Tender Chicken Teriyaki"
@@ -343,3 +344,48 @@ def owed_proteins_split(week_tally: dict, fortnight_tally: dict, rotation_cfg: d
     week_tally, fortnight_tally = week_tally or {}, fortnight_tally or {}
     return [p for p, spec in (rotation_cfg or {}).items()
             if ((fortnight_tally if "2wk" in str(spec) else week_tally).get(p, 0)) < _min_count(spec)]
+
+
+# STAPLE TOP-UP (Singapore mode — b_extended doesn't plan shop meals). B self-orders + logs lunch/dinner;
+# this deterministically suggests home staples to fill the day's REMAINING protein (to the floor) and fibre
+# (to target) WITHOUT busting the kcal ceiling — greedy by protein/fibre-per-kcal, each staple used once at
+# its max serving. Pure. Input: remaining = compute_remaining output; staples_cfg = goals home_staples.
+# Output: {"staples": [{item_name, amount, unit, serving, role, <macros>}], "added": {summed macros}}.
+def suggest_staples(remaining: dict, staples_cfg: dict) -> dict:
+    kcal_budget = (remaining.get("kcal") or {}).get("high") or 0
+    protein_gap = (remaining.get("protein_g") or {}).get("low") or 0
+    fibre_gap = (remaining.get("fibre_g") or {}).get("target") or 0
+    cands: list[dict] = []
+    for name, cfg in (staples_cfg or {}).items():
+        serv_amt, unit = parse_serving(cfg.get("serving"))
+        max_amt = serv_amt * int(cfg.get("max_servings", 1))
+        scale = (max_amt / serv_amt) if serv_amt else 1
+        cands.append({"item_name": name, "amount": max_amt, "unit": unit,
+                      "serving": cfg.get("serving"), "role": "staple",
+                      **{m: (cfg.get(m) or 0) * scale for m in _MACROS}})
+    chosen: list[dict] = []
+    added = {m: 0.0 for m in _MACROS}
+    while cands:
+        prot_short = added["protein_g"] < protein_gap
+        fib_short = added["fibre_g"] < fibre_gap
+        if not (prot_short or fib_short):
+            break
+
+        def _score(c):
+            if (c["kcal"] or 0) > kcal_budget - added["kcal"]:      # would bust the day's kcal ceiling
+                return -1.0
+            s = 0.0
+            if prot_short:
+                s += (c["protein_g"] or 0) / max(c["kcal"] or 1, 1)
+            if fib_short:
+                s += (c["fibre_g"] or 0) / max(c["kcal"] or 1, 1)
+            return s
+
+        best = max(cands, key=_score)
+        if _score(best) <= 0:                                       # nothing helps within the kcal ceiling
+            break
+        chosen.append(best)
+        for m in _MACROS:
+            added[m] += best[m] or 0
+        cands.remove(best)
+    return {"staples": chosen, "added": {m: round(added[m], 1) for m in _MACROS}}

@@ -15,7 +15,6 @@ Canonical `plan` schema (also consumed by fit.py and persistence.py) — produce
       {
         "name": str,
         "watch_label": str,
-        "location": "gym" | "apartment",
         "garmin": {"category": int, "code": int} | None,
         "sets": int,
         "reps": {"low": int, "high": int},
@@ -50,7 +49,6 @@ LB_PER_KG = 2.20462
 _HEADER_BG = "#2b3a4a"
 _HEADER_FG = "white"
 _GYM_BG = "#ffffff"
-_APARTMENT_BG = "#eef3f8"     # subtle tint so the at-home block reads as a group
 _ALT_TWEAK = "#f6f8fa"
 
 
@@ -109,7 +107,7 @@ def _title(plan: dict) -> str:
 # Renders the plan as a PNG and returns the image bytes.
 def render_workout_png(plan: dict) -> bytes:
     exercises = plan["exercises"]
-    headers = ["#", "Exercise", "Sets", "Reps", "Weight (kg / lb)", "Rest", "Where"]
+    headers = ["#", "Exercise", "Sets", "Reps", "Weight (kg / lb)", "Rest"]
     rows = []
     for i, ex in enumerate(exercises, 1):
         rows.append([
@@ -119,7 +117,6 @@ def render_workout_png(plan: dict) -> bytes:
             _reps_cell(ex),
             _weight_cell(ex),
             _rest_cell(ex),
-            "home" if ex.get("location") == "apartment" else "gym",
         ])
 
     n = len(rows)
@@ -139,7 +136,7 @@ def render_workout_png(plan: dict) -> bytes:
     table.set_fontsize(9.5)
     table.scale(1, 1.45)
 
-    col_widths = [0.04, 0.33, 0.07, 0.12, 0.22, 0.11, 0.11]
+    col_widths = [0.04, 0.44, 0.07, 0.12, 0.22, 0.11]
     for c, w in enumerate(col_widths):
         for r in range(n + 1):
             table[r, c].set_width(w)
@@ -150,13 +147,9 @@ def render_workout_png(plan: dict) -> bytes:
         cell.set_facecolor(_HEADER_BG)
         cell.set_text_props(color=_HEADER_FG, fontweight="bold")
 
-    # Body row styling: tint apartment rows; light zebra for gym rows
+    # Body row styling: light zebra striping
     for r in range(1, n + 1):
-        ex = exercises[r - 1]
-        if ex.get("location") == "apartment":
-            bg = _APARTMENT_BG
-        else:
-            bg = _ALT_TWEAK if r % 2 == 0 else _GYM_BG
+        bg = _ALT_TWEAK if r % 2 == 0 else _GYM_BG
         for c in range(len(headers)):
             table[r, c].set_facecolor(bg)
             table[r, c].set_edgecolor("#d0d7de")
@@ -167,8 +160,6 @@ def render_workout_png(plan: dict) -> bytes:
         notes.append("/side = reps per side")
     if any(not ex.get("garmin") for ex in exercises):
         notes.append("* = not synced to watch (no Garmin code) — do it from the table")
-    if any(ex.get("location") == "apartment" for ex in exercises):
-        notes.append("home = 3 kg dumbbells / floor work, done last")
     if notes:
         fig.text(0.04, 0.035, "   ·   ".join(notes), fontsize=7.5, color="#666666", va="bottom")
 

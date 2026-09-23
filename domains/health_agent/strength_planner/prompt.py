@@ -7,7 +7,7 @@ catalog below is STRUCTURAL only (what each exercise is + where she does it + ho
 
 "LLM proposes, code guarantees": the planner (planner.py) then validates the model's picks against
 the catalog, resolves + rounds weights to loadable increments, applies wide sanity clamps, and
-enforces the deterministic rules (apartment-last, Hip-Thrust-after-Row). So this prompt GUIDES; it
+enforces the deterministic rules (compound-first ordering, venue-scoped pairings). So this prompt GUIDES; it
 does not need to be perfectly obeyed.
 
 Stable SYSTEM prefix first (goals + conventions + catalog + output contract), dynamic state JSON
@@ -23,30 +23,41 @@ from domains.health_agent.strength_planner import catalog
 from domains.health_agent.goals import goals_prompt_block, load_goals
 
 
-# One model-friendly line per catalog exercise — STRUCTURAL facts only (no rep/rest/set numbers).
-# The model reads location/pattern/role/equipment to balance the session and decides the prescription.
-def _catalog_block() -> str:
+# One model-friendly line per catalog exercise AT THE ACTIVE VENUE — STRUCTURAL facts only (no
+# rep/rest/set numbers). The model reads pattern/role/equipment to balance the session and decides
+# the prescription. Dumbbell loads show the venue's real unit (kg in Singapore, lb in Bangkok).
+def _catalog_block(venue: str) -> str:
+    venues = catalog.load_catalog()["meta"].get("venues", {})
+    db_unit = ((venues.get(venue, {}) or {}).get("dumbbell", {}) or {}).get("unit", "kg")
     lines = []
-    for e in catalog.load_catalog()["exercises"]:
+    for e in catalog.exercises_for_venue(venue):
         flags = []
         if e.get("reps_per_side"):
             flags.append("per-side")
         if not e.get("garmin"):
             flags.append("no-watch-code")
-        if e.get("pairs_after"):
-            flags.append(f"only-with:{e['pairs_after']}")
-        fixed = e.get("fixed_weight")
+        anchor = e.get("pairs_after")
+        if anchor and venue in (e.get("pairs_after_at") or [venue]):
+            flags.append(f"only-with:{anchor}")
         seed = e.get("seed_weight")
-        if fixed:
-            load = f"fixed {fixed['value']}{fixed.get('unit', 'kg')}"
-        elif e.get("equipment") == "bodyweight":
+        fixed = catalog.active_fixed_weight(e, venue)         # venue-scoped fixed load (e.g. BKK 3 kg pair)
+        if e.get("equipment") == "bodyweight":
             load = "bodyweight"
+        elif e.get("equipment") == "dumbbell":
+            load = f"dumbbell({db_unit})"
         else:
             load = f"{e.get('equipment')}({e.get('load_unit')})"
-            if seed and seed.get("unit") != "bodyweight":
-                load += f", seed {seed['value']}{seed.get('unit')}"
+        if fixed:                                             # forced, non-progressing weight — say so, skip seed
+            load += f", fixed {fixed.get('value')}{fixed.get('unit')}"
+            flags.append("fixed-weight")
+        elif load != "bodyweight" and seed and seed.get("unit") != "bodyweight":
+            sv, su = seed.get("value"), seed.get("unit")          # show the seed in this line's display unit
+            disp = db_unit if e.get("equipment") == "dumbbell" else "kg"
+            if sv is not None and su != disp:
+                sv = round(catalog.lb_to_kg(sv), 1) if su == "lb" else round(catalog.kg_to_lb(sv), 1)
+            load += f", seed {sv}{disp}"
         tail = f" [{', '.join(flags)}]" if flags else ""
-        lines.append(f"- {e['name']} | {e['location']} | {e.get('movement_pattern')} | "
+        lines.append(f"- {e['name']} | {e.get('movement_pattern')} | "
                      f"{e.get('role')} | {load}{tail}")
     return "\n".join(lines)
 
@@ -70,8 +81,8 @@ _OUTPUT_SCHEMA = """Return STRICT JSON only, no prose, no code fences:
     "rest_low_s": <int>, "rest_high_s": <int>,
     "target_weight_kg": <number or null>}
  ]}
-Order exercises as they should be performed (the system enforces apartment-last + Hip-Thrust-after-Row).
-Use target_weight_kg=null for bodyweight or fixed-apartment exercises. For loaded lifts, base it on the
+Order exercises as they should be performed (the system also orders compounds first + enforces venue pairings).
+Use target_weight_kg=null for bodyweight and fixed-weight exercises. For loaded lifts, base it on the
 exercise_history.recent_top_kg in the state (progress conservatively — small jumps, ~1-2 reps in reserve)."""
 
 
@@ -100,8 +111,8 @@ YOU decide, per exercise, from best evidence AND B's data below — reps, sets, 
 {("- B's note for today: " + state["note"]) if state.get("note") else ""}
 {("- B's correction to honour (re-plan accordingly): " + state["correction"]) if state.get("correction") else ""}
 
-Choose exercises ONLY from this catalog, by EXACT name:
-{_catalog_block()}
+Choose exercises ONLY from this catalog (B's active gym), by EXACT name:
+{_catalog_block(state.get("venue") or catalog.default_venue())}
 
 {_OUTPUT_SCHEMA}"""
 

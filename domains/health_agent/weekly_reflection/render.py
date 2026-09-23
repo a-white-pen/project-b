@@ -11,6 +11,7 @@ Functions:
   render_weekly_reflection(data) -> str
 """
 
+from domains.health_agent.goals import mode_config
 from domains.health_agent.meal_planner.solver import owed_proteins
 from domains.health_agent.weekly_reflection import goal_progress as gp
 from system.text import esc as _esc
@@ -195,9 +196,15 @@ def assemble_reflection_data(week_num, calibration, now_avg7, goal_inputs, goals
     band_mid = n["band_mid_kg"]
     mc = goals.get("meal_constraints", {})
     eggs_target = mc.get("eggs_min", 10)
-    spend = _meal_spend(goal_inputs.get("meals"), mc)
-    rotation = _rotation_status(goals.get("meal_constraints", {}).get("protein_rotation", {}),
-                                goal_inputs.get("protein_1wk") or {}, goal_inputs.get("protein_2wk") or {})
+    spend = _meal_spend(goal_inputs.get("meals"), mc)   # None (hidden) when no meals were shop-planned
+    # Protein rotation + fish are a shop-planning concept (Bangkok). In Singapore B self-orders from one
+    # vendor, so there's nothing to rotate — hide it (else Habits reads "beef 0 ✗ · pork 0 ✗ · fish 0 ✗ …").
+    if mode_config().get("b_extended_plans_meals", True):
+        rotation = _rotation_status(goals.get("meal_constraints", {}).get("protein_rotation", {}),
+                                    goal_inputs.get("protein_1wk") or {}, goal_inputs.get("protein_2wk") or {})
+        fish_note = _fish_note(goal_inputs.get("fish_count", 0))
+    else:
+        rotation, fish_note = [], None
 
     run = goal_inputs.get("run")
     run_block = None
@@ -223,7 +230,7 @@ def assemble_reflection_data(week_num, calibration, now_avg7, goal_inputs, goals
         "muscle": muscle_block,
         "weight_goal": {"band_label": wg["label"], "trend_kg": calibration.weight_trend_kg},
         "eggs": {"count": goal_inputs.get("eggs", 0), "target": eggs_target},
-        "fish_note": _fish_note(goal_inputs.get("fish_count", 0)),
+        "fish_note": fish_note,
         "rotation": rotation,
         "spend": spend,
         "narrative": narrative,
