@@ -2,11 +2,25 @@
 
 A personal data and decision-support system. Built for one person.
 
-Tracks nutrition, body metrics, training, attention, and spend. Eventually recommends meals, plans workouts, and automates routine decisions within rules I set — not to automate everything, but to stop spending mental energy on things that have obvious answers if you just look at the data.
+Tracks nutrition, body metrics, training, attention, aligner wear, and spending. It turns those records into meal and workout plans, surfaces useful patterns, and automates routine decisions within rules I set — not to automate everything, but to stop spending mental energy on things that have obvious answers if you just look at the data.
 
 B remains the decision-maker. The system recommends, reminds, prioritizes, and automates within approved rules. B sets the goals and constraints, and can override at any time.
 
 This is not a product. No multi-user support. Not open-source.
+
+<p align="center">
+  <a href="https://www.python.org/"><img height="28" alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&amp;logoColor=white"></a>
+  <a href="https://fastapi.tiangolo.com/"><img height="28" alt="FastAPI" src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi&amp;logoColor=white"></a>
+  <a href="https://ai.google.dev/"><img height="28" alt="Gemini" src="https://img.shields.io/badge/LLM-Gemini-8E75B2?logo=googlegemini&amp;logoColor=white"></a>
+  <a href="https://core.telegram.org/bots/api"><img height="28" alt="Telegram" src="https://img.shields.io/badge/interface-Telegram-26A5E4?logo=telegram&amp;logoColor=white"></a>
+</p>
+<p align="center">
+  <a href="https://cloud.google.com/"><img height="28" alt="Google Cloud" src="https://img.shields.io/badge/cloud-Google%20Cloud-4285F4?logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://cloud.google.com/run"><img height="28" alt="Cloud Run" src="https://img.shields.io/badge/deploy-Cloud%20Run-4285F4?logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://cloud.google.com/scheduler"><img height="28" alt="Cloud Scheduler" src="https://img.shields.io/badge/scheduler-Cloud%20Scheduler-4285F4?logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://cloud.google.com/sql"><img height="28" alt="Cloud SQL" src="https://img.shields.io/badge/database-Cloud%20SQL-4285F4?logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://www.postgresql.org/"><img height="28" alt="PostgreSQL 16" src="https://img.shields.io/badge/engine-PostgreSQL%2016-4169E1?logo=postgresql&amp;logoColor=white"></a>
+</p>
 
 ---
 
@@ -16,31 +30,30 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 
 | Domain | What it does |
 |---|---|
-| Food | Logs meals via text, voice, or photo (nutrition label scan or visual estimation). Quoted-reply corrections supported. |
-| Weight | Logs weight from text or voice. Range validation. |
-| Sleep/wake | Logs sleep and wake events. Slash commands and voice phrases ("night night", "good morning"). |
-| Location | Stores location updates. Used to resolve timezone for all other domains. |
-| Attention | Starts and finishes attention sessions on a 2-level taxonomy (8 main × 24 subcategories — see `domains/attention/TAXONOMY.md`). Auto-closes previous open session on new start. Compound "finish X and start Y" messages produce two reply bubbles. Per-end-block footer shows the day's total per main category in local timezone. Co-categorisation (e.g. tennis = exercise + social) stored in notes and surfaced in the bubble. Quoted-reply corrections scoped per session. "Wake up" mid-nap closes the nap instead of writing a sleep event. `/attention_status` read command reports the current open session (or the last logged one) plus a "Today so far" monospace ledger — time, a `█` bar, and % of the waking day per main category, with an "untracked" residual. |
-| Exercise | Strava webhook: receives activity events, saves cardio runs/rides/swims/walks to `exercise.cardio_activities`, sends proactive Telegram notifications. Handles create, update, and delete. Strength sessions (WeightTraining/Workout/Crossfit) trigger a Garmin Connect fetch; exercise sets + HR are parsed and saved to `exercise.strength_sessions` / `exercise.strength_sets` with a per-exercise set notification. Everything else (yoga, pilates, climbing, plus unknown future Strava sport_types) lands in `exercise.other_exercises` with its own notification. |
-| Aligner (Invisalign) | IN/OUT wear tracking via a persistent `🦷 IN` / `🍽️ OUT` reply keyboard writing `b.aligner_wear_events`; per-arch tray tracking in `b.aligner_tray_changes` (spawned/reconciled from quoted IN/OUT corrections); `/aligner_status` read command. |
-| Expense *(on `expense-logging`, in live testing — not yet merged)* | Logs spending via text, voice, receipt/payment-screenshot photo, and multi-photo albums to `finances.spend_entries`. SGD home currency; foreign spends keep original currency and auto-resolve to SGD via FIFO over a money-changer pool (`finances.fx_lots`) or actual YouTrip/OCBC screenshot rates. Updates rebuild the row from the whole message thread. Quoted-reply corrections and hard delete supported. |
-
-**In progress:** nutrition data quality (USDA + Open Food Facts integration).
-
-**Stub:** general ask, data query.
+| Food | Logs meals from text, voice, nutrition labels, macro screenshots, and food photos. Preserves user- or label-provided values, uses USDA and Open Food Facts where suitable, and falls back to Gemini estimation. Quoted-reply corrections supported. |
+| Weight | Logs weight from text or voice with range validation. Weight remains a weekly reference only and does not drive calorie targets. |
+| Sleep/wake | Logs sleep and wake events from commands or natural phrases, coordinates with attention sessions, and anchors each nutrition day from wake to next wake. |
+| Location | Stores location updates and resolves the timezone used by the other domains. Planner behaviour can switch between Bangkok and Singapore from one configuration value. |
+| Attention | Tracks one active session at a time across a two-level taxonomy, supports compound finish/start messages and quoted corrections, and reports the waking day's time allocation. |
+| Exercise | Receives Strava activity events. Cardio and other activities are stored directly; strength activities trigger a Garmin Connect fetch for exercises, sets, loads, and heart-rate data. |
+| Aligner | Tracks Invisalign IN/OUT wear, rolling wear time, and independent upper/lower tray timelines through Telegram buttons and quoted corrections. |
+| Expense | Logs spending from text, voice, receipts, payment screenshots, and photo albums. Stores original currency, resolves supported SGD conversions, and supports threaded corrections and deletion. |
+| Health planner | Builds a rolling week around actual training and pinned days, plans meals toward fixed calorie and protein ranges, generates run and strength details, pushes supported workouts to Garmin, and writes a weekly reflection. |
+| Menus | Refreshes supported Bangkok restaurant menus on a weekly schedule and uses the current dishes, prices, and nutrition values for meal planning. |
+| Read APIs | Serves rate-limited nutrition, aligner, weight, spend, location, and sleep views for external visualisations. |
 
 ---
 
-## What it will do
+## Planning and automation
 
-**Decision support**
-- Visualizes patterns across nutrition, training, sleep, spend, and attention
-- Answers questions like "what should I eat today?", "am I hitting my protein target?"
+- `/week` shows the current plan and can rebuild the next eight days around completed sessions and day-specific pins.
+- `/plan` opens the day-of run, strength, and meal planners.
+- Every day targets **1,600–1,700 kcal** and **90–110 g protein**. Fibre is displayed as a soft reference rather than a constraint.
+- Daily nutrition totals run from the first wake on one day to the first wake on the next, with a local 4 a.m. fallback.
+- Cloud Scheduler triggers menu refreshes, meal planning, run and strength details, weekly reflections, and the forward weekly scaffold.
+- Meal, exercise, and week cards remain independently pinned in Telegram and can be corrected by replying to the relevant card.
 
-**Agentic layer (later)**
-- Recommends meals based on nutrition history, targets, and available menus
-- Plans workouts and pushes them to Garmin
-- Eventually places food orders and handles other low-stakes routine decisions
+**Still planned:** proactive reminders, richer general questions and natural-language data queries, and additional low-stakes outbound actions.
 
 ---
 
@@ -48,23 +61,27 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 
 | Layer | Choice |
 |---|---|
-| Database | Cloud SQL Postgres 16, `asia-southeast1` |
+| Runtime | Python 3.13 |
+| Interface | Telegram Bot API |
 | App | FastAPI on Cloud Run, webhook-based |
-| LLM | Gemini via `google-genai` SDK |
-| Async | Cloud Tasks |
-| Secrets | GCP Secret Manager |
+| Database | Cloud SQL for PostgreSQL 16, `asia-southeast1` |
+| LLM | Gemini through the `google-genai` SDK |
+| Scheduling | Cloud Scheduler calling authenticated internal endpoints |
+| Background work | FastAPI background tasks |
+| Secrets | Google Cloud Secret Manager |
 
 ---
 
 ## Repo layout
 
 ```
-telegram/    Telegram bot — receive messages, route, reply
-inbound/     Push-based inbound webhooks from external services (Strava)
-domains/     Business logic per domain (food, weight, sleep, attention, etc.)
-outbound/    Effects to non-Telegram destinations (reminders, calendar — future)
-system/      Shared plumbing: database, config, LLM client, logging
-schema/      Auto-generated data dictionary + dump script
+telegram/    Telegram protocol — receive updates, route messages, send replies
+inbound/     External activity and menu ingestion — Strava, Garmin, restaurant sources
+domains/     Input-agnostic business logic for each domain
+api/         Public read APIs and authenticated internal job endpoints
+outbound/    Effects to non-Telegram destinations — future reminders and calendar actions
+system/      Shared database, configuration, LLM, logging, and auth plumbing
+schema/      Generated data dictionary and its dump script
 ```
 
 ---
@@ -92,9 +109,9 @@ uvicorn app:app --reload
 
 ## Health check
 
-`GET /health` — confirms the app is running and DB is reachable.
+`GET /health` — confirms the app is running and the database is reachable.
 
-Note: `/healthz` is intercepted by GCP infrastructure — always use `/health`.
+Note: `/healthz` is intercepted by Google Cloud infrastructure — always use `/health`.
 
 ```bash
 # Production
