@@ -1,6 +1,19 @@
 # Data Dictionary
 _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py` to refresh._
 
+## Contents
+
+| Schema | Relations |
+|--------|-----------|
+| [`b`](#schema-b) | [`aligner_tray_changes`](#table-baligner_tray_changes) · [`aligner_wear_events`](#table-baligner_wear_events) · [`attention_sessions`](#table-battention_sessions) · [`body_composition`](#table-bbody_composition) · [`latest_location`](#view-blatest_location) · [`location`](#table-blocation) · [`period_days`](#table-bperiod_days) · [`sleep_wake_events`](#table-bsleep_wake_events) · [`weight_measurements`](#table-bweight_measurements) |
+| [`data_visualisation`](#schema-data_visualisation) | [`attention_visualisation`](#view-data_visualisationattention_visualisation) · [`body_aligner_day_visualisation`](#view-data_visualisationbody_aligner_day_visualisation) · [`body_aligner_status_visualisation`](#view-data_visualisationbody_aligner_status_visualisation) · [`body_aligner_tray_visualisation`](#view-data_visualisationbody_aligner_tray_visualisation) · [`body_composition_visualisation`](#view-data_visualisationbody_composition_visualisation) · [`body_weight_visualisation`](#view-data_visualisationbody_weight_visualisation) · [`fuel_day_visualisation`](#view-data_visualisationfuel_day_visualisation) · [`fuel_fast_visualisation`](#view-data_visualisationfuel_fast_visualisation) · [`fuel_item_visualisation`](#view-data_visualisationfuel_item_visualisation) · [`fuel_meal_visualisation`](#view-data_visualisationfuel_meal_visualisation) · [`location_visualisation`](#view-data_visualisationlocation_visualisation) · [`resources_spend_visualisation`](#view-data_visualisationresources_spend_visualisation) · [`resources_window_visualisation`](#view-data_visualisationresources_window_visualisation) · [`sleep_visualisation`](#view-data_visualisationsleep_visualisation) · [`today_fuel_visualisation`](#view-data_visualisationtoday_fuel_visualisation) · [`today_spend_visualisation`](#view-data_visualisationtoday_spend_visualisation) · [`today_training_visualisation`](#view-data_visualisationtoday_training_visualisation) · [`today_window_visualisation`](#view-data_visualisationtoday_window_visualisation) |
+| [`exercise`](#schema-exercise) | [`activities`](#view-exerciseactivities) · [`cardio_activities`](#table-exercisecardio_activities) · [`cardio_plan`](#table-exercisecardio_plan) · [`cardio_splits`](#table-exercisecardio_splits) · [`other_exercises`](#table-exerciseother_exercises) · [`strength_plan`](#table-exercisestrength_plan) · [`strength_sessions`](#table-exercisestrength_sessions) · [`strength_sets`](#table-exercisestrength_sets) |
+| [`external_data`](#schema-external_data) | [`menu_current`](#view-external_datamenu_current) · [`menu_items`](#table-external_datamenu_items) |
+| [`finances`](#schema-finances) | [`fx_lot_allocations`](#table-financesfx_lot_allocations) · [`fx_lots`](#table-financesfx_lots) · [`spend_entries`](#table-financesspend_entries) |
+| [`health_agent`](#schema-health_agent) | [`daily_plan`](#table-health_agentdaily_plan) · [`weekly_reflections`](#table-health_agentweekly_reflections) |
+| [`nutrition`](#schema-nutrition) | [`food_log`](#table-nutritionfood_log) · [`meal_plan`](#table-nutritionmeal_plan) |
+| [`system`](#schema-system) | [`conversation_state`](#table-systemconversation_state) · [`garmin_inbound`](#table-systemgarmin_inbound) · [`garmin_tokens`](#table-systemgarmin_tokens) · [`pinned_messages`](#table-systempinned_messages) · [`strava_inbound`](#table-systemstrava_inbound) · [`telegram_inbound`](#table-systemtelegram_inbound) · [`telegram_outbound`](#table-systemtelegram_outbound) |
+
 ## Schema: `b`
 
 ### Table: `b.aligner_tray_changes`
@@ -51,22 +64,23 @@ One row per continuous primary-attention interval for B. Grain: one activity ses
 | `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp, set by application code when a session is ended or corrected. NULL for rows that have not been changed after insert. |
 | `subcategory` | `text` | no |  | Specific activity within category. Valid (category, subcategory) pairs: work / {deep_work, shallow_work, meetings, learning, planning}; social / {social_in_person, social_messaging, social_broadcast}; self_care / {exercise, personal_care, meditation}; eat / {food_prep, food_collection, eating}; downtime / {rest, entertainment}; admin / {shopping_online, shopping_in_store, errands, life_admin, health_admin}; transit / {commute, travel}; other / {other}. |
 
+### Table: `b.body_composition`
+One row per body-composition scan for B. Grain: one scan. Sparse — gym and clinic machines, not a daily reading. measured_on is a date because the time of day is not recorded and carries no analytical value. device and location are nullable so a reading can be logged before the machine or venue is confirmed.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `body_composition_id` | `integer` | no | nextval('b.body_composition_body_composition_id_seq'::regclass) |  |
+| `measured_on` | `date` | no |  | The day the scan was taken. Primary time dimension. |
+| `body_fat_pct` | `numeric(3,1)` | no |  | Body fat as a percentage of total mass, as reported by the machine. e.g. 28.8. |
+| `device` | `text` | yes |  | The machine that produced the reading. e.g. Boditrax, Visbody, Technogym Checkup. NULL when not confirmed. |
+| `location` | `text` | yes |  | Where the scan was taken. e.g. Fitness First, RQ Sport. NULL when not confirmed. |
+| `notes` | `text` | yes |  | Optional detail or correction note. Excluded from the public feed. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance and lifecycle metadata, matching the other b tables. |
+| `created_at` | `timestamp with time zone` | no | now() | Row insertion timestamp. Use measured_on for all time-series queries. |
+| `updated_at` | `timestamp with time zone` | yes |  | Last mutation timestamp; NULL for rows never changed after insert. |
+
 ### View: `b.latest_location`
 Most recent location B has shared. Used by domain services to get the active timezone for local time-of-day inference. Application code falls back to Asia/Singapore if no rows exist.
-
-**View definition:**
-```sql
-SELECT location_id,
-    telegram_update_id,
-    latitude,
-    longitude,
-    timezone,
-    location_name,
-    created_at
-   FROM b.location
-  ORDER BY created_at DESC
- LIMIT 1;
-```
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -127,205 +141,62 @@ One row per body-weight reading for B. Grain: one measurement. No telegram_updat
 
 ## Schema: `data_visualisation`
 
-### View: `data_visualisation.aligner_visualisation`
-Aligner widget feed (body). wear_events + tray_changes via record_type, rows >=15 min old. Notes excluded.
-
-**View definition:**
-```sql
-SELECT 'wear_event'::text AS record_type,
-    w.aligner_wear_event_id AS id,
-    w.removed_at,
-    w.reinserted_at,
-    w.upper_tray_number,
-    w.lower_tray_number,
-    NULL::text AS arch,
-    NULL::integer AS tray_number,
-    NULL::integer AS planned_days,
-    NULL::timestamp with time zone AS started_at,
-    NULL::timestamp with time zone AS ended_at
-   FROM b.aligner_wear_events w
-  WHERE w.created_at <= (now() - '00:15:00'::interval)
-UNION ALL
- SELECT 'tray_change'::text AS record_type,
-    t.aligner_tray_change_id AS id,
-    NULL::timestamp with time zone AS removed_at,
-    NULL::timestamp with time zone AS reinserted_at,
-    NULL::integer AS upper_tray_number,
-    NULL::integer AS lower_tray_number,
-    t.arch,
-    t.tray_number,
-    t.planned_days,
-    t.started_at,
-    t.ended_at
-   FROM b.aligner_tray_changes t
-  WHERE t.created_at <= (now() - '00:15:00'::interval);
-```
+### View: `data_visualisation.attention_visualisation`
+Attention widget feed (mind). One row per session since the second-most-recent wake (48h floor if there is none), oldest first, rows >=15 min old. category collapses to exercise or meditation where the subcategory says so, otherwise the top-level category. ended_at is null while a session is still open.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `record_type` | `text` | yes |  |  |
-| `id` | `integer` | yes |  |  |
-| `removed_at` | `timestamp with time zone` | yes |  |  |
-| `reinserted_at` | `timestamp with time zone` | yes |  |  |
-| `upper_tray_number` | `integer` | yes |  |  |
-| `lower_tray_number` | `integer` | yes |  |  |
-| `arch` | `text` | yes |  |  |
-| `tray_number` | `integer` | yes |  |  |
-| `planned_days` | `integer` | yes |  |  |
+| `category` | `text` | yes |  |  |
 | `started_at` | `timestamp with time zone` | yes |  |  |
 | `ended_at` | `timestamp with time zone` | yes |  |  |
 
-### View: `data_visualisation.location_visualisation`
-Awake & location widget feed (today). City (from location_name, district dropped) + country (b.location.country, from Nominatim) + timezone. No coordinates.
-
-**View definition:**
-```sql
-SELECT NULLIF(btrim(regexp_replace(location_name, '^.*,'::text, ''::text)), ''::text) AS city,
-    country,
-    timezone
-   FROM b.location
-  WHERE created_at <= (now() - '00:15:00'::interval)
-  ORDER BY created_at DESC
- LIMIT 1;
-```
+### View: `data_visualisation.body_aligner_day_visualisation`
+Aligner day-bar feed (body). One row per local day from treatment start to today, rows >=15 min old. out_segments are the out-of-mouth windows clipped to the day, in minutes from local midnight, ordered; full_minutes is the whole duration of the removal before clipping, which is what the page judges a long removal on. is_tracked is false on a day with no logged events (the bar is drawn as untracked, not as 24h worn). is_partial is true when the day is not a full 24 hours — today, and the treatment-start day.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `city` | `text` | yes |  |  |
-| `country` | `text` | yes |  |  |
-| `timezone` | `text` | yes |  |  |
+| `day_date` | `date` | yes |  |  |
+| `tracked_from_min` | `integer` | yes |  |  |
+| `tracked_to_min` | `integer` | yes |  |  |
+| `worn_minutes` | `integer` | yes |  |  |
+| `is_tracked` | `boolean` | yes |  |  |
+| `is_partial` | `boolean` | yes |  |  |
+| `out_segments` | `jsonb` | yes |  |  |
 
-### View: `data_visualisation.nutrition_visualisation`
-Fuel widget feed. Live view over nutrition.food_log, full history, rows >=15 min old.
-
-**View definition:**
-```sql
-SELECT food_log_id,
-    meal_type,
-    food_item,
-    kcal,
-    protein_g,
-    carbs_g,
-    fat_g,
-    fibre_g,
-    sugar_g,
-    sodium_mg,
-    created_at AS logged_at,
-    now() AS refreshed_at
-   FROM nutrition.food_log f
-  WHERE created_at <= (now() - '00:15:00'::interval);
-```
+### View: `data_visualisation.body_aligner_status_visualisation`
+Aligner header feed (body). Always one row, rows >=15 min old. state is in, out or not_started; since is when that state began. worn_minutes_24h is the rolling 24 hours ending at the delay cutoff, clamped to treatment start.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `food_log_id` | `integer` | yes |  |  |
-| `meal_type` | `text` | yes |  |  |
-| `food_item` | `text` | yes |  |  |
-| `kcal` | `numeric(7,2)` | yes |  |  |
-| `protein_g` | `numeric(6,2)` | yes |  |  |
-| `carbs_g` | `numeric(6,2)` | yes |  |  |
-| `fat_g` | `numeric(6,2)` | yes |  |  |
-| `fibre_g` | `numeric(6,2)` | yes |  |  |
-| `sugar_g` | `numeric(6,2)` | yes |  |  |
-| `sodium_mg` | `numeric(7,2)` | yes |  |  |
-| `logged_at` | `timestamp with time zone` | yes |  |  |
-| `refreshed_at` | `timestamp with time zone` | yes |  |  |
+| `state` | `text` | yes |  |  |
+| `since` | `timestamp with time zone` | yes |  |  |
+| `treatment_days` | `integer` | yes |  |  |
+| `worn_minutes_24h` | `integer` | yes |  |  |
 
-### View: `data_visualisation.sleep_visualisation`
-Awake/asleep state for the today widget. Live view over b.sleep_wake_events, full history, rows >=15 min old.
-
-**View definition:**
-```sql
-SELECT event_type,
-    occurred_at
-   FROM b.sleep_wake_events
-  WHERE created_at <= (now() - '00:15:00'::interval);
-```
+### View: `data_visualisation.body_aligner_tray_visualisation`
+Aligner tray feed (body). One row per tray per arch, rows >=15 min old. days_worn counts local days with the changeover day credited to the incoming tray, so it lines up with planned_days. avg_worn_minutes averages complete tracked days only and is NULL when the tray has none yet. Notes excluded.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `event_type` | `text` | yes |  |  |
-| `occurred_at` | `timestamp with time zone` | yes |  |  |
+| `arch` | `text` | yes |  |  |
+| `tray_number` | `integer` | yes |  |  |
+| `planned_days` | `integer` | yes |  |  |
+| `started_on` | `date` | yes |  |  |
+| `is_current` | `boolean` | yes |  |  |
+| `days_worn` | `integer` | yes |  |  |
+| `avg_worn_minutes` | `integer` | yes |  |  |
 
-### View: `data_visualisation.spend_visualisation`
-Expenses widget feed (resources). Real spends, SGD>0, last ~6 months, rows >=15 min old. English item names only.
-
-**View definition:**
-```sql
-SELECT spend_entry_id,
-    spent_at,
-    merchant_name_raw,
-    platform,
-    category,
-    COALESCE(( SELECT array_agg(t.elem ->> 'name'::text ORDER BY t.ord) AS array_agg
-           FROM jsonb_array_elements(
-                CASE
-                    WHEN jsonb_typeof(s.items_json -> 'lines'::text) = 'array'::text THEN s.items_json -> 'lines'::text
-                    ELSE '[]'::jsonb
-                END) WITH ORDINALITY t(elem, ord)
-          WHERE NULLIF(btrim(t.elem ->> 'name'::text), ''::text) IS NOT NULL), ARRAY[]::text[]) AS items,
-    sgd_amount,
-    fx_rate_source,
-    payment_method
-   FROM finances.spend_entries s
-  WHERE COALESCE(ignored_reason, ''::text) = ''::text AND sgd_amount > 0::numeric AND spent_at >= (now() - '6 mons'::interval) AND created_at <= (now() - '00:15:00'::interval);
-```
+### View: `data_visualisation.body_composition_visualisation`
+Body-fat widget feed (body). One row per scan, oldest first, rows >=15 min old and measured within the last 6 months. source is device and location joined for display. Notes excluded.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
-| `spend_entry_id` | `integer` | yes |  |  |
-| `spent_at` | `timestamp with time zone` | yes |  |  |
-| `merchant_name_raw` | `text` | yes |  |  |
-| `platform` | `text` | yes |  |  |
-| `category` | `text` | yes |  |  |
-| `items` | `text[]` | yes |  |  |
-| `sgd_amount` | `numeric(6,2)` | yes |  |  |
-| `fx_rate_source` | `text` | yes |  |  |
-| `payment_method` | `text` | yes |  |  |
+| `measured_on` | `date` | yes |  |  |
+| `body_fat_pct` | `numeric(3,1)` | yes |  |  |
+| `source` | `text` | yes |  |  |
 
-### View: `data_visualisation.weight_visualisation`
-Weight widget feed (body). One row per local day (first weigh-in), rows >=15 min old.
-
-**View definition:**
-```sql
-WITH eligible AS (
-         SELECT w.measured_at,
-            w.weight_kg
-           FROM b.weight_measurements w
-          WHERE w.created_at <= (now() - '00:15:00'::interval)
-        ), localized AS (
-         SELECT e.measured_at,
-            e.weight_kg,
-            COALESCE(( SELECT l.timezone
-                   FROM b.location l
-                  WHERE l.created_at <= e.measured_at
-                  ORDER BY l.created_at DESC
-                 LIMIT 1), ( SELECT latest_location.timezone
-                   FROM b.latest_location), 'Asia/Singapore'::text) AS tz
-           FROM eligible e
-        ), with_wake AS (
-         SELECT lo.measured_at,
-            lo.weight_kg,
-            (lo.measured_at AT TIME ZONE lo.tz) AS measured_at_local,
-            wake.occurred_at AS wake_at
-           FROM localized lo
-             LEFT JOIN LATERAL ( SELECT e.occurred_at
-                   FROM b.sleep_wake_events e
-                  WHERE e.event_type = 'wake'::text AND e.occurred_at <= lo.measured_at AND e.occurred_at >= (lo.measured_at - '06:00:00'::interval) AND (( SELECT s.event_type
-                           FROM b.sleep_wake_events s
-                          WHERE s.occurred_at < e.occurred_at
-                          ORDER BY s.occurred_at DESC
-                         LIMIT 1)) = 'sleep'::text
-                  ORDER BY e.occurred_at DESC
-                 LIMIT 1) wake ON true
-        )
- SELECT DISTINCT ON ((measured_at_local::date)) measured_at,
-    measured_at_local,
-    weight_kg,
-    round(EXTRACT(epoch FROM measured_at - wake_at) / 60::numeric)::integer AS minutes_after_wake
-   FROM with_wake
-  ORDER BY (measured_at_local::date), measured_at;
-```
+### View: `data_visualisation.body_weight_visualisation`
+Weight widget feed (body). One row per local day, the first weigh-in of that day, rows >=15 min old and measured within the last 6 months. minutes_after_wake is null when no wake event preceded the reading within six hours.
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -334,70 +205,153 @@ WITH eligible AS (
 | `weight_kg` | `numeric(5,2)` | yes |  |  |
 | `minutes_after_wake` | `integer` | yes |  |  |
 
+### View: `data_visualisation.fuel_day_visualisation`
+Fuel day-total feed (fuel). One row per local day over the last 6 months, summed from fuel_item_visualisation. meal_count is the number of distinct meal types logged that day.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `local_day` | `date` | yes |  |  |
+| `meal_count` | `bigint` | yes |  |  |
+| `kcal` | `numeric` | yes |  |  |
+| `protein_g` | `numeric` | yes |  |  |
+| `carbs_g` | `numeric` | yes |  |  |
+| `fat_g` | `numeric` | yes |  |  |
+| `fibre_g` | `numeric` | yes |  |  |
+| `sugar_g` | `numeric` | yes |  |  |
+| `sodium_mg` | `numeric` | yes |  |  |
+
+### View: `data_visualisation.fuel_fast_visualisation`
+Overnight-fast feed (fuel). One row per night for the last 7 nights, rows >=15 min old. night_date attributes a night to the day its sleep began (noon cut-off). last_meal_end and first_meal_start are the nearest eating sessions within 24h either side of the night, null when there is none.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `night_date` | `date` | yes |  |  |
+| `tz` | `text` | yes |  |  |
+| `bed_at` | `timestamp with time zone` | yes |  |  |
+| `wake_at` | `timestamp with time zone` | yes |  |  |
+| `last_meal_end` | `timestamp with time zone` | yes |  |  |
+| `first_meal_start` | `timestamp with time zone` | yes |  |  |
+
+### View: `data_visualisation.fuel_item_visualisation`
+Per-item fuel feed (fuel). One row per logged food item over the last 6 months, rows >=15 min old. tz is the timezone in force when the item was logged; local_day attributes an item to the day of the preceding wake, falling back to its calendar date.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `meal_type` | `text` | yes |  |  |
+| `food_item` | `text` | yes |  |  |
+| `created_at` | `timestamp with time zone` | yes |  |  |
+| `tz` | `text` | yes |  |  |
+| `local_day` | `date` | yes |  |  |
+| `kcal` | `numeric(7,2)` | yes |  |  |
+| `protein_g` | `numeric(6,2)` | yes |  |  |
+| `carbs_g` | `numeric(6,2)` | yes |  |  |
+| `fat_g` | `numeric(6,2)` | yes |  |  |
+| `fibre_g` | `numeric(6,2)` | yes |  |  |
+| `sugar_g` | `numeric(6,2)` | yes |  |  |
+| `sodium_mg` | `numeric(7,2)` | yes |  |  |
+
+### View: `data_visualisation.fuel_meal_visualisation`
+Fuel meal feed (fuel). One row per meal per local day over the last 6 months. items is the food names joined with a middot in log order.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `local_day` | `date` | yes |  |  |
+| `meal_type` | `text` | yes |  |  |
+| `items` | `text` | yes |  |  |
+| `first_logged_at` | `timestamp with time zone` | yes |  |  |
+| `kcal` | `numeric` | yes |  |  |
+| `protein_g` | `numeric` | yes |  |  |
+| `carbs_g` | `numeric` | yes |  |  |
+| `fat_g` | `numeric` | yes |  |  |
+| `fibre_g` | `numeric` | yes |  |  |
+| `sugar_g` | `numeric` | yes |  |  |
+| `sodium_mg` | `numeric` | yes |  |  |
+
+### View: `data_visualisation.location_visualisation`
+Awake & location widget feed (today). City (district dropped from location_name) + country + timezone, rows >=15 min old. Latest row only. No coordinates.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `city` | `text` | yes |  |  |
+| `country` | `text` | yes |  |  |
+| `timezone` | `text` | yes |  |  |
+
+### View: `data_visualisation.resources_spend_visualisation`
+Expenses widget feed (resources). Real spends over the last 6 months — SGD>0, nothing ignored, subscriptions excluded — rows >=15 min old. merchant is the raw name with trailing branch and bracket text stripped; item is the line-item names joined. category collapses to a fixed display set; bucket splits everyday from oneoff (travel, one-off, fitness).
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `spent_at` | `timestamp with time zone` | yes |  |  |
+| `merchant` | `text` | yes |  |  |
+| `item` | `text` | yes |  |  |
+| `category` | `text` | yes |  |  |
+| `bucket` | `text` | yes |  |  |
+| `sgd_amount` | `numeric(6,2)` | yes |  |  |
+| `platform` | `text` | yes |  |  |
+| `local_day` | `date` | yes |  |  |
+
+### View: `data_visualisation.resources_window_visualisation`
+Window bounds for the resources tab. Always one row. record_start is the earliest eligible spend on record, window_start is the 6-month cut-off — the page shows whichever is later.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `record_start` | `date` | yes |  |  |
+| `window_start` | `date` | yes |  |  |
+
+### View: `data_visualisation.sleep_visualisation`
+Sleep widget feed (today). The last 2 sleep periods, oldest first, rows >=15 min old. bed_to and in_bed_min are null while the current sleep has no wake event yet.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `bed_from` | `timestamp with time zone` | yes |  |  |
+| `bed_to` | `timestamp with time zone` | yes |  |  |
+| `in_bed_min` | `integer` | yes |  |  |
+
+### View: `data_visualisation.today_fuel_visualisation`
+Today's macro totals (today). Always one row, summed over items logged since the current wake. Null when nothing is logged yet.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `since` | `timestamp with time zone` | yes |  |  |
+| `kcal` | `numeric` | yes |  |  |
+| `protein_g` | `numeric` | yes |  |  |
+| `carbs_g` | `numeric` | yes |  |  |
+| `fat_g` | `numeric` | yes |  |  |
+| `fibre_g` | `numeric` | yes |  |  |
+| `sugar_g` | `numeric` | yes |  |  |
+| `sodium_mg` | `numeric` | yes |  |  |
+
+### View: `data_visualisation.today_spend_visualisation`
+Today's spend by category (today). One row per category spent on since the current wake.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `category` | `text` | yes |  |  |
+| `sgd_amount` | `numeric` | yes |  |  |
+
+### View: `data_visualisation.today_training_visualisation`
+Today's training feed (today). One row per activity kind either planned for today or already done since the current wake. was_planned marks which; completed_at is the first session of that kind, null if not done yet. plan_status is the plan's own status for strength and cardio, null for other.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `tz` | `text` | yes |  |  |
+| `kind` | `text` | yes |  |  |
+| `was_planned` | `boolean` | yes |  |  |
+| `completed_at` | `timestamp with time zone` | yes |  |  |
+| `plan_status` | `text` | yes |  |  |
+
+### View: `data_visualisation.today_window_visualisation`
+The today window every today-tab view keys off. Always one row: since is the most recent wake, falling back to local midnight, and tz is the active timezone (Asia/Singapore when unknown).
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `since` | `timestamp with time zone` | yes |  |  |
+| `tz` | `text` | yes |  |  |
+
 ## Schema: `exercise`
 
 ### View: `exercise.activities`
 Unified read model at SESSION grain across cardio_activities, strength_sessions, and other_exercises. Columns: kind (cardio/strength/movement) and category (run/walk/ride/swim for cardio; strength for strength; yoga/pilates/climbing/etc. for movement) give two filter levels — agent queries either bucket. Common header columns are present on every row; kind-specific extras (distance_m, total_active_sets, etc.) live in the details JSONB. Drill into per-km splits via source_table=cardio_activities + source_id → exercise.cardio_splits; per-set detail via source_table=strength_sessions + source_id → exercise.strength_sets. Built for agentic consumption — narrow shape minimises NULL noise. For dashboards/ad-hoc SQL, consider querying source tables directly.
-
-**View definition:**
-```sql
-SELECT 'cardio'::text AS kind,
-    cardio_activities.activity_category AS category,
-    cardio_activities.started_at,
-    cardio_activities.timezone,
-    cardio_activities.duration_seconds,
-    cardio_activities.average_heartrate AS avg_hr,
-    cardio_activities.max_heartrate AS max_hr,
-    cardio_activities.calories_kcal,
-    cardio_activities.perceived_exertion,
-    cardio_activities.device_name,
-    'strava'::text AS source_app,
-    cardio_activities.strava_activity_id::text AS source_reference,
-    jsonb_strip_nulls(jsonb_build_object('activity_name', cardio_activities.activity_name, 'sport_type', cardio_activities.sport_type, 'is_treadmill', cardio_activities.is_treadmill, 'moving_seconds', cardio_activities.moving_seconds, 'distance_m', cardio_activities.distance_m, 'elevation_gain_m', cardio_activities.elevation_gain_m, 'average_speed_mps', cardio_activities.average_speed_mps, 'max_speed_mps', cardio_activities.max_speed_mps, 'average_cadence', cardio_activities.average_cadence, 'gear_name', cardio_activities.gear_name)) AS details,
-    'cardio_activities'::text AS source_table,
-    cardio_activities.cardio_activity_id AS source_id,
-    cardio_activities.created_at,
-    cardio_activities.updated_at
-   FROM exercise.cardio_activities
-UNION ALL
- SELECT 'strength'::text AS kind,
-    'strength'::text AS category,
-    strength_sessions.started_at,
-    NULL::text AS timezone,
-    strength_sessions.duration_seconds,
-    strength_sessions.avg_hr,
-    strength_sessions.max_hr,
-    strength_sessions.calories_kcal,
-    strength_sessions.perceived_exertion,
-    strength_sessions.device_name,
-    strength_sessions.source_app,
-    COALESCE(strength_sessions.strava_activity_id::text, strength_sessions.source_activity_id) AS source_reference,
-    jsonb_strip_nulls(jsonb_build_object('activity_name', strength_sessions.activity_name, 'total_active_sets', strength_sessions.total_active_sets, 'total_exercises', strength_sessions.total_exercises)) AS details,
-    'strength_sessions'::text AS source_table,
-    strength_sessions.strength_session_id AS source_id,
-    strength_sessions.created_at,
-    strength_sessions.updated_at
-   FROM exercise.strength_sessions
-UNION ALL
- SELECT 'movement'::text AS kind,
-    other_exercises.activity_type AS category,
-    other_exercises.started_at,
-    other_exercises.timezone,
-    other_exercises.duration_seconds,
-    other_exercises.avg_hr,
-    other_exercises.max_hr,
-    other_exercises.calories_kcal,
-    other_exercises.perceived_exertion,
-    other_exercises.device_name,
-    other_exercises.source_app,
-    COALESCE(other_exercises.strava_activity_id::text, other_exercises.source_activity_id) AS source_reference,
-    jsonb_strip_nulls(jsonb_build_object('activity_name', other_exercises.activity_name)) AS details,
-    'other_exercises'::text AS source_table,
-    other_exercises.other_exercise_id AS source_id,
-    other_exercises.created_at,
-    other_exercises.updated_at
-   FROM exercise.other_exercises;
-```
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -593,23 +547,6 @@ One row per active set in a strength session. REST periods from Garmin are folde
 ### View: `external_data.menu_current`
 Most recent successful menu batch per restaurant. Use this for agent meal-planning queries. Partial-failure tolerant: if a shop fails this run, its last-good batch is still returned. item_name_en holds the best available name — English from source when available, Thai script otherwise.
 
-**View definition:**
-```sql
-SELECT restaurant_name,
-    item_name_en,
-    category,
-    price_sgd,
-    price_thb,
-    kcal,
-    protein_g,
-    carbs_g,
-    fat_g
-   FROM external_data.menu_items m
-  WHERE scraped_at = (( SELECT max(menu_items.scraped_at) AS max
-           FROM external_data.menu_items
-          WHERE menu_items.restaurant_name = m.restaurant_name));
-```
-
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
 | `restaurant_name` | `text` | yes |  |  |
@@ -718,6 +655,7 @@ The 7-day spine: one row per planned day. Holds the day's activity kinds, the me
 | `meta` | `jsonb` | no | '{}'::jsonb | Provenance/debug, e.g. {"model":"...","scaffold_run_id":"..."}. |
 | `created_at` | `timestamp with time zone` | no | now() | Insertion time. |
 | `updated_at` | `timestamp with time zone` | yes |  | Last mutation; set ONLY on a real change (never a blanket update). |
+| `unavailable_items` | `jsonb` | no | '{}'::jsonb | Day-of sold-out/unavailable dishes per shop, {shop_name: [item_name,...]}, learned from meal corrections (text or menu photo); filtered out of the compose palette. |
 
 ### Table: `health_agent.weekly_reflections`
 One row per ISO week. Stores the weekly health reflection narrative and carry-forward planner guidance. Weight is read separately for display and does not determine calorie targets or planning direction.
