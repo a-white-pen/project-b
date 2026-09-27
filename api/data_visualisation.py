@@ -1,22 +1,22 @@
 """
-Public read API for data visualisation consumers (the awhitepen.com dashboard).
+Public read API for the awhitepen.com status dashboards.
 
-All endpoints are served live from views in the data_visualisation schema — no snapshot
-tables, no refresh job. The legacy /nutrition read route is retained transitionally,
-being retired once the dashboard moves to /nutrition-new.
+One endpoint per tab: /today, /body, /fuel, /resources. Each runs its tab's
+statements on a single connection and returns {"refreshed_at", "data"}.
+
+Two rules shape this file. Anything expressible in SQL belongs in the view, so
+the functions here only rename columns and serialize types. And a tab is sent
+only what it draws — a field nothing renders is a field that should not leave
+the database.
 
 Functions:
-  register_routes(app)        — registers the public read routes
-  _fetch_nutrition()          — (legacy) reads the nutrition view; returns (rows, refreshed_at)
-  _fetch_nutrition_view()     — reads the nutrition view for /nutrition-new; returns (rows, refreshed_at)
-  _fetch_aligner()            — queries the aligner view; returns (wear_events, tray_changes)
-  _fetch_weight()             — queries the weight view; returns contract-shaped rows
-  _fetch_spend()              — queries the spend view; returns contract-shaped rows
-  _fetch_location()           — queries the location view; returns {city, country, timezone}
-  _fetch_sleep()              — queries the sleep view; returns reported sleep/wake events
-  _get_cors_origin(request)   — returns the allowed CORS origin matching the request origin
-  _get_global_key_*(request)  — per-endpoint buckets for the 1000/day per-instance rate cap
-  _iso_utc(dt) / _now_iso()   — UTC ISO-8601 (Z) serialization helpers
+  register_routes(app)        — mounts the four routes and their rate limits
+  rate_limit_handler(req, e)  — re-adds CORS to slowapi's 429 so a browser can read it
+  _get_cors_headers(request)  — builds the shared CORS response headers
+  _serve(request, name, fn)   — runs a fetcher, wraps it in the response envelope
+  _query(*statements)         — runs statements on one connection, in order
+  _fetch_<tab>()              — one per tab; assembles that tab's payload
+  _shape_<view>()             — one per view; column names in, JSON out
 """
 
 import asyncio
@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+
+from slowapi import _rate_limit_exceeded_handler
 
 from api.limiter import limiter
 from system.db import get_connection
@@ -37,49 +39,165 @@ _ALLOWED_ORIGINS = {
     "http://awhitepen-local.local",
 }
 
+# Coarse current location for the footer and tab clock. TODAY also names the
+# country; the other three tabs do not, so they ask for less.
+_SQL_PLACE = """
+    SELECT city, timezone
+    FROM data_visualisation.location_visualisation
+"""
 
-# Returns a fixed string so all callers share one rate-limit bucket within this process.
-# Used by the 1000/day per-instance cap on the nutrition read endpoint.
-# Note: slowapi uses in-memory storage, so this cap is per Cloud Run instance,
-# not globally shared across instances. Acceptable for a low-traffic personal dashboard.
-def _get_global_key(request: Request) -> str:
-    return "global_dv_nutrition"
+_SQL_LOCATION = """
+    SELECT city, country, timezone
+    FROM data_visualisation.location_visualisation
+"""
+
+_SQL_SLEEP = """
+    SELECT bed_from, bed_to, in_bed_min
+    FROM data_visualisation.sleep_visualisation
+    ORDER BY bed_from
+"""
+
+_SQL_ATTENTION = """
+    SELECT category, started_at, ended_at
+    FROM data_visualisation.attention_visualisation
+    ORDER BY started_at
+"""
+
+_SQL_WEIGHT = """
+    SELECT measured_at, measured_at_local, weight_kg, minutes_after_wake
+    FROM data_visualisation.body_weight_visualisation
+    ORDER BY measured_at_local
+"""
+
+_SQL_COMPOSITION = """
+    SELECT measured_on, body_fat_pct, source
+    FROM data_visualisation.body_composition_visualisation
+    ORDER BY measured_on
+"""
+
+_SQL_ALIGNER_STATUS = """
+    SELECT state, since, treatment_days, worn_minutes_24h
+    FROM data_visualisation.body_aligner_status_visualisation
+"""
+
+_SQL_ALIGNER_DAYS = """
+    SELECT day_date, tracked_from_min, tracked_to_min, worn_minutes,
+           is_partial, out_segments
+    FROM data_visualisation.body_aligner_day_visualisation
+    ORDER BY day_date
+"""
+
+_SQL_ALIGNER_TRAYS = """
+    SELECT arch, tray_number, planned_days, started_on,
+           is_current, days_worn, avg_worn_minutes
+    FROM data_visualisation.body_aligner_tray_visualisation
+    ORDER BY arch, tray_number
+"""
+
+_SQL_FUEL_DAYS = """
+    SELECT local_day, meal_count,
+           kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg
+    FROM data_visualisation.fuel_day_visualisation
+    ORDER BY local_day
+"""
+
+_SQL_FUEL_FAST = """
+    SELECT night_date, tz, bed_at, wake_at, last_meal_end, first_meal_start
+    FROM data_visualisation.fuel_fast_visualisation
+    ORDER BY bed_at
+"""
+
+_SQL_FUEL_MEALS = """
+    SELECT local_day, meal_type, items,
+           kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg
+    FROM data_visualisation.fuel_meal_visualisation
+    ORDER BY local_day, first_logged_at
+"""
+
+_SQL_TODAY_WINDOW = """
+    SELECT since
+    FROM data_visualisation.today_window_visualisation
+"""
+
+_SQL_TODAY_FUEL = """
+    SELECT kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg
+    FROM data_visualisation.today_fuel_visualisation
+"""
+
+_SQL_TODAY_TRAINING = """
+    SELECT kind, was_planned, completed_at, plan_status
+    FROM data_visualisation.today_training_visualisation
+    ORDER BY kind
+"""
+
+_SQL_TODAY_SPEND = """
+    SELECT category, sgd_amount
+    FROM data_visualisation.today_spend_visualisation
+    ORDER BY sgd_amount DESC
+"""
+
+_SQL_TODAY_WEIGHT = """
+    SELECT measured_at, weight_kg
+    FROM data_visualisation.body_weight_visualisation
+    ORDER BY measured_at DESC
+    LIMIT 1
+"""
+
+_SQL_TODAY_COMPOSITION = """
+    SELECT measured_on, body_fat_pct
+    FROM data_visualisation.body_composition_visualisation
+    ORDER BY measured_on DESC
+    LIMIT 1
+"""
+
+_SQL_RESOURCES_SPEND = """
+    SELECT local_day, merchant, item, category, bucket, sgd_amount, platform
+    FROM data_visualisation.resources_spend_visualisation
+    ORDER BY spent_at
+"""
+
+_SQL_RESOURCES_WINDOW = """
+    SELECT record_start, window_start
+    FROM data_visualisation.resources_window_visualisation
+"""
 
 
-# Returns the request's Origin if it is on the allowlist, else the primary production origin.
-# Used to set Access-Control-Allow-Origin without exposing a wildcard.
+# Returns the request's Origin when it is allowed, otherwise the production origin.
+# Used to build an explicit Access-Control-Allow-Origin value without a wildcard.
 def _get_cors_origin(request: Request) -> str:
     origin = request.headers.get("origin", "")
     return origin if origin in _ALLOWED_ORIGINS else "https://www.awhitepen.com"
 
 
-# Per-endpoint buckets for the 1000/day per-instance cap, so a spike on one
-# endpoint does not eat another's allowance. Same in-memory caveat as nutrition.
-def _get_global_key_aligner(request: Request) -> str:
-    return "global_dv_aligner"
+# Builds the CORS headers shared by successful, failed and rate-limited responses.
+# Vary prevents a cache from serving one allowed origin's response to the other.
+def _get_cors_headers(request: Request) -> dict[str, str]:
+    return {
+        "Access-Control-Allow-Origin": _get_cors_origin(request),
+        "Vary": "Origin",
+    }
 
 
-def _get_global_key_weight(request: Request) -> str:
-    return "global_dv_weight"
+# slowapi answers a 429 without going through _serve, so the response carries no
+# Access-Control-Allow-Origin. A browser then refuses to read it, fetch rejects with
+# no status attached, and the page reports a network failure instead of a rate limit.
+# Re-add the same CORS headers as successful responses, for these routes only.
+def rate_limit_handler(request: Request, exc):
+    response = _rate_limit_exceeded_handler(request, exc)
+
+    if request.url.path.startswith("/api/data-visualisation/"):
+        response.headers.update(_get_cors_headers(request))
+
+    return response
 
 
-def _get_global_key_spend(request: Request) -> str:
-    return "global_dv_spend"
-
-
-def _get_global_key_nutrition_new(request: Request) -> str:
-    return "global_dv_nutrition_new"
-
-
-def _get_global_key_location(request: Request) -> str:
-    return "global_dv_location"
-
-
-def _get_global_key_sleep(request: Request) -> str:
-    return "global_dv_sleep"
-
-
-_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+# Builds the key function for the 1000/day cap. One bucket per endpoint, so a spike
+# on one does not eat another's allowance. slowapi stores counts in memory, so the
+# cap is per Cloud Run instance rather than global.
+def _bucket(name: str):
+    def key(request: Request) -> str:
+        return f"global_dv_{name}"
+    return key
 
 
 # Serializes a tz-aware datetime to UTC ISO-8601 with a Z suffix; passes through None.
@@ -94,409 +212,477 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# Runs the statements on one connection, in order. Returns (rows, column names)
+# per statement, so a tab that reads several views costs one connection.
+def _query(*statements: str) -> list[tuple[list[tuple], list[str]]]:
+    conn = get_connection()
+    try:
+        results = []
+        with conn.cursor() as cur:
+            for sql in statements:
+                cur.execute(sql)
+                results.append((cur.fetchall(), [d[0] for d in cur.description]))
+        return results
+    finally:
+        conn.close()
+
+
+# Runs a fetcher off the event loop and wraps the result in the response envelope.
+# name is used for the log events and appears in nothing the caller sees.
+async def _serve(request: Request, name: str, fetch) -> JSONResponse:
+    cors_headers = _get_cors_headers(request)
+
+    try:
+        payload = await asyncio.to_thread(fetch)
+    except Exception as e:
+        log_failure(logger, logging.ERROR, f"{name}_fetch_failed", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal Server Error",
+            headers=cors_headers,
+        )
+
+    log_event(logger, logging.INFO, f"{name}_served",
+              origin=request.headers.get("origin", ""))
+
+    response = JSONResponse(content={"refreshed_at": _now_iso(), "data": payload})
+    response.headers.update(cors_headers)
+    return response
+
+
 # Registers the public read routes onto the FastAPI app.
-# Called from app.py during startup alongside other inbound route registrations.
+# Called from app.py during startup alongside the inbound route registrations.
 def register_routes(app: FastAPI) -> None:
 
-    @app.get("/api/data-visualisation/nutrition", status_code=status.HTTP_200_OK)
+    @app.get("/api/data-visualisation/today", status_code=status.HTTP_200_OK)
     @limiter.limit("5/minute")
     @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key)
-    async def get_nutrition(request: Request) -> JSONResponse:
-        # Returns the rolling 7-day food log snapshot as JSON.
-        # Rate limits: 5/min and 200/day per IP; 1000/day per instance across all callers.
-        # CORS header permits direct browser calls from awhitepen.com.
-        # Inputs: none (reads from data_visualisation.nutrition_visualisation).
-        # Returns: {"refreshed_at": <iso8601>, "data": [<row>, ...]}.
-        try:
-            rows, refreshed_at = await asyncio.to_thread(_fetch_nutrition)
-            log_event(logger, logging.INFO, "nutrition_visualisation_served",
-                      origin=request.headers.get("origin", ""), rows=len(rows))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "nutrition_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    @limiter.limit("1000/day", key_func=_bucket("today"))
+    async def get_today(request: Request) -> JSONResponse:
+        return await _serve(request, "today", _fetch_today)
 
-        response = JSONResponse(content={"refreshed_at": refreshed_at, "data": rows})
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
-
-    @app.get("/api/data-visualisation/nutrition-new", status_code=status.HTTP_200_OK)
+    @app.get("/api/data-visualisation/body", status_code=status.HTTP_200_OK)
     @limiter.limit("5/minute")
     @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_nutrition_new)
-    async def get_nutrition_new(request: Request) -> JSONResponse:
-        # Views-backed replacement for /nutrition: reads the live
-        # data_visualisation.nutrition_visualisation VIEW (full history, 15-min lag).
-        # Same response shape as /nutrition so the frontend can switch URLs directly.
-        # The legacy /nutrition route above is intentionally left untouched (still live).
-        try:
-            rows, refreshed_at = await asyncio.to_thread(_fetch_nutrition_view)
-            log_event(logger, logging.INFO, "nutrition_new_visualisation_served",
-                      origin=request.headers.get("origin", ""), rows=len(rows))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "nutrition_new_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    @limiter.limit("1000/day", key_func=_bucket("body"))
+    async def get_body(request: Request) -> JSONResponse:
+        return await _serve(request, "body", _fetch_body)
 
-        response = JSONResponse(content={"refreshed_at": refreshed_at, "data": rows})
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
-
-    @app.get("/api/data-visualisation/aligner", status_code=status.HTTP_200_OK)
+    @app.get("/api/data-visualisation/fuel", status_code=status.HTTP_200_OK)
     @limiter.limit("5/minute")
     @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_aligner)
-    async def get_aligner(request: Request) -> JSONResponse:
-        # Serves the Invisalign wear events + tray changes from the live view.
-        # Rate limits: 5/min and 200/day per IP; 1000/day per instance.
-        # CORS header permits direct browser calls from awhitepen.com.
-        # Returns: {"refreshed_at": <iso8601>, "wear_events": [...], "tray_changes": [...]}.
-        try:
-            wear_events, tray_changes = await asyncio.to_thread(_fetch_aligner)
-            log_event(logger, logging.INFO, "aligner_visualisation_served",
-                      origin=request.headers.get("origin", ""),
-                      wear_events=len(wear_events), tray_changes=len(tray_changes))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "aligner_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    @limiter.limit("1000/day", key_func=_bucket("fuel"))
+    async def get_fuel(request: Request) -> JSONResponse:
+        return await _serve(request, "fuel", _fetch_fuel)
 
-        response = JSONResponse(content={
-            "refreshed_at": _now_iso(),
-            "wear_events": wear_events,
-            "tray_changes": tray_changes,
+    @app.get("/api/data-visualisation/resources", status_code=status.HTTP_200_OK)
+    @limiter.limit("5/minute")
+    @limiter.limit("200/day")
+    @limiter.limit("1000/day", key_func=_bucket("resources"))
+    async def get_resources(request: Request) -> JSONResponse:
+        return await _serve(request, "resources", _fetch_resources)
+
+
+# Everything the TODAY tab reads, using one connection. The body cells read the same
+# views their own tabs do, narrowed to the newest row: TODAY shows the latest reading
+# whenever it was taken, and dates it itself. Fuel has its own view because TODAY
+# counts food from B's last wake, not from midnight.
+def _fetch_today() -> dict:
+    location, sleep, attention, window, fuel, weight, composition, spend, training = _query(
+        _SQL_LOCATION, _SQL_SLEEP, _SQL_ATTENTION, _SQL_TODAY_WINDOW,
+        _SQL_TODAY_FUEL, _SQL_TODAY_WEIGHT, _SQL_TODAY_COMPOSITION,
+        _SQL_TODAY_SPEND, _SQL_TODAY_TRAINING,
+    )
+    return {
+        "location": _shape_location(*location),
+        "window": _shape_today_window(*window),
+        "sleep": _shape_sleep(*sleep),
+        "attention": _shape_attention(*attention),
+        "fuel": _shape_today_fuel(*fuel),
+        "body": _shape_today_body(weight, composition),
+        "spend": _shape_today_spend(*spend),
+        "training": _shape_today_training(*training),
+    }
+
+
+# The day's planned activity kinds and whether each happened. One entry per kind;
+# the list is empty when nothing is planned and nothing was done. completed_at is
+# the first real session of that kind today, so a session counts as done as soon as
+# it syncs. was_planned is false for a session B did without planning it.
+def _shape_today_training(raw_rows: list[tuple], cols: list[str]) -> dict:
+    items = []
+
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+
+        # A single row with a null kind means the day has no plan and no session.
+        if row["kind"] is None:
+            continue
+
+        items.append({
+            "kind": row["kind"],
+            "was_planned": row["was_planned"],
+            "completed_at": _iso_utc(row["completed_at"]),
+            "plan_status": row["plan_status"],
         })
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
 
-    @app.get("/api/data-visualisation/weight", status_code=status.HTTP_200_OK)
-    @limiter.limit("5/minute")
-    @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_weight)
-    async def get_weight(request: Request) -> JSONResponse:
-        # Serves weigh-ins from the live view as a bare JSON array.
-        # Keys are literal per the dashboard contract ("Date", "Day",
-        # "Weighing Time", "Weight kg", "Minutes After Wake").
-        # Rate limits: 5/min and 200/day per IP; 1000/day per instance.
-        try:
-            rows = await asyncio.to_thread(_fetch_weight)
-            log_event(logger, logging.INFO, "weight_visualisation_served",
-                      origin=request.headers.get("origin", ""), rows=len(rows))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "weight_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        response = JSONResponse(content=rows)
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
-
-    @app.get("/api/data-visualisation/spend", status_code=status.HTTP_200_OK)
-    @limiter.limit("5/minute")
-    @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_spend)
-    async def get_spend(request: Request) -> JSONResponse:
-        # Serves B's variable spend transactions (SGD) from the live view.
-        # Rate limits: 5/min and 200/day per IP; 1000/day per instance.
-        # Returns: {"refreshed_at": <iso8601>, "data": [<row>, ...]}.
-        try:
-            rows = await asyncio.to_thread(_fetch_spend)
-            log_event(logger, logging.INFO, "spend_visualisation_served",
-                      origin=request.headers.get("origin", ""), rows=len(rows))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "spend_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        response = JSONResponse(content={"refreshed_at": _now_iso(), "data": rows})
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
-
-    @app.get("/api/data-visualisation/location", status_code=status.HTTP_200_OK)
-    @limiter.limit("5/minute")
-    @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_location)
-    async def get_location(request: Request) -> JSONResponse:
-        # Serves B's current location (most recent row, >=15 min old) for the dashboard.
-        # Returns {city, country, timezone} — coarse, no coordinates.
-        try:
-            payload = await asyncio.to_thread(_fetch_location)
-            log_event(logger, logging.INFO, "location_visualisation_served",
-                      origin=request.headers.get("origin", ""))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "location_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        response = JSONResponse(content=payload)
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
-
-    @app.get("/api/data-visualisation/sleep", status_code=status.HTTP_200_OK)
-    @limiter.limit("5/minute")
-    @limiter.limit("200/day")
-    @limiter.limit("1000/day", key_func=_get_global_key_sleep)
-    async def get_sleep(request: Request) -> JSONResponse:
-        # Serves reported sleep/wake boundary events for the dashboard.
-        # Returns: {"refreshed_at": <iso8601>, "events": [{event_type, occurred_at}, ...]}.
-        try:
-            events = await asyncio.to_thread(_fetch_sleep)
-            log_event(logger, logging.INFO, "sleep_visualisation_served",
-                      origin=request.headers.get("origin", ""), events=len(events))
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "sleep_visualisation_fetch_failed", e)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        response = JSONResponse(content={"refreshed_at": _now_iso(), "events": events})
-        response.headers["Access-Control-Allow-Origin"] = _get_cors_origin(request)
-        return response
+    return {"items": items}
 
 
-# Queries all rows from data_visualisation.nutrition_visualisation ordered by logged_at.
-# Opens and closes its own connection.
-# Returns: (rows_as_list_of_dicts, refreshed_at_isoformat_string).
-# refreshed_at is extracted from the first row and omitted from individual row dicts.
-# Numeric columns are cast to float; timestamps to ISO 8601 strings for JSON safety.
-def _fetch_nutrition() -> tuple[list[dict], str | None]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT food_log_id, meal_type, food_item,
-                       kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg,
-                       logged_at, refreshed_at
-                FROM data_visualisation.nutrition_visualisation
-                ORDER BY logged_at
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
-    if not raw_rows:
-        return [], None
-
-    refreshed_at = None
-    data = []
-    numeric_cols = {"kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg"}
-
-    for raw in raw_rows:
-        row = dict(zip(cols, raw))
-
-        if refreshed_at is None:
-            refreshed_at = row["refreshed_at"].isoformat()
-        del row["refreshed_at"]
-
-        row["logged_at"] = row["logged_at"].isoformat()
-
-        for col in numeric_cols:
-            if row[col] is not None:
-                row[col] = float(row[col])
-
-        data.append(row)
-
-    return data, refreshed_at
-
-
-# Reads the data_visualisation.nutrition_visualisation VIEW for the /nutrition-new
-# endpoint. Same shape as _fetch_nutrition, kept separate so the legacy snapshot path
-# can be retired later without touching this. Returns (rows, refreshed_at_isoformat).
-def _fetch_nutrition_view() -> tuple[list[dict], str | None]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT food_log_id, meal_type, food_item,
-                       kcal, protein_g, carbs_g, fat_g, fibre_g, sugar_g, sodium_mg,
-                       logged_at, refreshed_at
-                FROM data_visualisation.nutrition_visualisation
-                ORDER BY logged_at
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
-    if not raw_rows:
-        return [], None
-
-    refreshed_at = None
-    data = []
-    numeric_cols = {"kcal", "protein_g", "carbs_g", "fat_g", "fibre_g", "sugar_g", "sodium_mg"}
-
-    for raw in raw_rows:
-        row = dict(zip(cols, raw))
-        if refreshed_at is None:
-            refreshed_at = row["refreshed_at"].isoformat()
-        del row["refreshed_at"]
-        row["logged_at"] = row["logged_at"].isoformat()
-        for col in numeric_cols:
-            if row[col] is not None:
-                row[col] = float(row[col])
-        data.append(row)
-
-    return data, refreshed_at
-
-
-# Queries data_visualisation.aligner_visualisation and splits the union rows into
-# the two contract arrays. Opens and closes its own connection.
-# Timestamps are serialized to UTC ISO-8601 (Z). Notes are not exposed.
-def _fetch_aligner() -> tuple[list[dict], list[dict]]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT record_type, id, removed_at, reinserted_at,
-                       upper_tray_number, lower_tray_number,
-                       arch, tray_number, planned_days, started_at, ended_at
-                FROM data_visualisation.aligner_visualisation
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
-    wear_events: list[dict] = []
-    tray_changes: list[dict] = []
-
-    for raw in raw_rows:
-        row = dict(zip(cols, raw))
-        if row["record_type"] == "wear_event":
-            wear_events.append({
-                "aligner_wear_event_id": row["id"],
-                "removed_at": _iso_utc(row["removed_at"]),
-                "reinserted_at": _iso_utc(row["reinserted_at"]),
-                "upper_tray_number": row["upper_tray_number"],
-                "lower_tray_number": row["lower_tray_number"],
-            })
-        else:
-            tray_changes.append({
-                "aligner_tray_change_id": row["id"],
-                "arch": row["arch"],
-                "tray_number": row["tray_number"],
-                "planned_days": row["planned_days"],
-                "started_at": _iso_utc(row["started_at"]),
-                "ended_at": _iso_utc(row["ended_at"]),
-            })
-
-    # Wear events most-recent-first; tray changes chronological (the widget derives
-    # "first worn" from the earliest started_at).
-    wear_events.sort(key=lambda e: e["removed_at"] or "", reverse=True)
-    tray_changes.sort(key=lambda t: t["started_at"] or "")
-    return wear_events, tray_changes
-
-
-# Queries data_visualisation.weight_visualisation and shapes each row to the
-# dashboard contract (literal keys). Opens and closes its own connection.
-# measured_at_local is the local wall clock (timezone already applied in the view);
-# weight is formatted to 2 decimals; minutes_after_wake is 0 when unknown (NULL),
-# which the widget treats as "hide" (it only shows values > 0 and < 120).
-def _fetch_weight() -> list[dict]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT measured_at_local, weight_kg, minutes_after_wake
-                FROM data_visualisation.weight_visualisation
-                ORDER BY measured_at DESC
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
-    data = []
-    for raw in raw_rows:
-        row = dict(zip(cols, raw))
-        local = row["measured_at_local"]          # naive datetime = local wall clock
-        hour12 = local.hour % 12 or 12
-        ampm = "am" if local.hour < 12 else "pm"
-        maw = row["minutes_after_wake"]
-        data.append({
-            "Date": local.strftime("%Y-%m-%d"),
-            "Day": _DAYS[local.weekday()],
-            "Weighing Time": f"{hour12:02d}:{local.minute:02d} {ampm}",
-            "Weight kg": f"{row['weight_kg']:.2f}",
-            "Minutes After Wake": int(maw) if maw is not None else 0,
-        })
-    return data
-
-
-# Queries data_visualisation.spend_visualisation and shapes each row to the dashboard
-# contract. Opens and closes its own connection. spent_at → UTC ISO-8601 (Z); sgd_amount
-# → 2-decimal string; items → English line-item names already extracted by the view
-# (items_json->lines[].name; name_local and notes are deliberately not exposed).
-def _fetch_spend() -> list[dict]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT spend_entry_id, spent_at, merchant_name_raw, platform,
-                       category, items, sgd_amount, fx_rate_source, payment_method
-                FROM data_visualisation.spend_visualisation
-                ORDER BY spent_at DESC
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
+# What B has spent since she last woke, one row per category, largest first. Empty
+# when she has not spent anything since. One-offs are included. Fixed monthly costs
+# are not here; they are config the front end holds.
+def _shape_today_spend(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
     data = []
     for raw in raw_rows:
         row = dict(zip(cols, raw))
         data.append({
-            "spend_entry_id": row["spend_entry_id"],
-            "spent_at": _iso_utc(row["spent_at"]),
-            "merchant_name_raw": row["merchant_name_raw"],
-            "platform": row["platform"],
             "category": row["category"],
-            "items": row["items"] or [],
-            "sgd_amount": f"{row['sgd_amount']:.2f}",
-            "fx_rate_source": row["fx_rate_source"],
-            "payment_method": row["payment_method"],
+            "sgd_amount": _num(row["sgd_amount"]),
         })
     return data
 
 
-# Reads data_visualisation.location_visualisation (single most-recent row) and returns the
-# minimal contract object {city, country, timezone} — no coordinates. Falls back to
-# Asia/Singapore when no eligible location exists, so the dashboard always has a render clock.
-def _fetch_location() -> dict:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT city, country, timezone
-                FROM data_visualisation.location_visualisation
-            """)
-            raw = cur.fetchone()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
+# The one instant the whole tab dates itself from: B's last wake, falling back to
+# midnight where she is when no wake is on record. Fuel, spending and training all
+# count from it, and the front end measures the activity table from it too.
+def _shape_today_window(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
+        return {"since": None}
 
-    if not raw:
+    return {"since": _iso_utc(dict(zip(cols, raw_rows[0]))["since"])}
+
+
+# Everything logged since B last woke. Always one row; every macro is null when she
+# has eaten nothing since.
+def _shape_today_fuel(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
+        return {"kcal": None, "protein_g": None, "carbs_g": None,
+                "fat_g": None, "fibre_g": None, "sugar_g": None, "sodium_mg": None}
+
+    row = dict(zip(cols, raw_rows[0]))
+    return {
+        "kcal": _num(row["kcal"]),
+        "protein_g": _num(row["protein_g"]),
+        "carbs_g": _num(row["carbs_g"]),
+        "fat_g": _num(row["fat_g"]),
+        "fibre_g": _num(row["fibre_g"]),
+        "sugar_g": _num(row["sugar_g"]),
+        "sodium_mg": _num(row["sodium_mg"]),
+    }
+
+
+# The newest weigh-in and the newest body-fat reading, which are taken on different
+# days by different devices. Either can be null, and the front end dates each one.
+def _shape_today_body(weight, composition) -> dict:
+    w_rows, w_cols = weight
+    c_rows, c_cols = composition
+    data = {"weight_kg": None, "measured_at": None, "body_fat_pct": None, "measured_on": None}
+
+    if w_rows:
+        row = dict(zip(w_cols, w_rows[0]))
+        data["weight_kg"] = _num(row["weight_kg"])
+        data["measured_at"] = _iso_utc(row["measured_at"])
+
+    if c_rows:
+        row = dict(zip(c_cols, c_rows[0]))
+        data["body_fat_pct"] = _num(row["body_fat_pct"])
+        data["measured_on"] = _iso_date(row["measured_on"])
+
+    return data
+
+
+# Where B is, for the tabs that only need a clock and a name for the footer.
+def _shape_place(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
+        return {"city": None, "timezone": "Asia/Singapore"}
+
+    row = dict(zip(cols, raw_rows[0]))
+    return {"city": row["city"], "timezone": row["timezone"]}
+
+
+# A single row, or none. Falls back to Asia/Singapore so the dashboard always has a
+# timezone for its clock.
+def _shape_location(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
         return {"city": None, "country": None, "timezone": "Asia/Singapore"}
 
-    row = dict(zip(cols, raw))
-    return {"city": row["city"], "country": row["country"], "timezone": row["timezone"]}
+    row = dict(zip(cols, raw_rows[0]))
+    return {
+        "city": row["city"],
+        "country": row["country"],
+        "timezone": row["timezone"],
+    }
 
 
-# Reads data_visualisation.sleep_visualisation. Returns reported sleep/wake events ordered
-# chronologically: [{event_type, occurred_at(ISO Z)}, ...].
-def _fetch_sleep() -> list[dict]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT event_type, occurred_at
-                FROM data_visualisation.sleep_visualisation
-                ORDER BY occurred_at
-            """)
-            raw_rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    finally:
-        conn.close()
-
+# The last two nights, oldest first. bed_to and in_bed_min are null on a night that
+# has no wake event yet, which is how the front end tells that B is asleep now.
+def _shape_sleep(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
     data = []
     for raw in raw_rows:
         row = dict(zip(cols, raw))
         data.append({
-            "event_type": row["event_type"],
-            "occurred_at": _iso_utc(row["occurred_at"]),
+            "bed_from": _iso_utc(row["bed_from"]),
+            "bed_to": _iso_utc(row["bed_to"]),
+            "in_bed_min": row["in_bed_min"],
         })
     return data
+
+
+# One row per session, oldest first. ended_at is null on the open session.
+def _shape_attention(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "category": row["category"],
+            "started_at": _iso_utc(row["started_at"]),
+            "ended_at": _iso_utc(row["ended_at"]),
+        })
+    return data
+
+
+# ISO-8601 calendar date from a date or a datetime; passes through None.
+# datetime is a subclass of date, so the narrower check has to come first.
+def _iso_date(value) -> str | None:
+    if value is None:
+        return None
+    return (value.date() if isinstance(value, datetime) else value).isoformat()
+
+
+# Everything the BODY tab reads, using one connection. Location supplies the
+# current city and timezone for the footer and clock; historical dates are already
+# shaped by their views.
+def _fetch_body() -> dict:
+    location, weight, composition, state, days, trays = _query(
+        _SQL_PLACE,
+        _SQL_WEIGHT,
+        _SQL_COMPOSITION,
+        _SQL_ALIGNER_STATUS,
+        _SQL_ALIGNER_DAYS,
+        _SQL_ALIGNER_TRAYS,
+    )
+    return {
+        "location": _shape_place(*location),
+        "weight": _shape_weight(*weight),
+        "composition": _shape_composition(*composition),
+        "aligner_status": _shape_aligner_status(*state),
+        "aligner_days": _shape_aligner_days(*days),
+        "aligner_trays": _shape_aligner_trays(*trays),
+    }
+
+
+# One row per local day B weighed in, oldest first. measured_on is B's own day,
+# the grain the view de-duplicates on; measured_at is the instant, for the clock.
+# minutes_after_wake is null when no wake event was logged before the reading.
+def _shape_weight(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "measured_on": _iso_date(row["measured_at_local"]),
+            "measured_at": _iso_utc(row["measured_at"]),
+            "weight_kg": float(row["weight_kg"]),
+            "minutes_after_wake": row["minutes_after_wake"],
+        })
+    return data
+
+
+# One row per scan, oldest first. source is the machine and venue joined for
+# display, and is null while neither has been confirmed.
+def _shape_composition(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "measured_on": _iso_date(row["measured_on"]),
+            "body_fat_pct": float(row["body_fat_pct"]),
+            "source": row["source"],
+        })
+    return data
+
+
+# The single status row. state is in, out or not_started, and since is when that
+# state began. The fallback keeps the tab renderable before any tray is logged.
+def _shape_aligner_status(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
+        return {
+            "state": "not_started",
+            "since": None,
+            "treatment_days": None,
+            "worn_minutes_24h": None,
+        }
+
+    row = dict(zip(cols, raw_rows[0]))
+    return {
+        "state": row["state"],
+        "since": _iso_utc(row["since"]),
+        "treatment_days": row["treatment_days"],
+        "worn_minutes_24h": row["worn_minutes_24h"],
+    }
+
+
+# One row per local day from treatment start to today, oldest first. out_segments
+# arrives already parsed from jsonb and is empty when no removal overlaps that day.
+# is_partial marks a day that is not a full 24 hours.
+def _shape_aligner_days(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "day_date": _iso_date(row["day_date"]),
+            "tracked_from_min": row["tracked_from_min"],
+            "tracked_to_min": row["tracked_to_min"],
+            "worn_minutes": row["worn_minutes"],
+            "is_partial": row["is_partial"],
+            "out_segments": row["out_segments"],
+        })
+    return data
+
+
+# One row per tray per arch, oldest first. avg_worn_minutes is null until the tray
+# has one complete tracked day.
+def _shape_aligner_trays(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "arch": row["arch"],
+            "tray_number": row["tray_number"],
+            "planned_days": row["planned_days"],
+            "started_on": _iso_date(row["started_on"]),
+            "is_current": row["is_current"],
+            "days_worn": row["days_worn"],
+            "avg_worn_minutes": row["avg_worn_minutes"],
+        })
+    return data
+
+
+# Numeric column as a float. Passes through None, so a macro no item carried that
+# day stays distinguishable from a recorded zero.
+def _num(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+# Everything the FUEL tab reads, using one connection. Location supplies the
+# current city and timezone for the footer and clock. Days and meals cover the
+# last six months; fast covers the last seven nights shown by the fasting card.
+def _fetch_fuel() -> dict:
+    location, days, meals, fast = _query(
+        _SQL_PLACE, _SQL_FUEL_DAYS, _SQL_FUEL_MEALS, _SQL_FUEL_FAST
+    )
+    return {
+        "location": _shape_place(*location),
+        "days": _shape_fuel_days(*days),
+        "meals": _shape_fuel_meals(*meals),
+        "fast": _shape_fuel_fast(*fast),
+    }
+
+
+# One row per wake-based local day, oldest first. local_day is the grain the view
+# groups on. A macro total is null when no item that day carried it.
+def _shape_fuel_days(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "local_day": _iso_date(row["local_day"]),
+            "meal_count": row["meal_count"],
+            "kcal": _num(row["kcal"]),
+            "protein_g": _num(row["protein_g"]),
+            "carbs_g": _num(row["carbs_g"]),
+            "fat_g": _num(row["fat_g"]),
+            "fibre_g": _num(row["fibre_g"]),
+            "sugar_g": _num(row["sugar_g"]),
+            "sodium_mg": _num(row["sodium_mg"]),
+        })
+    return data
+
+
+# B's last 7 nights, oldest first. night_date is the local date she went to bed on.
+# The fast runs from last_meal_end to first_meal_start; either is null when no meal
+# sits on that side of the night, and the front end shows that as missing.
+def _shape_fuel_fast(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "night_date": _iso_date(row["night_date"]),
+            "tz": row["tz"],
+            "bed_at": _iso_utc(row["bed_at"]),
+            "wake_at": _iso_utc(row["wake_at"]),
+            "last_meal_end": _iso_utc(row["last_meal_end"]),
+            "first_meal_start": _iso_utc(row["first_meal_start"]),
+        })
+    return data
+
+
+# One row per wake-based local day and meal slot. Slots arrive in the order B
+# logged them, so the food log keeps that order rather than imposing one of its
+# own. items is the day's entries for that slot joined for display.
+def _shape_fuel_meals(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "local_day": _iso_date(row["local_day"]),
+            "meal_type": row["meal_type"],
+            "items": row["items"],
+            "kcal": _num(row["kcal"]),
+            "protein_g": _num(row["protein_g"]),
+            "carbs_g": _num(row["carbs_g"]),
+            "fat_g": _num(row["fat_g"]),
+            "fibre_g": _num(row["fibre_g"]),
+            "sugar_g": _num(row["sugar_g"]),
+            "sodium_mg": _num(row["sodium_mg"]),
+        })
+    return data
+
+
+# Everything the RESOURCES tab reads, using one connection. Location is here for the
+# footer: every date on this tab is cut at midnight where B currently is.
+def _fetch_resources() -> dict:
+    location, spend, window = _query(_SQL_PLACE, _SQL_RESOURCES_SPEND, _SQL_RESOURCES_WINDOW)
+    return {
+        "location": _shape_place(*location),
+        "spend": _shape_resources_spend(*spend),
+        "window": _shape_resources_window(*window),
+    }
+
+
+# One row per transaction, oldest first. local_day is the day it falls on in B's
+# current timezone; the exact instant is not published because the tab shows no
+# clock. merchant is the shop with its branch stripped, and is null
+# when none was recorded; platform is the delivery layer, null when B bought direct;
+# item is "" when the bill was not itemised. bucket is everyday or oneoff and decides
+# which layer of the dashboard a row joins; fixed costs are config, never rows.
+def _shape_resources_spend(raw_rows: list[tuple], cols: list[str]) -> list[dict]:
+    data = []
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        data.append({
+            "local_day": _iso_date(row["local_day"]),
+            "merchant": row["merchant"],
+            "platform": row["platform"],
+            "item": row["item"],
+            "category": row["category"],
+            "bucket": row["bucket"],
+            "sgd_amount": _num(row["sgd_amount"]),
+        })
+    return data
+
+
+# A single row. record_start is the first spend ever recorded and is deliberately not
+# limited to the six-month window, so the empty-month note stays true once the record
+# outgrows it. record_start is null while no spend has been recorded at all.
+def _shape_resources_window(raw_rows: list[tuple], cols: list[str]) -> dict:
+    if not raw_rows:
+        return {"record_start": None, "window_start": None}
+
+    row = dict(zip(cols, raw_rows[0]))
+    return {
+        "record_start": _iso_date(row["record_start"]),
+        "window_start": _iso_date(row["window_start"]),
+    }

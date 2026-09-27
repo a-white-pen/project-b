@@ -1,21 +1,25 @@
+# Python and local runtime.
 .env
 .venv/
 __pycache__/
 *.pyc
-.DS_Store
 .pytest_cache/
 *.egg-info/
-tests/
 cloud-sql-proxy
-*.docx
-~$*.docx
-HANDOFF.md
-HANDOVER_NEW_AGENT.md
+
+# OS, editor and agent workspace files.
+.DS_Store
 .claude/
-schema/old_schema_snapshot_*_reference_only.json
-schema/private_relations.txt
 PLAN_*.md
 agentic/
+
+# Local documents and generated references.
+*.docx
+~$*.docx
+schema/private_relations.txt
+
+# Tests stay local in this repository.
+tests/
 
 # Local /brag skill install and generated launch-video artifacts.
 .agents/skills/brag/
