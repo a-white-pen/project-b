@@ -8,9 +8,9 @@ Until now reconcile ran only LAZILY (/week open) + on the Sun/1pm crons; this ma
 nudge the moment the activity syncs.
 
 DEDUP: nudge only on a genuine status TRANSITION — the (kind, local-date) satellite goes from
-absent/planned/skipped → done/unplanned. A re-sync, a Strava 'update', or a second same-day activity
-finds the day already done → no transition → no nudge. The inbound callers ALSO gate on
-aspect_type=='create' (cardio) / created=True (strength), so this is the belt-and-suspenders backstop.
+absent/planned/skipped → done/unplanned. A re-sync or a second same-day activity finds the day
+already done → no transition → no nudge. The inbound caller ALSO nudges only when it has just
+created the exercise row, so this is the belt-and-suspenders backstop.
 
 Best-effort: the inbound hooks wrap this in try/except + lazy import so it can NEVER affect ingestion.
 
@@ -37,7 +37,7 @@ _DONE = {"done", "unplanned"}              # terminal "it happened" statuses
 _TARGET = 2                                 # the weekly 2+2 target per kind
 
 
-# Normalises started_at (a UTC datetime, or a Strava ISO string like "2026-06-25T05:30:00Z") to a
+# Normalises started_at (a UTC datetime, or an ISO string like "2026-06-25T05:30:00Z") to a
 # tz-aware UTC datetime. Returns None on anything unparseable (the caller then no-ops).
 def _norm_dt(started_at) -> datetime | None:
     if isinstance(started_at, datetime):
@@ -96,7 +96,7 @@ def compose_nudge(plan_date, kind: str, detail: str, tally: dict) -> str:
 
 # Eager reconcile + (conditional) nudge for a just-landed activity. kind in {cardio, strength}; detail
 # is the caller-built label (e.g. "run (5.4 km)" / "strength session"); started_at is the activity's
-# UTC datetime (or Strava ISO string). No-op unless the activity's day+kind transitions to done/unplanned.
+# UTC datetime (or ISO string). No-op unless the activity's day+kind transitions to done/unplanned.
 # Self-contained best-effort: ANY failure degrades to no-nudge (never propagates), so the inbound hook
 # is safe even if a caller forgets to wrap it. (Treating an errored read as "absent" could fake a
 # transition, so on error we return WITHOUT nudging rather than guessing.)
@@ -107,6 +107,8 @@ def notify_activity_landed(started_at, kind: str, detail: str) -> None:
         log_failure(logger, logging.WARNING, "activity_nudge_failed", e, kind=kind)
 
 
+# The body of notify_activity_landed: reconciles the plan, then sends the week-tally nudge to
+# Telegram if this activity's day and kind just turned done or unplanned. Errors propagate.
 def _run_nudge(started_at, kind: str, detail: str) -> None:
     if kind not in _SAT:
         return

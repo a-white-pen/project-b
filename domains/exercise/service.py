@@ -1,79 +1,79 @@
 """
-Exercise domain — persists Strava-sourced activities to the right exercise table.
+Exercise domain — saves completed activities to the right exercise table.
 
-Three destination tables, dispatched by sport_type:
-  exercise.cardio_activities  — run/walk/ride/swim and treadmill variants. Per-km
+Three destination tables, chosen by classify_activity(sport_type):
+  exercise.cardio_activities  — run/walk/ride/swim and treadmill variants. Per-lap
                                 splits go to exercise.cardio_splits.
-  exercise.strength_sessions  — WeightTraining/Workout/Crossfit. Written by the
-                                Garmin processor after this module hands off via
-                                category="strength". Per-set detail in strength_sets.
+  exercise.strength_sessions  — WeightTraining/Workout/Crossfit. Written by
+                                domains.exercise.strength_service from the exercise-set
+                                payload, not from here.
   exercise.other_exercises    — everything else (yoga, pilates, climbing, plus any
-                                unknown future Strava sport_type). No sub-table.
+                                sport_type not mapped above). No sub-table.
+
+Activities arrive as one normalized dict built by the inbound source (today
+inbound.garmin.processor). Keys match the column names below, plus "name" for
+activity_name and "splits" for the cardio laps. Rows are identified by source_app +
+source_activity_id, which is unique per table, so saving the same activity twice
+never creates a second row.
 
 Public functions:
-  save_strava_activity(strava_inbound_id, activity) — SINGLE DISPATCHER used by
-      both the live webhook processor and the historical backfill. Classifies the
-      sport_type, holds a per-activity advisory lock for the save+sweep window,
-      writes to the right table, then sweeps sibling tables so the activity
-      lives in exactly one family (handles Strava re-tag scenarios). Returns
-      (saved, category). For "strength", returns (False, "strength") without
-      writing OR holding the lock — the caller (Strava processor) handles
-      strength orchestration with its own strava_activity_lock window.
-  strava_activity_lock(strava_activity_id)        — context manager that
-      acquires a session-scope pg_advisory_lock keyed on the strava_activity_id.
-      Serializes concurrent processing of the same activity (e.g. two close-
-      together Strava edit events). Public so the processor's strength branch
-      can wrap its own orchestration in the same lock.
-  save_cardio_activity(strava_inbound_id, activity)  — thin write path; assumes
-      category is already cardio. Direct callers (tests/scripts) only.
-  save_other_exercise(strava_inbound_id, activity)   — thin write path for
-      other_exercises rows.
-  delete_cardio_activity(strava_activity_id)         — deletes cardio row + splits (CASCADE)
-  delete_other_exercise(strava_activity_id)          — deletes one other_exercises row
+  classify_activity(sport_type)          — maps a sport_type to run/walk/ride/swim/strength/other
+  save_cardio_activity(activity)         — inserts one cardio row and its splits; True if the row is new
+  save_other_exercise(activity)          — inserts one other_exercises row; True if the row is new
+  get_recorded_activities(source_app, source_activity_ids) — {source_activity_id: activity_name}
+      for the ids already saved in any of the three tables
+  find_activity_from_other_source(source_app, started_at) — True if another source already
+      recorded a cardio or other session starting within two minutes of started_at
+  update_activity_names(source_app, names) — applies renames made at the source to rows that
+      source created
+  get_presentations(source_app, source_activity_ids) — {source_activity_id: meta.presentation}
+      for rows that source created, leaving out rows that show the Strava export's
+  save_presentation(source_app, source_activity_id, presentation) — sets meta.presentation on
+      the row that source created, unless it shows the Strava export's
+  get_recent_activity_ids(source_app, since, limit) — source ids of the newest rows that source
+      created, started at or after since (any time when None)
+  delete_activities(source_app, source_activity_ids) — deletes the rows that source created,
+      with their splits and sets
 
 Internal helpers:
-  _classify_activity(sport_type)              — maps Strava sport_type to routing category
-  _other_activity_type(sport_type)            — maps Strava sport_type to activity_type stored on other_exercises
-  ensure_single_exercise_family(id, keep)    — deletes sibling rows so each activity_id lives in one family
-  _extract_timezone(tz_str)                   — extracts IANA timezone from Strava timezone string
-  _build_splits(activity)                     — merges laps + splits_metric into per-km split rows
-
-Routing summary (via save_strava_activity):
-  WeightTraining/Workout/Crossfit  → "strength" → handed off to inbound.garmin.processor
-  Run/Walk/Ride/Swim variants      → category   → exercise.cardio_activities
-  Everything else                  → "other"    → exercise.other_exercises
+  _other_activity_type(sport_type) — maps sport_type to the activity_type stored on other_exercises
+  _coerce_calories(value)          — float kcal to int, keeping an explicit 0
 """
 
 import json
 import logging
 import re
-from contextlib import contextmanager
+from datetime import timedelta
 
 from system.db import get_connection
 from system.logging import log_event, log_failure
 
 logger = logging.getLogger(__name__)
 
-# Strava sport_type → Project B activity routing category.
-# Types not listed here fall back to "other" so nothing is silently dropped —
-# the Strava processor routes "other" rows to exercise.other_exercises.
+# sport_type → routing category. Types not listed here fall back to "other" so
+# nothing is silently dropped.
 _RUN_TYPES = {"Run", "TrailRun", "VirtualRun", "Treadmill"}
 _WALK_TYPES = {"Walk", "Hike"}
 _RIDE_TYPES = {"Ride", "VirtualRide", "EBikeRide", "MountainBikeRide", "GravelRide", "Velomobile"}
 _SWIM_TYPES = {"Swim", "OpenWaterSwim"}
-# Routed to Garmin processor — Garmin exercise_sets presence determines if they
-# end up in strength tables. No cardio row is written for these.
+# Strength only when the session carries exercise sets; the inbound processor
+# decides that, since only it has the set payload.
 _STRENGTH_TYPES = {"WeightTraining", "Workout", "Crossfit"}
 
+CARDIO_CATEGORIES = {"run", "walk", "ride", "swim"}
 
-# Classifies a Strava sport_type into a Project B routing category. Drives which
-# downstream save function the Strava processor calls — does NOT directly become
-# the activity_category column on any row (cardio rows carry the specific
-# category like "run"; other_exercises rows carry an activity_type derived from
-# sport_type in save_other_exercise).
-# Inputs: Strava sport_type string.
+# Two recordings of the same workout start at the same second; the window absorbs
+# clock rounding between sources.
+_SAME_SESSION_WINDOW = timedelta(seconds=120)
+
+
+# Classifies a sport_type into a routing category. Drives which save function the
+# inbound processor calls — does NOT directly become the activity_category column
+# on any row (cardio rows carry the specific category like "run"; other_exercises
+# rows carry an activity_type derived from sport_type in save_other_exercise).
+# Inputs: sport_type string.
 # Outputs: one of: "run", "walk", "ride", "swim", "strength", "other".
-def _classify_activity(sport_type: str) -> str:
+def classify_activity(sport_type: str) -> str:
     if sport_type in _STRENGTH_TYPES:
         return "strength"
     if sport_type in _RUN_TYPES:
@@ -86,110 +86,39 @@ def _classify_activity(sport_type: str) -> str:
         return "swim"
     # Intentional catch-all — every unrecognised sport_type routes to
     # exercise.other_exercises, including cardio-ish machine types like Rowing,
-    # Elliptical, StandUpPaddling, and Skating. Design decision (2026-05-26):
-    # the conceptual split is "things with meaningful distance/pace" vs "things
-    # with meaningful duration/HR". Machine cardio without B caring about pace
-    # belongs in the second bucket. If a specific cardio-ish type later proves
-    # important enough to warrant distance + pace handling, promote it into one
-    # of the explicit type sets above.
+    # Elliptical, StandUpPaddling, and Skating. The split is "things with meaningful
+    # distance/pace" vs "things with meaningful duration/HR". If a cardio-ish type
+    # later needs distance + pace handling, promote it into one of the sets above.
     return "other"
 
 
-# Coerces Strava's float calories to our integer column. Returns None ONLY when
-# the source omitted the field — explicit 0.0 (legitimate for very short
-# activities) is preserved as int 0, not silently dropped. Used by both
-# save_cardio_activity and save_other_exercise.
+# Coerces float calories to our integer column. Returns None ONLY when the source
+# omitted the field — explicit 0.0 (legitimate for very short activities) is kept.
 def _coerce_calories(value) -> int | None:
     if value is None:
         return None
     return int(value)
 
 
-# Extracts the IANA timezone string from Strava's "(GMT+07:00) Asia/Bangkok" format.
-def _extract_timezone(tz_str: str) -> str:
-    if tz_str and ") " in tz_str:
-        return tz_str.split(") ", 1)[1]
-    if tz_str:
-        log_event(logger, logging.WARNING, "exercise_timezone_format_unexpected", tz_str_len=len(tz_str))
-    return tz_str or "UTC"
-
-
-# Merges Strava laps (has cadence, max HR, elevation gain) with splits_metric
-# (has moving_time, elevation_difference, grade_adjusted_speed) by split index.
-# Assumption: Strava lap_index and splits_metric split key are 1-based and aligned — same position
-# in each array maps to the same km split. If Strava ever changes this, splits will silently mismatch.
-# Laps missing lap_index, distance, or elapsed_time are skipped — those columns are NOT NULL in the schema.
-# Returns a list of dicts ready for bulk insert into exercise.cardio_splits.
-def _build_splits(activity: dict) -> list[dict]:
-    # Use .get("split") to avoid KeyError if Strava omits the split key on any entry.
-    splits_by_idx = {s["split"]: s for s in activity.get("splits_metric", []) if s.get("split") is not None}
-    rows = []
-    for lap in activity.get("laps", []):
-        idx = lap.get("lap_index")
-        distance = lap.get("distance")
-        elapsed = lap.get("elapsed_time")
-        # lap_index, distance_m, elapsed_seconds are NOT NULL in the schema — skip incomplete laps.
-        if idx is None or distance is None or elapsed is None:
-            log_event(logger, logging.WARNING, "exercise_split_incomplete_lap_skipped",
-                      lap_index=idx, has_distance=distance is not None, has_elapsed=elapsed is not None)
-            continue
-        sm = splits_by_idx.get(idx, {})
-        rows.append({
-            "lap_index": idx,
-            "distance_m": distance,
-            "elapsed_seconds": elapsed,
-            "moving_seconds": sm.get("moving_time") or lap.get("moving_time"),
-            "average_speed_mps": lap.get("average_speed"),
-            "max_speed_mps": lap.get("max_speed"),
-            "average_cadence": lap.get("average_cadence"),
-            "average_heartrate": lap.get("average_heartrate"),
-            "max_heartrate": lap.get("max_heartrate"),
-            "elevation_gain_m": lap.get("total_elevation_gain"),
-            "elevation_difference_m": sm.get("elevation_difference"),
-            "grade_adjusted_speed_mps": sm.get("average_grade_adjusted_speed"),
-            "pace_zone": lap.get("pace_zone") or (sm.get("pace_zone") if sm.get("pace_zone") else None),
-        })
-    return rows
-
-
-# Upserts one cardio activity row and replaces its splits.
-# Assumes the activity has ALREADY been classified as cardio by the caller —
-# see save_strava_activity for the full dispatch path. Direct callers (tests,
-# scripts) must pass an activity whose sport_type maps to run/walk/ride/swim.
-# Returns (saved, activity_category): activity_category is the specific cardio
-# category written (run/walk/ride/swim), or None on DB failure.
-# Inputs: strava_inbound_id from system.strava_inbound, full Strava activity detail dict.
-def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, str | None]:
-    sport_type = activity.get("sport_type", "")
-    category = _classify_activity(sport_type)
-    if category not in ("run", "walk", "ride", "swim"):
-        # Defensive guard for direct callers; the dispatcher (save_strava_activity)
-        # routes non-cardio types to their correct table before this is called.
-        log_event(logger, logging.WARNING, "exercise_cardio_save_skipped_non_cardio",
-                  sport_type=sport_type, classified_as=category,
-                  strava_activity_id=activity.get("id"))
-        return False, category
-
-    strava_activity_id = activity["id"]
-    start_latlng = activity.get("start_latlng") or []
-    gear = activity.get("gear") or {}
-    map_data = activity.get("map") or {}
-    polyline = map_data.get("polyline") or map_data.get("summary_polyline") or None
-
-    meta = {
-        "strava_workout_type": activity.get("workout_type"),
-        "external_id": activity.get("external_id"),
-    }
-
-    conn = get_connection()
+# Inserts one cardio activity row and its splits in one transaction. Assumes the
+# caller has already classified the activity as run/walk/ride/swim.
+# Inputs: normalized activity dict (see module docstring) with "splits" as a list of
+#         exercise.cardio_splits rows keyed by column name.
+# Outputs: True if a new row was written; False if it already existed or the write
+#          failed (failures are logged; the caller retries on its next run).
+def save_cardio_activity(activity: dict) -> bool:
+    category = classify_activity(activity["sport_type"])
+    splits = activity.get("splits") or []
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO exercise.cardio_activities (
-                        strava_inbound_id, strava_activity_id, activity_name,
-                        sport_type, activity_category, is_treadmill,
+                        source_app, inbound_row_id, source_activity_id,
+                        activity_name, sport_type, activity_category, is_treadmill,
                         started_at, timezone,
                         duration_seconds, moving_seconds,
                         distance_m, elevation_gain_m, elev_high_m, elev_low_m,
@@ -198,76 +127,48 @@ def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, 
                         perceived_exertion, gear_name, device_name,
                         polyline, start_lat, start_lng, meta
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s
                     )
-                    ON CONFLICT (strava_activity_id) DO UPDATE SET
-                        strava_inbound_id    = EXCLUDED.strava_inbound_id,
-                        activity_name        = EXCLUDED.activity_name,
-                        sport_type           = EXCLUDED.sport_type,
-                        activity_category    = EXCLUDED.activity_category,
-                        is_treadmill         = EXCLUDED.is_treadmill,
-                        started_at           = EXCLUDED.started_at,
-                        timezone             = EXCLUDED.timezone,
-                        duration_seconds     = EXCLUDED.duration_seconds,
-                        moving_seconds       = EXCLUDED.moving_seconds,
-                        distance_m           = EXCLUDED.distance_m,
-                        elevation_gain_m     = EXCLUDED.elevation_gain_m,
-                        elev_high_m          = EXCLUDED.elev_high_m,
-                        elev_low_m           = EXCLUDED.elev_low_m,
-                        average_speed_mps    = EXCLUDED.average_speed_mps,
-                        max_speed_mps        = EXCLUDED.max_speed_mps,
-                        average_cadence      = EXCLUDED.average_cadence,
-                        average_heartrate    = EXCLUDED.average_heartrate,
-                        max_heartrate        = EXCLUDED.max_heartrate,
-                        calories_kcal        = EXCLUDED.calories_kcal,
-                        perceived_exertion   = EXCLUDED.perceived_exertion,
-                        gear_name            = EXCLUDED.gear_name,
-                        device_name          = EXCLUDED.device_name,
-                        polyline             = EXCLUDED.polyline,
-                        start_lat            = EXCLUDED.start_lat,
-                        start_lng            = EXCLUDED.start_lng,
-                        meta                 = EXCLUDED.meta,
-                        updated_at           = now()
+                    ON CONFLICT (source_app, source_activity_id)
+                        WHERE source_activity_id IS NOT NULL
+                    DO NOTHING
                     RETURNING cardio_activity_id
                     """,
                     (
-                        strava_inbound_id, strava_activity_id,
-                        activity.get("name") or "Activity",
-                        sport_type, category, bool(activity.get("trainer")),
-                        activity.get("start_date"),
-                        _extract_timezone(activity.get("timezone", "")),
-                        activity.get("elapsed_time"), activity.get("moving_time"),
-                        activity.get("distance") or None,
-                        activity.get("total_elevation_gain") or None,
-                        activity.get("elev_high") or None,
-                        activity.get("elev_low") or None,
-                        activity.get("average_speed") or None,
-                        activity.get("max_speed") or None,
+                        activity["source_app"], activity["inbound_row_id"], activity["source_activity_id"],
+                        activity["name"], activity["sport_type"], category, activity["is_treadmill"],
+                        activity["started_at"], activity["timezone"],
+                        activity["duration_seconds"], activity["moving_seconds"],
+                        activity.get("distance_m") or None,
+                        activity.get("elevation_gain_m") or None,
+                        activity.get("elev_high_m"),
+                        activity.get("elev_low_m"),
+                        activity.get("average_speed_mps") or None,
+                        activity.get("max_speed_mps") or None,
                         activity.get("average_cadence") or None,
                         activity.get("average_heartrate") or None,
                         activity.get("max_heartrate") or None,
-                        _coerce_calories(activity.get("calories")),
+                        _coerce_calories(activity.get("calories_kcal")),
                         activity.get("perceived_exertion"),
-                        gear.get("name") or None,
-                        activity.get("device_name") or None,
-                        polyline or None,
-                        start_latlng[0] if len(start_latlng) >= 2 else None,
-                        start_latlng[1] if len(start_latlng) >= 2 else None,
-                        json.dumps(meta),
+                        activity.get("gear_name"),
+                        activity.get("device_name"),
+                        activity.get("polyline"),
+                        activity.get("start_lat"),
+                        activity.get("start_lng"),
+                        json.dumps(activity.get("meta") or {}),
                     ),
                 )
                 row = cur.fetchone()
+                if row is None:
+                    log_event(logger, logging.INFO, "exercise_cardio_already_saved",
+                              source_app=activity["source_app"],
+                              source_activity_id=activity["source_activity_id"])
+                    return False
                 cardio_activity_id = row[0]
 
-                # Replace splits — delete old ones then bulk insert current.
-                cur.execute(
-                    "DELETE FROM exercise.cardio_splits WHERE cardio_activity_id = %s",
-                    (cardio_activity_id,),
-                )
-                splits = _build_splits(activity)
                 if splits:
                     cur.executemany(
                         """
@@ -298,46 +199,26 @@ def save_cardio_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, 
 
         log_event(logger, logging.INFO, "exercise_cardio_saved",
                   cardio_activity_id=cardio_activity_id,
-                  strava_activity_id=strava_activity_id,
+                  source_app=activity["source_app"],
+                  source_activity_id=activity["source_activity_id"],
                   activity_category=category,
-                  sport_type=sport_type,
+                  sport_type=activity["sport_type"],
                   splits_count=len(splits))
-        return True, category
+        return True
 
     except Exception as e:
         log_failure(logger, logging.ERROR, "exercise_cardio_save_failed", e,
-                    strava_activity_id=strava_activity_id,
-                    strava_inbound_id=strava_inbound_id)
-        return False, None
+                    source_app=activity.get("source_app"),
+                    source_activity_id=activity.get("source_activity_id"))
+        return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
-# Deletes one cardio activity row and its splits (via CASCADE) by Strava activity ID.
-# Called when Strava sends a delete event for an activity B has removed in the Strava app.
-# Inputs: strava_activity_id from the Strava webhook event.
-# Outputs: True if a row was deleted, False if no matching row existed. Raises on DB error.
-def delete_cardio_activity(strava_activity_id: int) -> bool:
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM exercise.cardio_activities WHERE strava_activity_id = %s",
-                    (strava_activity_id,),
-                )
-                deleted = cur.rowcount > 0
-        log_event(logger, logging.INFO, "exercise_cardio_deleted",
-                  strava_activity_id=strava_activity_id, deleted=deleted)
-        return deleted
-    finally:
-        conn.close()
-
-
-# Maps Strava sport_type → activity_type stored on exercise.other_exercises rows.
-# Lower-snake-case values for consistent agent/analytics filtering. Unknown
-# sport_types fall through to a snake_case slug of the Strava string itself so
-# new types (Tai Chi, Boxing, etc.) survive without code changes.
+# sport_type → activity_type stored on exercise.other_exercises rows. Lower-snake-case
+# values for consistent agent/analytics filtering. Unknown sport_types fall through
+# to a snake_case slug so new types (Tai Chi, Boxing, etc.) survive without code changes.
 _OTHER_ACTIVITY_TYPE_MAP = {
     "Yoga": "yoga",
     "Pilates": "pilates",
@@ -345,9 +226,7 @@ _OTHER_ACTIVITY_TYPE_MAP = {
 }
 
 
-# Converts a Strava sport_type into our normalised activity_type for
-# other_exercises. Falls back to a snake_case slug so future Strava additions
-# land in a queryable form without needing code updates.
+# Converts a sport_type into our normalised activity_type for other_exercises.
 # Examples: "Yoga" → "yoga"; "RockClimbing" → "climbing" (mapped); "TaiChi" → "tai_chi" (slug); "" → "other".
 def _other_activity_type(sport_type: str) -> str:
     if sport_type in _OTHER_ACTIVITY_TYPE_MAP:
@@ -358,53 +237,33 @@ def _other_activity_type(sport_type: str) -> str:
     return re.sub(r"(?<=[a-z])(?=[A-Z])", "_", sport_type).lower()
 
 
-# Upserts one row into exercise.other_exercises. Used by the Strava processor
-# for activities that classify as "other" — yoga, pilates, climbing, and any
-# unknown sport_type not explicitly mapped to cardio or strength.
-# Inputs: strava_inbound_id from system.strava_inbound, full Strava activity detail dict.
-# Outputs: True if a row was saved (insert or update), False on DB error.
-def save_other_exercise(strava_inbound_id: int, activity: dict) -> bool:
-    strava_activity_id = activity.get("id")
-    if strava_activity_id is None:
-        log_event(logger, logging.WARNING, "exercise_other_missing_activity_id",
-                  strava_inbound_id=strava_inbound_id)
-        return False
-
+# Inserts one row into exercise.other_exercises — yoga, pilates, climbing, and any
+# sport_type not classified as cardio or strength.
+# Inputs: normalized activity dict (see module docstring).
+# Outputs: True if a new row was written; False if it already existed or the write
+#          failed (failures are logged; the caller retries on its next run).
+def save_other_exercise(activity: dict) -> bool:
     sport_type = activity.get("sport_type", "")
     activity_type = _other_activity_type(sport_type)
 
-    # Curate a payload of Strava extras into meta. system.strava_inbound only
-    # stores the webhook event, not the fetched activity detail — anything we
-    # drop here is gone for good. These fields don't earn dedicated columns
-    # (the table is shape-stable across activity_types, where most of these
-    # would be null) but they live in meta for ad-hoc / agent access via
-    # meta ->> 'distance_m'. The Strava polyline blob (1-50KB) is intentionally
-    # skipped; if a specific other-type ever needs route geometry, promote it
-    # to a dedicated column then.
-    gear = activity.get("gear") or {}
-    start_latlng = activity.get("start_latlng") or []
+    # Movement fields have no column on this table (most activity types leave them
+    # empty), so the ones present go into meta for ad-hoc and agent queries.
     extras = {
-        "strava_sport_type": sport_type,
-        "strava_workout_type": activity.get("workout_type"),
-        "external_id": activity.get("external_id"),
-        # Movement / distance fields — present for cardio-ish "other" types
-        # (Elliptical, Rowing, Skating, SUP) and absent for true non-cardio
-        # (Yoga, Pilates, Climbing). None values are dropped below so the meta
-        # payload stays compact.
-        "distance_m": activity.get("distance"),
-        "moving_seconds": activity.get("moving_time"),
-        "elevation_gain_m": activity.get("total_elevation_gain"),
-        "elev_high_m": activity.get("elev_high"),
-        "elev_low_m": activity.get("elev_low"),
-        "average_speed_mps": activity.get("average_speed"),
-        "max_speed_mps": activity.get("max_speed"),
+        "sport_type": sport_type,
+        "distance_m": activity.get("distance_m"),
+        "moving_seconds": activity.get("moving_seconds"),
+        "elevation_gain_m": activity.get("elevation_gain_m"),
+        "elev_high_m": activity.get("elev_high_m"),
+        "elev_low_m": activity.get("elev_low_m"),
+        "average_speed_mps": activity.get("average_speed_mps"),
+        "max_speed_mps": activity.get("max_speed_mps"),
         "average_cadence": activity.get("average_cadence"),
-        "is_treadmill": activity.get("trainer") if "trainer" in activity else None,
-        "gear_name": gear.get("name"),
-        "start_lat": start_latlng[0] if len(start_latlng) >= 2 else None,
-        "start_lng": start_latlng[1] if len(start_latlng) >= 2 else None,
+        "is_treadmill": activity.get("is_treadmill") or None,
+        "gear_name": activity.get("gear_name"),
+        "start_lat": activity.get("start_lat"),
+        "start_lng": activity.get("start_lng"),
     }
-    meta = {k: v for k, v in extras.items() if v is not None}
+    meta = {**(activity.get("meta") or {}), **{k: v for k, v in extras.items() if v is not None}}
 
     conn = None
     try:
@@ -414,7 +273,6 @@ def save_other_exercise(strava_inbound_id: int, activity: dict) -> bool:
                 cur.execute(
                     """
                     INSERT INTO exercise.other_exercises (
-                        strava_inbound_id, strava_activity_id,
                         source_app, inbound_row_id, source_activity_id,
                         activity_type, activity_name,
                         started_at, timezone,
@@ -422,266 +280,288 @@ def save_other_exercise(strava_inbound_id: int, activity: dict) -> bool:
                         avg_hr, max_hr, calories_kcal,
                         perceived_exertion, device_name, meta
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s
                     )
-                    ON CONFLICT (strava_activity_id) WHERE strava_activity_id IS NOT NULL
-                    DO UPDATE SET
-                        strava_inbound_id  = EXCLUDED.strava_inbound_id,
-                        source_app         = EXCLUDED.source_app,
-                        inbound_row_id     = EXCLUDED.inbound_row_id,
-                        source_activity_id = EXCLUDED.source_activity_id,
-                        activity_type      = EXCLUDED.activity_type,
-                        activity_name      = EXCLUDED.activity_name,
-                        started_at         = EXCLUDED.started_at,
-                        timezone           = EXCLUDED.timezone,
-                        duration_seconds   = EXCLUDED.duration_seconds,
-                        avg_hr             = EXCLUDED.avg_hr,
-                        max_hr             = EXCLUDED.max_hr,
-                        calories_kcal      = EXCLUDED.calories_kcal,
-                        perceived_exertion = EXCLUDED.perceived_exertion,
-                        device_name        = EXCLUDED.device_name,
-                        meta               = EXCLUDED.meta,
-                        updated_at         = now()
+                    ON CONFLICT (source_app, source_activity_id)
+                        WHERE source_activity_id IS NOT NULL
+                    DO NOTHING
                     RETURNING other_exercise_id
                     """,
                     (
-                        strava_inbound_id,
-                        strava_activity_id,
-                        "strava",
-                        strava_inbound_id,    # inbound_row_id — same as strava_inbound_id for source_app='strava'
-                        str(strava_activity_id),
+                        activity["source_app"],
+                        activity["inbound_row_id"],
+                        activity["source_activity_id"],
                         activity_type,
                         activity.get("name") or "Activity",
-                        activity.get("start_date"),
-                        _extract_timezone(activity.get("timezone", "")),
-                        activity.get("elapsed_time") or activity.get("moving_time"),
+                        activity["started_at"],
+                        activity.get("timezone"),
+                        activity.get("duration_seconds") or activity.get("moving_seconds"),
                         activity.get("average_heartrate") or None,
                         activity.get("max_heartrate") or None,
-                        _coerce_calories(activity.get("calories")),
+                        _coerce_calories(activity.get("calories_kcal")),
                         activity.get("perceived_exertion"),
-                        activity.get("device_name") or None,
+                        activity.get("device_name"),
                         json.dumps(meta),
                     ),
                 )
                 row = cur.fetchone()
-                other_exercise_id = row[0] if row else None
+
+        if row is None:
+            log_event(logger, logging.INFO, "exercise_other_already_saved",
+                      source_app=activity["source_app"],
+                      source_activity_id=activity["source_activity_id"])
+            return False
 
         log_event(logger, logging.INFO, "exercise_other_saved",
-                  other_exercise_id=other_exercise_id,
-                  strava_activity_id=strava_activity_id,
+                  other_exercise_id=row[0],
+                  source_app=activity["source_app"],
+                  source_activity_id=activity["source_activity_id"],
                   activity_type=activity_type,
                   sport_type=sport_type)
         return True
 
     except Exception as e:
         log_failure(logger, logging.ERROR, "exercise_other_save_failed", e,
-                    strava_activity_id=strava_activity_id,
-                    strava_inbound_id=strava_inbound_id)
+                    source_app=activity.get("source_app"),
+                    source_activity_id=activity.get("source_activity_id"))
         return False
     finally:
         if conn is not None:
             conn.close()
 
 
-# Deletes one other_exercises row by Strava activity ID. Called from the Strava
-# delete dispatcher alongside delete_cardio_activity / delete_strength_session.
-# Inputs: strava_activity_id from the Strava webhook event.
-# Outputs: True if a row was deleted, False if no matching row existed. Raises on DB error.
-def delete_other_exercise(strava_activity_id: int) -> bool:
+# Looks up which of the given source ids are already saved in any exercise table.
+# Inputs: source_app (e.g. "garmin"), list of source activity ids as text.
+# Outputs: {source_activity_id: activity_name} for the ids found. Raises on DB error so
+#          the caller skips the run rather than re-saving everything it cannot check.
+def get_recorded_activities(source_app: str, source_activity_ids: list[str]) -> dict[str, str | None]:
+    if not source_activity_ids:
+        return {}
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM exercise.other_exercises WHERE strava_activity_id = %s",
-                    (strava_activity_id,),
+                    """
+                    SELECT source_activity_id, activity_name
+                    FROM exercise.cardio_activities
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    UNION ALL
+                    SELECT source_activity_id, activity_name
+                    FROM exercise.strength_sessions
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    UNION ALL
+                    SELECT source_activity_id, activity_name
+                    FROM exercise.other_exercises
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    """,
+                    {"app": source_app, "ids": list(source_activity_ids)},
                 )
-                deleted = cur.rowcount > 0
-        log_event(logger, logging.INFO, "exercise_other_deleted",
-                  strava_activity_id=strava_activity_id, deleted=deleted)
-        return deleted
+                return {row[0]: row[1] for row in cur.fetchall()}
     finally:
         conn.close()
 
 
-# Ensures a Strava activity ID lives in EXACTLY ONE exercise family table by
-# deleting any sibling rows. Called by save_strava_activity AFTER a successful
-# save (and by the strength path in inbound/strava/processor.py after a
-# successful Garmin save) so that a re-tag in Strava — Run → Yoga, Yoga →
-# WeightTraining, etc. — moves the row cleanly rather than leaving the activity
-# in two tables.
-#
-# Inputs: strava_activity_id, keep — the category the activity now lives under.
-# One of: "run"/"walk"/"ride"/"swim" (cardio family), "strength", "other".
-# Outputs: list of sibling table names where a row was deleted, for logging.
-#
-# Per-table failures are caught and logged but NEVER re-raised. The post-save
-# sweep is a cleanup step: the user-visible reply / notification must not be
-# suppressed by a transient sibling-delete DB hiccup. Worst case on partial
-# failure is a recoverable duplicate (activity in two tables) — the next
-# webhook for the same activity, or the next backfill run, will clean up.
-#
-# Idempotent — no-op when sibling tables don't have the row. Strength import
-# is local to avoid a top-level circular import between service.py and
-# strength_service.py.
-_CARDIO_CATEGORIES = {"run", "walk", "ride", "swim"}
-
-
-def ensure_single_exercise_family(strava_activity_id: int, keep: str) -> list[str]:
-    from domains.exercise.strength_service import delete_strength_session
-
-    swept: list[str] = []
-    failures: list[str] = []
-
-    # Defensive per-table try/except: a single failing delete must not stop us
-    # from sweeping the other siblings, AND must not surface as an exception
-    # to the user-visible reply path.
-    def _safe_delete(table_label: str, fn) -> None:
-        try:
-            if fn(strava_activity_id):
-                swept.append(table_label)
-        except Exception as e:
-            failures.append(table_label)
-            log_failure(
-                logger,
-                logging.WARNING,
-                "exercise_sibling_sweep_table_failed",
-                e,
-                strava_activity_id=strava_activity_id,
-                kept_category=keep,
-                failed_table=table_label,
-            )
-
-    if keep not in _CARDIO_CATEGORIES:
-        _safe_delete("cardio_activities", delete_cardio_activity)
-    if keep != "strength":
-        _safe_delete("strength_sessions", delete_strength_session)
-    if keep != "other":
-        _safe_delete("other_exercises", delete_other_exercise)
-
-    if swept or failures:
-        log_event(
-            logger,
-            logging.INFO,
-            "exercise_sibling_tables_swept",
-            strava_activity_id=strava_activity_id,
-            kept_category=keep,
-            swept_tables=swept,
-            failed_tables=failures,
-        )
-    return swept
-
-
-# Per-activity session-scope advisory lock around save+sweep. Two webhook events
-# for the SAME strava_activity_id (e.g. B edits Run → Yoga → Run quickly) can be
-# processed concurrently as FastAPI background tasks; without serialization both
-# can save then both can sweep, deleting each other's just-saved rows and
-# leaving NO row in any table. The lock pins all processing of a given
-# strava_activity_id to one in-flight handler at a time. Different activities
-# still process in parallel.
-#
-# Key choice: raw strava_activity_id (bigint). Strava IDs are 10+ digit
-# positive integers, well clear of the int4-range hashtext keys used by
-# _lock_attention_writes / _lock_sleep_wake_writes in the bigint lock space.
-#
-# Lock is held by a dedicated short-lived connection in autocommit mode so it
-# survives the multiple sub-transactions opened by save_*/delete_* helpers.
-# Released explicitly in the finally; conn.close() releases on any error path.
-@contextmanager
-def strava_activity_lock(strava_activity_id):
-    if strava_activity_id is None:
-        # Malformed payload — no lock keyed available. Best we can do is
-        # proceed; the missing-id guard in save_other_exercise will reject.
-        yield
-        return
+# True if a cardio or other session from a different source starts within two minutes
+# of started_at — the same workout already recorded before this source took over.
+# Strength rows are not checked: they have always been keyed on the Garmin id.
+# Inputs: source_app of the incoming activity, its UTC start.
+# Outputs: bool. Raises on DB error so the caller retries rather than duplicating.
+def find_activity_from_other_source(source_app: str, started_at) -> bool:
     conn = get_connection()
-    conn.autocommit = True
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(%s)", (int(strava_activity_id),))
-        yield
-    finally:
-        try:
+        with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (int(strava_activity_id),))
-        except Exception as e:
-            log_failure(
-                logger,
-                logging.WARNING,
-                "exercise_activity_lock_release_failed",
-                e,
-                strava_activity_id=strava_activity_id,
-            )
+                cur.execute(
+                    """
+                    SELECT 1 FROM exercise.cardio_activities
+                    WHERE source_app <> %(app)s AND started_at BETWEEN %(lo)s AND %(hi)s
+                    UNION ALL
+                    SELECT 1 FROM exercise.other_exercises
+                    WHERE source_app <> %(app)s AND started_at BETWEEN %(lo)s AND %(hi)s
+                    LIMIT 1
+                    """,
+                    {
+                        "app": source_app,
+                        "lo": started_at - _SAME_SESSION_WINDOW,
+                        "hi": started_at + _SAME_SESSION_WINDOW,
+                    },
+                )
+                return cur.fetchone() is not None
+    finally:
         conn.close()
 
 
-# Single dispatcher entry point for routing one Strava activity to the right
-# exercise table. Used by both the webhook processor (inbound/strava/processor.py)
-# and the historical backfill (inbound/strava/backfill.py) so live and replay
-# behaviour stay in sync.
-#
-# Behaviour:
-#   1. Classifies the Strava sport_type → category.
-#   2. Writes to the right table (cardio or other). On successful write, sweeps
-#      sibling tables so the strava_activity_id lives in at most one family
-#      (handles Strava re-tag scenarios like Run → Yoga).
-#   3. For "strength", returns without writing OR sweeping — Garmin fetch lives
-#      in a separate module and the sibling-sweep decision is the caller's
-#      (must distinguish a genuine re-tag from a benign update of an existing
-#      strength activity; only the caller has the aspect_type context).
-#
-# Inputs: strava_inbound_id, full Strava activity detail dict.
-# Outputs: (saved, category) where:
-#   (True,  "run"/"walk"/"ride"/"swim")  — cardio row written
-#   (True,  "other")                     — other_exercises row written
-#   (False, "strength")                  — caller must orchestrate the strength
-#                                          path (sibling sweep + Garmin fetch);
-#                                          see processor.py for the rules
-#   (False, category)                    — write failure (errors already logged)
-#
-# Sweep ordering — IMPORTANT:
-# Sweep runs AFTER a successful save, not before. Rationale: if we sweep first
-# and the save fails (e.g. transient DB error), the old row is permanently
-# deleted with no replacement. Sweep-after means save failures leave the
-# pre-existing row in place. The trade-off: while the save commits and the
-# sweep runs, an activity can briefly appear in two tables. The sweep is a
-# single-row delete and almost always succeeds; if it fails (rare), we have a
-# recoverable duplicate, never lost data. The previous design's claim that
-# Strava webhook retries would cover sweep+save failures was WRONG — the
-# webhook handler returns 200 OK before this code runs (background task in
-# inbound/strava/webhook.py), so Strava sees success and never retries.
-def save_strava_activity(strava_inbound_id: int, activity: dict) -> tuple[bool, str]:
-    sport_type = activity.get("sport_type", "")
-    category = _classify_activity(sport_type)
-    strava_activity_id = activity.get("id")
+# Copies activity names changed at the source onto the rows that source created
+# directly. Rows that came in through the old Strava trigger keep their name, which
+# may have been edited on Strava.
+# Inputs: source_app, {source_activity_id: current name at the source}.
+# Outputs: number of rows renamed. Failures are logged and return 0 (cosmetic only).
+def update_activity_names(source_app: str, names: dict[str, str]) -> int:
+    if not names:
+        return 0
+    renamed = 0
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            with conn.cursor() as cur:
+                for table in ("cardio_activities", "strength_sessions", "other_exercises"):
+                    cur.execute(
+                        f"""
+                        UPDATE exercise.{table} t
+                        SET activity_name = v.name, updated_at = now()
+                        FROM unnest(%s::text[], %s::text[]) AS v(source_activity_id, name)
+                        WHERE t.source_app = %s
+                          AND t.source_activity_id = v.source_activity_id
+                          AND t.strava_activity_id IS NULL
+                          AND t.activity_name IS DISTINCT FROM v.name
+                        """,
+                        (list(names.keys()), list(names.values()), source_app),
+                    )
+                    renamed += cur.rowcount
+        if renamed:
+            log_event(logger, logging.INFO, "exercise_activity_names_updated",
+                      source_app=source_app, renamed=renamed)
+        return renamed
+    except Exception as e:
+        log_failure(logger, logging.WARNING, "exercise_activity_rename_failed", e,
+                    source_app=source_app)
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
 
-    # Strength dispatch needs no DB write here — return early outside the lock.
-    # The processor handles strength orchestration (including its own
-    # ensure_single_exercise_family call); the strength branch in
-    # process_activity_event holds an equivalent lock-friendly window via the
-    # synchronous fetch + post-fetch existence check.
-    if category == "strength":
-        log_event(logger, logging.INFO, "exercise_strength_routed_to_caller",
-                  sport_type=sport_type, strava_activity_id=strava_activity_id)
-        return False, "strength"
 
-    # Serialize concurrent processing of the same activity_id. Different
-    # activity_ids continue to run in parallel.
-    with strava_activity_lock(strava_activity_id):
-        if category == "other":
-            saved = save_other_exercise(strava_inbound_id, activity)
-            if saved and strava_activity_id is not None:
-                # Post-save sweep: clear any stale cardio/strength row left over
-                # from a re-tag (Run → Yoga etc.). Idempotent — no-op when
-                # siblings are empty. Failure here leaves a recoverable
-                # duplicate, not data loss; logged inside the helper.
-                ensure_single_exercise_family(strava_activity_id, keep="other")
-            return saved, "other"
+# Reads meta.presentation (what the site shows for a session, e.g. its photos) from the rows
+# the source created. Rows showing the Strava export's presentation are left out: their
+# title and photos came from Strava and are kept as they are.
+# Inputs: source_app, list of source activity ids as text.
+# Outputs: {source_activity_id: presentation} ({} when the row has none). Raises on DB error.
+def get_presentations(source_app: str, source_activity_ids: list[str]) -> dict[str, dict]:
+    if not source_activity_ids:
+        return {}
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_activity_id, meta->'presentation'
+                    FROM exercise.cardio_activities
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    UNION ALL
+                    SELECT source_activity_id, meta->'presentation'
+                    FROM exercise.strength_sessions
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    UNION ALL
+                    SELECT source_activity_id, meta->'presentation'
+                    FROM exercise.other_exercises
+                    WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)
+                    """,
+                    {"app": source_app, "ids": list(source_activity_ids)},
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {source_activity_id: presentation or {} for source_activity_id, presentation in rows
+            if (presentation or {}).get("source") != "strava_export"}
 
-        # Cardio path — category is run/walk/ride/swim.
-        saved, returned_category = save_cardio_activity(strava_inbound_id, activity)
-        final_category = returned_category or category
-        if saved and strava_activity_id is not None:
-            ensure_single_exercise_family(strava_activity_id, keep=final_category)
-        return saved, final_category
+
+# Sets meta.presentation on the row the source created, leaving the rest of meta alone. A row
+# showing the Strava export's presentation is never changed.
+# Inputs: source_app, source activity id, the new presentation.
+# Outputs: True if a row was updated. Raises on DB error.
+def save_presentation(source_app: str, source_activity_id: str, presentation: dict) -> bool:
+    updated = 0
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for table in ("cardio_activities", "strength_sessions", "other_exercises"):
+                    cur.execute(
+                        f"""
+                        UPDATE exercise.{table}
+                        SET meta = COALESCE(meta, '{{}}'::jsonb)
+                                   || jsonb_build_object('presentation', %s::jsonb),
+                            updated_at = now()
+                        WHERE source_app = %s AND source_activity_id = %s
+                          AND COALESCE(meta->'presentation'->>'source', '') <> 'strava_export'
+                        """,
+                        (json.dumps(presentation), source_app, source_activity_id),
+                    )
+                    updated += cur.rowcount
+    finally:
+        conn.close()
+    return updated > 0
+
+
+# Lists the newest rows the source created, in any exercise table.
+# Inputs: source_app, a UTC datetime the rows started at or after (None for any time), and
+#         how many to return at most.
+# Outputs: source activity ids as text, newest first. Raises on DB error.
+def get_recent_activity_ids(source_app: str, since, limit: int) -> list[str]:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_activity_id FROM (
+                        SELECT source_activity_id, started_at FROM exercise.cardio_activities
+                        WHERE source_app = %(app)s
+                        UNION ALL
+                        SELECT source_activity_id, started_at FROM exercise.strength_sessions
+                        WHERE source_app = %(app)s
+                        UNION ALL
+                        SELECT source_activity_id, started_at FROM exercise.other_exercises
+                        WHERE source_app = %(app)s
+                    ) recorded
+                    WHERE source_activity_id IS NOT NULL
+                      AND (%(since)s::timestamptz IS NULL OR started_at >= %(since)s)
+                    ORDER BY started_at DESC
+                    LIMIT %(limit)s
+                    """,
+                    {"app": source_app, "since": since, "limit": limit},
+                )
+                return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+# Deletes the rows the source created for the given ids, with their cardio splits and
+# strength sets, in one transaction. The planner's records of them are left to
+# week_planner.reconcile, which reopens a plan whose workout is gone.
+# Inputs: source_app, source activity ids as text. Outputs: rows deleted. Raises on DB error.
+def delete_activities(source_app: str, source_activity_ids: list[str]) -> int:
+    if not source_activity_ids:
+        return 0
+    params = {"app": source_app, "ids": list(source_activity_ids)}
+    deleted = 0
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM exercise.cardio_splits WHERE cardio_activity_id IN (
+                        SELECT cardio_activity_id FROM exercise.cardio_activities
+                        WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s))
+                    """, params)
+                cur.execute(
+                    """
+                    DELETE FROM exercise.strength_sets WHERE strength_session_id IN (
+                        SELECT strength_session_id FROM exercise.strength_sessions
+                        WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s))
+                    """, params)
+                for table in ("cardio_activities", "strength_sessions", "other_exercises"):
+                    cur.execute(
+                        f"DELETE FROM exercise.{table} "
+                        "WHERE source_app = %(app)s AND source_activity_id = ANY(%(ids)s)", params)
+                    deleted += cur.rowcount
+    finally:
+        conn.close()
+    log_event(logger, logging.INFO, "exercise_activities_deleted",
+              source_app=source_app, deleted=deleted, source_activity_ids=",".join(source_activity_ids))
+    return deleted

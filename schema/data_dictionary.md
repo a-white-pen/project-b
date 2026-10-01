@@ -6,7 +6,7 @@ _Auto-generated. Do not edit by hand. Run `python schema/dump_data_dictionary.py
 | Schema | Relations |
 |--------|-----------|
 | [`b`](#schema-b) | [`aligner_tray_changes`](#table-baligner_tray_changes) · [`aligner_wear_events`](#table-baligner_wear_events) · [`attention_sessions`](#table-battention_sessions) · [`body_composition`](#table-bbody_composition) · [`latest_location`](#view-blatest_location) · [`location`](#table-blocation) · [`period_days`](#table-bperiod_days) · [`sleep_wake_events`](#table-bsleep_wake_events) · [`weight_measurements`](#table-bweight_measurements) |
-| [`data_visualisation`](#schema-data_visualisation) | [`attention_visualisation`](#view-data_visualisationattention_visualisation) · [`body_aligner_day_visualisation`](#view-data_visualisationbody_aligner_day_visualisation) · [`body_aligner_status_visualisation`](#view-data_visualisationbody_aligner_status_visualisation) · [`body_aligner_tray_visualisation`](#view-data_visualisationbody_aligner_tray_visualisation) · [`body_composition_visualisation`](#view-data_visualisationbody_composition_visualisation) · [`body_weight_visualisation`](#view-data_visualisationbody_weight_visualisation) · [`fuel_day_visualisation`](#view-data_visualisationfuel_day_visualisation) · [`fuel_fast_visualisation`](#view-data_visualisationfuel_fast_visualisation) · [`fuel_item_visualisation`](#view-data_visualisationfuel_item_visualisation) · [`fuel_meal_visualisation`](#view-data_visualisationfuel_meal_visualisation) · [`location_visualisation`](#view-data_visualisationlocation_visualisation) · [`resources_spend_visualisation`](#view-data_visualisationresources_spend_visualisation) · [`resources_window_visualisation`](#view-data_visualisationresources_window_visualisation) · [`sleep_visualisation`](#view-data_visualisationsleep_visualisation) · [`today_fuel_visualisation`](#view-data_visualisationtoday_fuel_visualisation) · [`today_spend_visualisation`](#view-data_visualisationtoday_spend_visualisation) · [`today_training_visualisation`](#view-data_visualisationtoday_training_visualisation) · [`today_window_visualisation`](#view-data_visualisationtoday_window_visualisation) |
+| [`data_visualisation`](#schema-data_visualisation) | [`attention_visualisation`](#view-data_visualisationattention_visualisation) · [`body_aligner_day_visualisation`](#view-data_visualisationbody_aligner_day_visualisation) · [`body_aligner_status_visualisation`](#view-data_visualisationbody_aligner_status_visualisation) · [`body_aligner_tray_visualisation`](#view-data_visualisationbody_aligner_tray_visualisation) · [`body_composition_visualisation`](#view-data_visualisationbody_composition_visualisation) · [`body_weight_visualisation`](#view-data_visualisationbody_weight_visualisation) · [`fitness_activity_visualisation`](#view-data_visualisationfitness_activity_visualisation) · [`fuel_day_visualisation`](#view-data_visualisationfuel_day_visualisation) · [`fuel_fast_visualisation`](#view-data_visualisationfuel_fast_visualisation) · [`fuel_item_visualisation`](#view-data_visualisationfuel_item_visualisation) · [`fuel_meal_visualisation`](#view-data_visualisationfuel_meal_visualisation) · [`location_visualisation`](#view-data_visualisationlocation_visualisation) · [`resources_spend_visualisation`](#view-data_visualisationresources_spend_visualisation) · [`resources_window_visualisation`](#view-data_visualisationresources_window_visualisation) · [`sleep_visualisation`](#view-data_visualisationsleep_visualisation) · [`today_fuel_visualisation`](#view-data_visualisationtoday_fuel_visualisation) · [`today_spend_visualisation`](#view-data_visualisationtoday_spend_visualisation) · [`today_training_visualisation`](#view-data_visualisationtoday_training_visualisation) · [`today_window_visualisation`](#view-data_visualisationtoday_window_visualisation) |
 | [`exercise`](#schema-exercise) | [`activities`](#view-exerciseactivities) · [`cardio_activities`](#table-exercisecardio_activities) · [`cardio_plan`](#table-exercisecardio_plan) · [`cardio_splits`](#table-exercisecardio_splits) · [`other_exercises`](#table-exerciseother_exercises) · [`strength_plan`](#table-exercisestrength_plan) · [`strength_sessions`](#table-exercisestrength_sessions) · [`strength_sets`](#table-exercisestrength_sets) |
 | [`external_data`](#schema-external_data) | [`menu_current`](#view-external_datamenu_current) · [`menu_items`](#table-external_datamenu_items) |
 | [`finances`](#schema-finances) | [`fx_lot_allocations`](#table-financesfx_lot_allocations) · [`fx_lots`](#table-financesfx_lots) · [`spend_entries`](#table-financesspend_entries) |
@@ -205,6 +205,21 @@ Weight widget feed (body). One row per local day, the first weigh-in of that day
 | `weight_kg` | `numeric(5,2)` | yes |  |  |
 | `minutes_after_wake` | `integer` | yes |  |  |
 
+### View: `data_visualisation.fitness_activity_visualisation`
+Site footer Fitness card feed. The newest five sessions across cardio, strength and other exercises, newest first, started within the last 6 months. Live: a session shows as soon as it is recorded (no 15-minute delay, unlike the other public views). name prefers meta.presentation.title (the Strava title kept from the Strava export) over the recorded name; sport_type is the Strava-vocabulary type; timezone is where the session was recorded; url opens the session on Garmin Connect when its Garmin id is known, else on Strava; media_url is the first photo's display copy (from the Strava export, or copied from Garmin); profile_url is the Garmin Connect profile of the newest synced activity.
+
+| Column | Type | Nullable | Default | Notes |
+|--------|------|----------|---------|-------|
+| `name` | `text` | yes |  |  |
+| `sport_type` | `text` | yes |  |  |
+| `distance_m` | `numeric` | yes |  |  |
+| `moving_seconds` | `integer` | yes |  |  |
+| `started_at` | `timestamp with time zone` | yes |  |  |
+| `timezone` | `text` | yes |  |  |
+| `url` | `text` | yes |  |  |
+| `media_url` | `text` | yes |  |  |
+| `profile_url` | `text` | yes |  |  |
+
 ### View: `data_visualisation.fuel_day_visualisation`
 Fuel day-total feed (fuel). One row per local day over the last 6 months, summed from fuel_item_visualisation. meal_count is the number of distinct meal types logged that day.
 
@@ -374,15 +389,15 @@ Unified read model at SESSION grain across cardio_activities, strength_sessions,
 | `updated_at` | `timestamp with time zone` | yes |  |  |
 
 ### Table: `exercise.cardio_activities`
-One row per completed cardio activity synced from Strava. Covers runs, walks, hikes, rides, and swims. Non-distance activities (yoga, pilates, climbing, etc.) live in exercise.other_exercises; strength sessions live in exercise.strength_sessions. Grain: one activity. Source payload is in system.strava_inbound.
+One row per completed cardio activity. Covers runs, walks, hikes, rides, and swims. Non-distance activities (yoga, pilates, climbing, etc.) live in exercise.other_exercises; strength sessions live in exercise.strength_sessions. Grain: one activity. Source-agnostic: source_app + source_activity_id identify the origin platform. Garmin rows keep their raw payload in system.garmin_inbound (inbound_row_id); rows from before the Garmin sync came from the Strava webhook (system.strava_inbound).
 
 | Column | Type | Nullable | Default | Notes |
 |--------|------|----------|---------|-------|
 | `cardio_activity_id` | `integer` | no | nextval('exercise.cardio_activities_cardio_activity_id_seq'::regclass) |  |
-| `strava_inbound_id` | `integer` | no |  | FK to system.strava_inbound row that triggered this activity save. |
-| `strava_activity_id` | `bigint` | no |  | Strava activity ID. Unique — update events overwrite via application upsert logic, not new rows. |
+| `strava_inbound_id` | `integer` | yes |  | FK to the system.strava_inbound row that triggered this save. NULL for rows not from the Strava webhook. |
+| `strava_activity_id` | `bigint` | yes |  | Strava activity ID. NULL for rows not from the Strava webhook. Unique when present. |
 | `activity_name` | `text` | no |  |  |
-| `sport_type` | `text` | no |  | Raw Strava sport_type string, e.g. Run, Walk, Ride, TrailRun, VirtualRun, Hike. |
+| `sport_type` | `text` | no |  | Activity type in the Strava sport_type vocabulary, e.g. Run, Walk, Ride, TrailRun, VirtualRun, Hike. Garmin activity types are mapped onto it; the raw Garmin type key is kept in meta.garmin_type_key. |
 | `activity_category` | `text` | no |  | Normalised Project B category. Values for rows written on/after 2026-05-26: run, walk, ride, swim. Legacy value: other_cardio (historical rows from before non-distance activities were routed to exercise.other_exercises — never produced by the current classifier). |
 | `is_treadmill` | `boolean` | no | false | True when Strava trainer=true, indicating a treadmill or indoor trainer session. No GPS data. |
 | `started_at` | `timestamp with time zone` | no |  |  |
@@ -405,9 +420,12 @@ One row per completed cardio activity synced from Strava. Covers runs, walks, hi
 | `polyline` | `text` | yes |  | Google-encoded polyline of the GPS route. Null for treadmill and indoor activities. Decode with any polyline library for map visualisation. |
 | `start_lat` | `numeric(9,6)` | yes |  | Latitude of activity start point. Null for treadmill. |
 | `start_lng` | `numeric(9,6)` | yes |  | Longitude of activity start point. Null for treadmill. |
-| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance and fields not promoted to columns. Shape: {"strava_workout_type": ..., "splits_metric": [...], "external_id": "garmin_ping_..."}. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source provenance and fields not promoted to columns. Strava rows: {"strava_workout_type": ..., "external_id": "garmin_ping_..."}. Garmin rows: {"garmin_type_key": ..., "device_id": ...}. garmin_activity_id links a Strava-era row to its Garmin activity. presentation is what the site shows for the session: from the Strava export {"title", "description", "media": [{"type": "photo"\|"video", "file", "url", "display_url"}], "strava_activity_id", "source": "strava_export"}, or the photos B added in Garmin {"media": [{"type": "photo", "file", "url", "display_url", "garmin_image_id"}], "source": "garmin"}. The site shows its title and first photo. |
 | `created_at` | `timestamp with time zone` | no | now() |  |
 | `updated_at` | `timestamp with time zone` | yes |  |  |
+| `source_app` | `text` | no | 'garmin'::text | Platform that recorded the activity. garmin = Garmin Connect activity sync. strava = Strava webhook (rows recorded before the Garmin sync). |
+| `inbound_row_id` | `integer` | yes |  | Loose FK into the relevant raw inbound table — garmin_inbound_id when source_app=garmin, strava_inbound_id when source_app=strava. No PG foreign key because the target table varies by source. |
+| `source_activity_id` | `text` | yes |  | Activity ID in the source platform. TEXT to accommodate non-integer IDs from future sources. Unique per source_app. |
 
 ### Table: `exercise.cardio_plan`
 Planned structured run (one row/day; UNIQUE plan_date). Holds detail only for actual runs (treadmill/outdoor); ad-hoc cardio (hash/hike/cycle/swim) sits as activity_type=cardio with NO row here and reconciles loosely against cardio_activities. Real FK to daily_plan + trigger requires activity_type contains 'cardio'.
@@ -416,7 +434,7 @@ Planned structured run (one row/day; UNIQUE plan_date). Holds detail only for ac
 |--------|------|----------|---------|-------|
 | `cardio_plan_id` | `integer` | no | nextval('exercise.cardio_plan_cardio_plan_id_seq'::regclass) |  |
 | `plan_date` | `date` | no |  |  |
-| `status` | `text` | no | 'planned'::text | planned -> done \| skipped \| unplanned. Forward-only. |
+| `status` | `text` | no | 'planned'::text | planned -> done \| skipped \| unplanned. Forward-only, except that a workout deleted after it was matched (in Garmin, or by hand) is undone by the reconciler: its done plan is planned again, and an unplanned record made for it is removed. |
 | `run_type` | `text` | yes |  | easy \| long \| quality \| fartlek. Drives delivery (text vs Garmin push). |
 | `run_surface` | `text` | yes |  | treadmill (default) \| outdoor. |
 | `target_distance_m` | `integer` | yes |  | Coarse target distance (m). Duration is derived (distance ÷ pace). |
@@ -458,7 +476,7 @@ One row per completed activity that is neither distance-based cardio (run/walk/r
 | `other_exercise_id` | `integer` | no | nextval('exercise.other_exercises_other_exercise_id_seq'::regclass) | Surrogate primary key. |
 | `strava_inbound_id` | `integer` | yes |  | Loose FK to system.strava_inbound row that triggered this save. NULL when the row did not originate from a Strava webhook (e.g. manual entry or future direct-source ingestion). |
 | `strava_activity_id` | `bigint` | yes |  | Strava activity ID. NULL when not Strava-triggered. Unique when present — update events overwrite via application upsert logic, not new rows. |
-| `source_app` | `text` | no | 'strava'::text | Platform that recorded the session. strava = Strava webhook (today). Future: garmin (direct Garmin Connect ingest), apple_health, manual. |
+| `source_app` | `text` | no | 'strava'::text | Platform that recorded the session. garmin = Garmin Connect activity sync. strava = Strava webhook (rows recorded before the Garmin sync). manual = logged directly. |
 | `inbound_row_id` | `integer` | yes |  | Loose FK into the relevant raw inbound table — strava_inbound_id when source_app=strava. No PG foreign key because the target table varies by source. |
 | `source_activity_id` | `text` | yes |  | Activity ID in the source platform. TEXT to accommodate non-integer IDs from future sources. |
 | `activity_type` | `text` | no |  | Normalised activity type. Examples: yoga, pilates, climbing. Free-form text validated in app code only (no CHECK constraint) so new types can be added without a migration. |
@@ -471,7 +489,7 @@ One row per completed activity that is neither distance-based cardio (run/walk/r
 | `calories_kcal` | `integer` | yes |  | Active calories burned as reported by the source platform. NULL when not available. |
 | `perceived_exertion` | `integer` | yes |  | RPE 1–10, B-reported via Telegram. NULL until reported. Not device-recorded. |
 | `device_name` | `text` | yes |  | Name of the recording device, e.g. Garmin Forerunner 265. NULL when not available from source. |
-| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific and type-specific fields not promoted to dedicated columns. Examples — climbing: {"hardest_grade": "V4", "route_count": 8}; yoga: {"style": "vinyasa", "instructor": "..."}; strava provenance: {"external_id": "garmin_ping_..."}. Keeps schema stable as new activity types arrive. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific and type-specific fields not promoted to dedicated columns. Examples — climbing: {"hardest_grade": "V4", "route_count": 8}; yoga: {"style": "vinyasa", "instructor": "..."}; strava provenance: {"external_id": "garmin_ping_..."}; Garmin sync: {"sport_type", "garmin_type_key", "distance_m", "moving_seconds"}. garmin_activity_id links a Strava-era row to its Garmin activity. presentation is what the site shows: {"title", "description", "media", "strava_activity_id", "source": "strava_export"} from the Strava export, or {"media", "source": "garmin"} with the photos B added in Garmin. The site shows its title and first photo. Keeps schema stable as new activity types arrive. |
 | `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp (UTC). |
 | `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp (UTC). Set on any correction or re-sync. |
 
@@ -482,7 +500,7 @@ Planned strength session (one row/day; UNIQUE plan_date). Sun scaffold writes in
 |--------|------|----------|---------|-------|
 | `strength_plan_id` | `integer` | no | nextval('exercise.strength_plan_strength_plan_id_seq'::regclass) |  |
 | `plan_date` | `date` | no |  |  |
-| `status` | `text` | no | 'planned'::text | planned -> done (reconciled to an actual) \| skipped (passed, none) \| unplanned (did it w/o a plan; reconciler-created). Forward-only. Counts toward the target when status IN (done,unplanned). |
+| `status` | `text` | no | 'planned'::text | planned -> done (reconciled to an actual) \| skipped (passed, none) \| unplanned (did it w/o a plan; reconciler-created). Forward-only, except that a workout deleted after it was matched (in Garmin, or by hand) is undone by the reconciler: its done plan is planned again, and an unplanned record made for it is removed. Counts toward the target when status IN (done,unplanned). |
 | `plan` | `jsonb` | yes |  | Day-of detail JSONB: {"exercises":[{name,watch_label,location,garmin,sets,reps:{low,high},reps_per_side,rest_s:{low,high},weight:{kg_low,kg_high,basis},note,fit:{reps,rest_s,weight_kg}}],"focus":...,"estimated_minutes":...,"rationale":...,"model":...}. NULL at scaffold; regenerated + pushed to Garmin day-of. |
 | `garmin_workout_id` | `text` | yes |  | Garmin Connect id of the workout PUSHED to B's watch (set when pushed, before she trains). NULL if not pushed. Distinct from completion. |
 | `completed_strength_session_id` | `integer` | yes |  | Loose FK to exercise.strength_sessions — the ACTUAL session, set by the reconciler after. NULL until done. |
@@ -511,7 +529,7 @@ One row per strength training session. Source-agnostic: source_app + source_acti
 | `total_exercises` | `integer` | yes |  | Count of distinct exercise names recorded in the session. |
 | `perceived_exertion` | `integer` | yes |  | RPE 1–10, B-reported via Telegram. NULL until reported. Not device-recorded. |
 | `device_name` | `text` | yes |  | Name of the recording device, e.g. Garmin Forerunner 265. NULL when not available from source. |
-| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific fields not promoted to dedicated columns. Keeps schema stable as source platforms evolve. |
+| `meta` | `jsonb` | no | '{}'::jsonb | Source-specific fields not promoted to dedicated columns. Keeps schema stable as source platforms evolve. Garmin: {"garmin_activity_id", "device_id"}, plus {"garmin_type_key", "sport_type", "timezone"} from the Garmin sync (timezone = where the session was recorded). presentation is what the site shows: {"title", "description", "media", "strava_activity_id", "source": "strava_export"} from the Strava export, or {"media", "source": "garmin"} with the photos B added in Garmin. The site shows its title and first photo. |
 | `created_at` | `timestamp with time zone` | no | now() | Row creation timestamp (UTC). |
 | `updated_at` | `timestamp with time zone` | yes |  | Last update timestamp (UTC). Set on any correction or re-sync. |
 
@@ -734,7 +752,7 @@ Raw payloads fetched from Garmin Connect. One row per successful fetch (no upser
 | `payload` | `jsonb` | no |  | JSON shape: {"summary": <activity_detail>, "exercise_sets": <exerciseSets response>, "hr_samples": [[timestamp_ms, hr_bpm], ...]}. hr_samples is the second-by-second HR stream from the details endpoint; may be absent for rows captured before that field was added. |
 | `strava_inbound_id` | `integer` | yes |  | FK to the Strava webhook event that triggered this fetch. NULL for backfill or manual CLI runs. |
 | `received_at` | `timestamp with time zone` | no | now() |  |
-| `source` | `text` | no |  | Why this fetch happened. strava_trigger = Strava webhook fired and we looked up the matching Garmin activity. backfill = one-off historical sync. manual = ad-hoc CLI run. |
+| `source` | `text` | no |  | Why this fetch happened. strava_trigger = a Strava webhook fired and the activity was looked up on Garmin (since the Garmin sync, the doorbell check; before it, the Strava pipeline's lookup). command = B sent /sync_garmin. backfill = inbound.garmin.backfill over a date range (and the earlier one-off historical sync). manual = an ad-hoc run. |
 
 ### Table: `system.garmin_tokens`
 Single-row cache of the Garmin Connect DI OAuth2 token blob. Written by the garmin-health-data CLI bootstrap (garmin auth). di_token (~18h) is refreshed automatically; di_refresh_token rotates on each refresh (~30d). Re-bootstrap needed only if refresh_token expires.

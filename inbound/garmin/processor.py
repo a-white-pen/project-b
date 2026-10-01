@@ -1,230 +1,243 @@
 """
-Garmin Connect strength session processor — fetches activity detail when a Strava
-WeightTraining/Workout/Crossfit event fires, stores the raw payload in
-system.garmin_inbound, parses it into exercise.strength_sessions + strength_sets,
-and sends a Telegram notification.
+Garmin Connect activity processor — turns one Garmin activity into an exercise row and a
+Telegram confirmation.
+
+Called by inbound.garmin.sync for every activity not yet recorded. The Garmin payload is
+normalized into the exercise domain's activity dict, so classification, the tables written
+and the message formats are the same ones the Strava feed produced.
 
 Functions:
-  process_strength_event(strava_inbound_id, strava_activity) — main entry point;
-      called from inbound.strava.processor when sport_type is a strength type.
-      Matches the Garmin activity by start time, fetches detail + exercise sets,
-      stores raw payload (Phase 1), parses + saves structured rows (Phase 2),
-      and sends Telegram notification. Retries up to 3 times if Garmin hasn't synced.
-  _match_garmin_activity(client, strava_start_dt) — searches Garmin for an activity
-      within ±120s of the Strava start time; returns the Garmin activity dict or None.
-  fetch_garmin_detail(client, garmin_activity_id) — fetches full summary and
-      exercise sets for one Garmin activity.
-  _store_garmin_inbound(object_id, payload, strava_inbound_id) — inserts one row
-      into system.garmin_inbound; returns the new garmin_inbound_id.
-
-Shared outbound helpers (get_latest_chat_id, store_outbound) live in telegram.replies.
+  process_activity(client, listed, notify, now, source) — fetches the activity detail (plus
+      laps for cardio, exercise sets and HR for strength), stores the raw payload in
+      system.garmin_inbound, saves the exercise row and, when the row is new and notify is
+      set, sends the Telegram confirmation and planner nudge. Returns the outcome.
+  map_sport_type(activity_type)  — Garmin activityType → (sport_type, is_treadmill)
+  parse_garmin_time(value)       — Garmin GMT timestamp → UTC datetime
+  _normalize_activity(...)       — Garmin detail + laps → exercise domain activity dict
+  _normalize_splits(splits, category) — Garmin lapDTOs → exercise.cardio_splits rows
+  _cadence(category, *sources)   — cadence in the stored unit (one-foot count for run/walk)
+  _timezone_name(summary, started_at) — IANA zone the activity was recorded in
+  _fetch_exercise_sets(client, garmin_activity_id) — raw exercise sets for a session
+  _fetch_activity_hr(client, garmin_activity_id)   — second-by-second HR samples
+  _first_fetch_at(garmin_activity_id) — when the activity was first fetched (sets wait)
+  _store_garmin_inbound(object_id, payload, source) — inserts one system.garmin_inbound row
+  _send_confirmation(text, garmin_activity_id) — sends and logs one proactive Telegram message
 """
 
 import json
 import logging
-import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
+from domains.exercise.activity_formatter import format_activity_notification
+from domains.exercise.service import (
+    CARDIO_CATEGORIES,
+    classify_activity,
+    save_cardio_activity,
+    save_other_exercise,
+)
 from domains.exercise.strength_formatter import format_strength_notification
 from domains.exercise.strength_service import parse_active_sets, save_strength_session
-from inbound.garmin.client import get_garmin_client
 from system.db import get_connection
 from system.logging import log_event, log_failure
-from telegram.replies import get_latest_chat_id, send_reply, store_outbound
+from system.timezone import get_timezone
+from telegram.replies import get_latest_chat_id, send_logged
 
 logger = logging.getLogger(__name__)
 
-# Retry delays (seconds) when Garmin hasn't synced the session yet.
-_RETRY_DELAYS = [90, 240, 600]
+# Garmin activityType.typeKey → (sport_type, is_treadmill). sport_type is the vocabulary the
+# exercise tables already hold — the names Garmin activities carried when they arrived via
+# Strava — so the same workout classifies, labels and stores exactly as before.
+_SPORT_TYPES = {
+    "running": ("Run", False),
+    "street_running": ("Run", False),
+    "track_running": ("Run", False),
+    "ultra_run": ("Run", False),
+    "obstacle_run": ("Run", False),
+    "treadmill_running": ("Run", True),
+    "indoor_running": ("Run", True),
+    "trail_running": ("TrailRun", False),
+    "virtual_run": ("VirtualRun", True),
+    "walking": ("Walk", False),
+    "casual_walking": ("Walk", False),
+    "speed_walking": ("Walk", False),
+    "hiking": ("Hike", False),
+    "rucking": ("Hike", False),
+    "cycling": ("Ride", False),
+    "road_biking": ("Ride", False),
+    "indoor_cycling": ("Ride", True),
+    "virtual_ride": ("VirtualRide", True),
+    "mountain_biking": ("MountainBikeRide", False),
+    "gravel_cycling": ("GravelRide", False),
+    "e_bike_fitness": ("EBikeRide", False),
+    "lap_swimming": ("Swim", False),
+    "swimming": ("Swim", False),
+    "open_water_swimming": ("OpenWaterSwim", False),
+    "strength_training": ("WeightTraining", False),
+    "indoor_cardio": ("Workout", False),
+    "other": ("Workout", False),
+    "hiit": ("HighIntensityIntervalTraining", False),
+    "yoga": ("Yoga", False),
+    "pilates": ("Pilates", False),
+    "elliptical": ("Elliptical", False),
+    "stair_climbing": ("StairStepper", False),
+    "indoor_rowing": ("Rowing", False),
+    "rowing": ("Rowing", False),
+    "indoor_climbing": ("RockClimbing", False),
+    "bouldering": ("RockClimbing", False),
+    "rock_climbing": ("RockClimbing", False),
+}
+
+# Child types missing from the map above fall back to their parent (activityType.parentTypeId).
+_PARENT_SPORT_TYPES = {
+    1: ("Run", False),
+    2: ("Ride", False),
+    3: ("Hike", False),
+    9: ("Walk", False),
+    26: ("Swim", False),
+}
+
+# Recorded on the watch but not exercise; never written to the exercise tables.
+IGNORED_TYPES = {"meditation", "breathwork"}
+
+# Garmin often lists a strength session before its exercise sets are processed. A
+# strength_training session without sets is re-checked on each sync for this long after
+# it was first fetched, then saved without sets.
+_SETS_GRACE = timedelta(minutes=30)
 
 
-# Entry point — called as a FastAPI BackgroundTask from inbound.strava.processor.
-# Fetches the matching Garmin activity for a Strava strength event, stores the raw
-# payload (Phase 1), parses + saves structured rows (Phase 2), and sends Telegram
-# notification. Retries on a fixed schedule if Garmin hasn't processed the session yet.
-# Inputs: strava_inbound_id (FK to system.strava_inbound), full Strava activity dict.
-# Outputs: none — result logged; rows written to strength_sessions / strength_sets;
-#          notification sent to Telegram.
-def process_strength_event(strava_inbound_id: int, strava_activity: dict) -> None:
-    sport_type = strava_activity.get("sport_type", "")
-    strava_activity_id = strava_activity.get("id")
-    strava_start_str = strava_activity.get("start_date", "")
+# Maps a Garmin activityType dict to (sport_type, is_treadmill). Unknown keys become a
+# CamelCase sport_type ("tai_chi" → "TaiChi") and classify as "other".
+def map_sport_type(activity_type: dict) -> tuple[str, bool]:
+    type_key = (activity_type.get("typeKey") or "").lower()
+    if type_key in _SPORT_TYPES:
+        return _SPORT_TYPES[type_key]
+    parent = _PARENT_SPORT_TYPES.get(activity_type.get("parentTypeId"))
+    if parent:
+        return parent
+    return "".join(part.capitalize() for part in type_key.split("_")), False
 
-    log_event(logger, logging.INFO, "garmin_strength_event_started",
-              strava_inbound_id=strava_inbound_id,
-              strava_activity_id=strava_activity_id,
-              sport_type=sport_type)
 
-    try:
-        strava_start_dt = datetime.fromisoformat(
-            strava_start_str.replace("Z", "+00:00")
-        )
-    except (ValueError, AttributeError):
-        log_event(logger, logging.ERROR, "garmin_strength_invalid_start_date",
-                  strava_inbound_id=strava_inbound_id,
-                  strava_activity_id=strava_activity_id)
-        return
-
-    for attempt in range(len(_RETRY_DELAYS) + 1):
-        if attempt > 0:
-            delay = _RETRY_DELAYS[attempt - 1]
-            log_event(logger, logging.INFO, "garmin_strength_retry_wait",
-                      strava_inbound_id=strava_inbound_id,
-                      attempt=attempt,
-                      delay_seconds=delay)
-            # Known limitation: time.sleep() inside a FastAPI background task holds a
-            # Cloud Run instance for up to 15.5 min. The instance may be killed mid-sleep
-            # on scale-to-zero. Acceptable for now; proper fix is Cloud Tasks enqueue.
-            time.sleep(delay)
-
+# Parses a Garmin GMT timestamp ("2026-09-29 06:05:12", "2026-09-29T06:05:12.0" or epoch ms)
+# into a UTC datetime. Raises ValueError on anything else.
+def parse_garmin_time(value) -> datetime:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    text = str(value or "").strip().replace("T", " ").rstrip("Z")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
-            client = get_garmin_client()
-            garmin_activity = _match_garmin_activity(client, strava_start_dt)
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError("unrecognised Garmin timestamp")
 
-            if garmin_activity is None:
-                log_event(logger, logging.WARNING, "garmin_strength_no_match",
-                          strava_inbound_id=strava_inbound_id,
-                          attempt=attempt)
-                if attempt < len(_RETRY_DELAYS):
-                    continue
-                log_event(logger, logging.WARNING, "garmin_strength_match_exhausted",
-                          strava_inbound_id=strava_inbound_id,
-                          strava_activity_id=strava_activity_id)
-                return
 
-            garmin_activity_id = garmin_activity.get("activityId")
-            summary, exercise_sets, hr_samples = fetch_garmin_detail(client, garmin_activity_id)
+# Processes one Garmin activity end to end. Called by inbound.garmin.sync for activities
+# that are not yet recorded; the unique source id on each table keeps a repeat harmless.
+# Inputs: logged-in GarminApiClient, the activity's entry from the activity list, whether
+#         a new row should be confirmed on Telegram, the run's current UTC time, and the
+#         system.garmin_inbound source label (see inbound.garmin.sync.run_activity_sync).
+# Outputs: "saved" (new row), "not_saved" (already recorded or save failed; logged),
+#          "waiting" (strength sets not synced yet) or "ignored" (not exercise).
+#          Raises on Garmin API errors so the caller retries on its next run.
+def process_activity(client, listed: dict, notify: bool, now: datetime, source: str = "manual") -> str:
+    garmin_activity_id = listed["activityId"]
+    activity_type = listed.get("activityType") or {}
+    type_key = activity_type.get("typeKey")
 
-            # Guard: Garmin often syncs the activity summary before exercise sets arrive.
-            # Treat empty sets as a transient failure and retry on the same schedule as
-            # no-match; on the final attempt log a warning and give up without saving.
-            if not exercise_sets:
-                log_event(logger, logging.WARNING, "garmin_strength_empty_sets",
+    if type_key in IGNORED_TYPES:
+        log_event(logger, logging.INFO, "garmin_activity_ignored",
+                  garmin_activity_id=garmin_activity_id, type_key=type_key)
+        return "ignored"
+
+    sport_type, is_treadmill = map_sport_type(activity_type)
+    category = classify_activity(sport_type)
+    log_event(logger, logging.INFO, "garmin_activity_processing",
+              garmin_activity_id=garmin_activity_id, type_key=type_key,
+              sport_type=sport_type, category=category, notify=notify)
+
+    summary = client.connectapi(f"/activity-service/activity/{garmin_activity_id}") or {}
+    payload = {"activity": listed, "summary": summary}
+
+    if category == "strength":
+        exercise_sets = _fetch_exercise_sets(client, garmin_activity_id)
+        payload["exercise_sets"] = exercise_sets
+        summary_dto = summary.get("summaryDTO") or {}
+        session_start = summary_dto.get("startTimeGMT") or summary_dto.get("startTimeLocal")
+        has_sets = bool(parse_active_sets(exercise_sets, session_start_str=session_start))
+
+        if not has_sets and sport_type != "WeightTraining":
+            # Cardio / Other sessions only count as strength when sets were recorded.
+            category = "other"
+        elif not has_sets:
+            first_fetched = _first_fetch_at(garmin_activity_id)
+            if first_fetched is None or now - first_fetched < _SETS_GRACE:
+                if first_fetched is None:
+                    _store_garmin_inbound(garmin_activity_id, payload, source)
+                log_event(logger, logging.INFO, "garmin_strength_sets_pending",
                           garmin_activity_id=garmin_activity_id,
-                          strava_inbound_id=strava_inbound_id,
-                          attempt=attempt)
-                if attempt < len(_RETRY_DELAYS):
-                    continue
-                log_event(logger, logging.WARNING, "garmin_strength_sets_exhausted",
-                          garmin_activity_id=garmin_activity_id,
-                          strava_inbound_id=strava_inbound_id,
-                          strava_activity_id=strava_activity_id)
-                return
-
-            # Guard: a non-empty raw payload can still parse to zero active sets if
-            # all rows are REST/WARMUP (Garmin tags set types in a second pass).
-            # Retry on the same schedule; give up without saving on the final attempt.
-            # Count-only check; HR is correlated later inside save_strength_session.
-            _summary_dto = summary.get("summaryDTO") or {}
-            _session_start = _summary_dto.get("startTimeGMT") or _summary_dto.get("startTimeLocal")
-            if not parse_active_sets(exercise_sets, session_start_str=_session_start):
-                log_event(logger, logging.WARNING, "garmin_strength_no_active_sets",
-                          garmin_activity_id=garmin_activity_id,
-                          raw_set_count=len(exercise_sets),
-                          strava_inbound_id=strava_inbound_id,
-                          attempt=attempt)
-                if attempt < len(_RETRY_DELAYS):
-                    continue
-                log_event(logger, logging.WARNING, "garmin_strength_active_sets_exhausted",
-                          garmin_activity_id=garmin_activity_id,
-                          strava_inbound_id=strava_inbound_id,
-                          strava_activity_id=strava_activity_id)
-                return
-
-            payload = {"summary": summary, "exercise_sets": exercise_sets, "hr_samples": hr_samples}
-            garmin_inbound_id = _store_garmin_inbound(
-                garmin_activity_id, payload, strava_inbound_id
-            )
-
-            log_event(logger, logging.INFO, "garmin_payload_captured",
-                      garmin_inbound_id=garmin_inbound_id,
+                          raw_set_count=len(exercise_sets))
+                return "waiting"
+            log_event(logger, logging.WARNING, "garmin_strength_saved_without_sets",
                       garmin_activity_id=garmin_activity_id,
-                      strava_inbound_id=strava_inbound_id,
-                      has_exercise_sets=bool(exercise_sets),
-                      set_count=len(exercise_sets) if isinstance(exercise_sets, list) else 0,
-                      attempt=attempt)
+                      raw_set_count=len(exercise_sets))
 
-            # Phase 2 — parse and save structured rows, then notify.
-            _parse_and_notify(
-                garmin_inbound_id=garmin_inbound_id,
-                summary=summary,
-                exercise_sets=exercise_sets,
-                hr_samples=hr_samples,
-                strava_inbound_id=strava_inbound_id,
-                strava_activity_id=strava_activity_id,
-                strava_activity=strava_activity,
-            )
-            return
+        if category == "strength":
+            payload["hr_samples"] = _fetch_activity_hr(client, garmin_activity_id) if has_sets else []
 
-        except Exception as e:
-            log_failure(logger, logging.ERROR, "garmin_strength_event_failed", e,
-                        strava_inbound_id=strava_inbound_id,
-                        attempt=attempt)
-            if attempt < len(_RETRY_DELAYS):
-                continue
-            return
+    elif category in CARDIO_CATEGORIES:
+        payload["splits"] = client.connectapi(
+            f"/activity-service/activity/{garmin_activity_id}/splits"
+        ) or {}
 
+    garmin_inbound_id = _store_garmin_inbound(garmin_activity_id, payload, source)
+    activity = _normalize_activity(listed, summary, payload.get("splits"),
+                                   sport_type, is_treadmill, category, garmin_inbound_id)
 
-# Parses the captured Garmin payload into structured rows and sends Telegram notification.
-# Inputs: all fields needed for save_strength_session + the original Strava activity
-#         dict (used to extract timezone and start_date for local time display).
-#         strava_start_dt: optional UTC datetime override — used by the replay script
-#         where strava_activity is the webhook event body (no start_date field).
-# Outputs: none — rows written to DB; notification sent; failures logged and swallowed.
-def _parse_and_notify(
-    garmin_inbound_id: int,
-    summary: dict,
-    exercise_sets: list,
-    hr_samples: list,
-    strava_inbound_id: int,
-    strava_activity_id: int | None,
-    strava_activity: dict,
-    strava_start_dt: datetime | None = None,
-) -> None:
-    # Parse Strava start_date (UTC) — authoritative time source.
-    # summaryDTO.startTimeGMT is true UTC; exercise_set startTime is also UTC — consistent.
-    # strava_start_dt may already be set (e.g. passed by the replay script).
-    if strava_start_dt is None:
-        strava_start_str = strava_activity.get("start_date", "")
-        if strava_start_str:
+    if category == "strength":
+        return _save_strength(activity, summary, payload, notify)
+
+    saved = (save_cardio_activity(activity) if category in CARDIO_CATEGORIES
+             else save_other_exercise(activity))
+    if not saved:
+        return "not_saved"
+
+    if notify:
+        _send_confirmation(format_activity_notification(activity, category), garmin_activity_id)
+        # A new cardio session reconciles its planned day and sends the weekly tally nudge.
+        # Lazy-imported and wrapped so it can never affect ingestion.
+        if category in CARDIO_CATEGORIES:
             try:
-                strava_start_dt = datetime.fromisoformat(strava_start_str.replace("Z", "+00:00"))
-            except ValueError:
-                pass
+                from domains.health_agent.week_planner.activity_nudge import notify_activity_landed
+                distance_m = activity.get("distance_m")
+                detail = f"{category} ({distance_m / 1000:.1f} km)" if distance_m else category
+                notify_activity_landed(activity["started_at"], "cardio", detail)
+            except Exception as e:
+                log_failure(logger, logging.WARNING, "cardio_reconcile_nudge_failed", e,
+                            garmin_activity_id=garmin_activity_id)
+    return "saved"
 
+
+# Saves a strength session from the stored payload and, when new and notify is set, sends
+# the set-table confirmation and the planner nudge.
+# Inputs: normalized activity dict, Garmin activity detail, the stored payload, notify flag.
+# Outputs: "saved" or "not_saved", as for process_activity.
+def _save_strength(activity: dict, summary: dict, payload: dict, notify: bool) -> str:
     strength_session_id, parsed_sets, created = save_strength_session(
-        garmin_inbound_id=garmin_inbound_id,
+        garmin_inbound_id=activity["inbound_row_id"],
         summary=summary,
-        exercise_sets=exercise_sets,
-        hr_samples=hr_samples,
-        strava_inbound_id=strava_inbound_id,
-        strava_activity_id=strava_activity_id,
-        strava_start_dt=strava_start_dt,
+        exercise_sets=payload["exercise_sets"],
+        started_at=activity["started_at"],
+        hr_samples=payload["hr_samples"],
+        extra_meta={**activity["meta"], "sport_type": activity["sport_type"],
+                    "timezone": activity["timezone"]},
     )
-    if strength_session_id is None:
-        log_event(logger, logging.WARNING, "garmin_strength_save_failed_no_notify",
-                  garmin_inbound_id=garmin_inbound_id)
-        return
     if not created:
-        # Session already existed (duplicate Strava delivery or retry after partial success).
-        # Do not send a second notification.
-        log_event(logger, logging.INFO, "garmin_strength_duplicate_skipped",
-                  garmin_inbound_id=garmin_inbound_id,
-                  strength_session_id=strength_session_id)
-        return
+        return "not_saved"
+    if not notify:
+        return "saved"
 
-    # Extract timezone from Strava activity for local time display.
-    tz_raw = strava_activity.get("timezone") or ""
-    # Strava format: "(GMT+07:00) Asia/Bangkok" — extract the IANA part.
-    timezone_str = tz_raw.split(") ", 1)[1] if ") " in tz_raw else "Asia/Bangkok"
-
-    # Build notification fields from summaryDTO (where Garmin nests session stats).
     summary_dto = summary.get("summaryDTO") or {}
-    activity_name = (
-        summary.get("activityName") or summary.get("activityDescription") or "Strength Session"
-    )
-    # Use Strava start_date (UTC) for display; formatter converts to local time via timezone_str.
-    started_at = strava_start_dt
     duration_raw = summary_dto.get("duration") or summary_dto.get("elapsedDuration")
     avg_hr_raw = summary_dto.get("averageHR") or summary_dto.get("averageHeartRate")
     max_hr_raw = summary_dto.get("maxHR") or summary_dto.get("maxHeartRate")
@@ -232,111 +245,177 @@ def _parse_and_notify(
 
     try:
         text = format_strength_notification(
-            activity_name=activity_name,
-            started_at=started_at,  # UTC datetime; formatter converts to local via timezone_str
+            activity_name=activity["name"],
+            started_at=activity["started_at"],
             duration_seconds=int(duration_raw) if duration_raw else None,
             avg_hr=float(avg_hr_raw) if avg_hr_raw is not None else None,
             max_hr=float(max_hr_raw) if max_hr_raw is not None else None,
             calories_kcal=int(calories_raw) if calories_raw else None,
             parsed_sets=parsed_sets,
-            timezone_str=timezone_str,
+            timezone_str=activity["timezone"],
         )
     except Exception as e:
         log_failure(logger, logging.ERROR, "garmin_strength_format_failed", e,
                     strength_session_id=strength_session_id)
-        return
+        return "saved"
 
-    chat_id = get_latest_chat_id()
-    if chat_id is None:
-        log_event(logger, logging.WARNING, "garmin_strength_no_chat_id",
-                  strength_session_id=strength_session_id)
-        return
+    _send_confirmation(text, activity["source_activity_id"])
 
-    message_id, sent_payload = send_reply(chat_id, text)
-    if message_id is not None:
-        store_outbound(message_id, sent_payload)
-
-    log_event(logger, logging.INFO, "garmin_strength_notification_sent",
-              strength_session_id=strength_session_id,
-              chat_id=chat_id,
-              message_id=message_id,
-              parsed_sets_count=len(parsed_sets))
-
-    # Spec F: a NEW strength session reconciles its planned day + sends a proactive tally nudge. Reached
-    # only on created=True (the early return above blocks re-syncs); lazy-imported + wrapped so it can
-    # NEVER affect ingestion.
+    # A new strength session reconciles its planned day and sends the weekly tally nudge.
+    # Lazy-imported and wrapped so it can never affect ingestion.
     try:
         from domains.health_agent.week_planner.activity_nudge import notify_activity_landed
-        notify_activity_landed(started_at, "strength", "strength session")
+        notify_activity_landed(activity["started_at"], "strength", "strength session")
     except Exception as e:
         log_failure(logger, logging.WARNING, "strength_reconcile_nudge_failed", e,
                     strength_session_id=strength_session_id)
+    return "saved"
 
 
-# Searches Garmin for an activity within ±120s of the given UTC datetime.
-# Fetches activities for a ±1 day window around the Strava start time to account
-# for timezone differences, then filters by start time proximity.
-# Only returns an activity that started within 120s of strava_start_dt.
-# Inputs: logged-in Garmin client, Strava activity start time as UTC datetime.
-# Outputs: Garmin activity dict (from the activity list endpoint) or None.
-def _match_garmin_activity(client, strava_start_dt: datetime) -> dict | None:
-    window_start = (strava_start_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    window_end = (strava_start_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+# Builds the exercise domain's activity dict from Garmin's detail (summaryDTO), falling back
+# to the activity-list entry for any field the detail lacks.
+# Inputs: list entry, activity detail, splits response (cardio only), mapped sport_type,
+#         treadmill flag, routing category, and the system.garmin_inbound row id.
+# Outputs: normalized activity dict (keys documented in domains.exercise.service).
+def _normalize_activity(listed: dict, summary: dict, splits: dict | None, sport_type: str,
+                        is_treadmill: bool, category: str, inbound_row_id: int) -> dict:
+    summary_dto = summary.get("summaryDTO") or {}
 
-    activities = client.connectapi(
-        "/activitylist-service/activities/search/activities",
-        params={"startDate": window_start, "endDate": window_end, "limit": 20},
-    ) or []
+    # First non-null value for any of the keys, detail before list entry.
+    def pick(*keys):
+        for source in (summary_dto, listed):
+            for key in keys:
+                if source.get(key) is not None:
+                    return source[key]
+        return None
 
-    best = None
-    best_delta = timedelta(seconds=120)
+    started_at = parse_garmin_time(summary_dto.get("startTimeGMT") or listed.get("startTimeGMT"))
+    duration = pick("elapsedDuration", "duration")
+    moving = pick("movingDuration", "duration")
+    rpe = summary_dto.get("directWorkoutRpe")
+    device_id = (
+        ((summary.get("metadataDTO") or {}).get("deviceMetaDataDTO") or {}).get("deviceId")
+        or listed.get("deviceId")
+    )
+    meta = {"garmin_type_key": (listed.get("activityType") or {}).get("typeKey")}
+    if device_id:
+        meta["device_id"] = str(device_id)
 
-    for activity in activities:
-        start_str = activity.get("startTimeGMT") or activity.get("startTimeLocal", "")
-        if not start_str:
+    return {
+        "source_app": "garmin",
+        "source_activity_id": str(listed["activityId"]),
+        "inbound_row_id": inbound_row_id,
+        "name": summary.get("activityName") or listed.get("activityName") or "Activity",
+        "sport_type": sport_type,
+        "is_treadmill": is_treadmill,
+        "started_at": started_at,
+        "timezone": _timezone_name(summary, started_at),
+        "duration_seconds": round(duration) if duration is not None else 0,
+        "moving_seconds": round(moving) if moving is not None else 0,
+        "distance_m": pick("distance"),
+        "elevation_gain_m": pick("elevationGain"),
+        "elev_high_m": pick("maxElevation"),
+        "elev_low_m": pick("minElevation"),
+        "average_speed_mps": pick("averageSpeed"),
+        "max_speed_mps": pick("maxSpeed"),
+        "average_cadence": _cadence(category, summary_dto, listed),
+        "average_heartrate": pick("averageHR"),
+        "max_heartrate": pick("maxHR"),
+        "calories_kcal": pick("calories"),
+        "perceived_exertion": round(rpe / 10) if rpe else None,
+        "gear_name": None,
+        "device_name": None,
+        "polyline": None,
+        "start_lat": pick("startLatitude"),
+        "start_lng": pick("startLongitude"),
+        "splits": _normalize_splits(splits, category) if category in CARDIO_CATEGORIES else [],
+        "meta": meta,
+    }
+
+
+# Converts Garmin's lapDTOs (one per auto-lap, usually 1 km) into exercise.cardio_splits
+# rows. Laps missing distance or time are skipped — those columns are NOT NULL.
+# Inputs: /splits response, routing category (for the cadence unit).
+# Outputs: list of split dicts keyed by column name, in lap order.
+def _normalize_splits(splits: dict | None, category: str) -> list[dict]:
+    rows = []
+    for index, lap in enumerate((splits or {}).get("lapDTOs") or [], start=1):
+        distance = lap.get("distance")
+        elapsed = lap.get("elapsedDuration") or lap.get("duration")
+        if distance is None or elapsed is None:
+            log_event(logger, logging.WARNING, "garmin_split_incomplete_lap_skipped",
+                      lap_index=index, has_distance=distance is not None,
+                      has_elapsed=elapsed is not None)
+            continue
+        moving = lap.get("movingDuration")
+        gain = lap.get("elevationGain")
+        loss = lap.get("elevationLoss")
+        rows.append({
+            "lap_index": index,
+            "distance_m": distance,
+            "elapsed_seconds": round(elapsed),
+            "moving_seconds": round(moving) if moving is not None else None,
+            "average_speed_mps": lap.get("averageSpeed"),
+            "max_speed_mps": lap.get("maxSpeed"),
+            "average_cadence": _cadence(category, lap),
+            "average_heartrate": lap.get("averageHR"),
+            "max_heartrate": lap.get("maxHR"),
+            "elevation_gain_m": gain,
+            "elevation_difference_m": gain - loss if gain is not None and loss is not None else None,
+            "grade_adjusted_speed_mps": lap.get("avgGradeAdjustedSpeed"),
+            "pace_zone": None,
+        })
+    return rows
+
+
+# Cadence in the unit the exercise tables store. Garmin reports run and walk cadence as
+# steps per minute (both feet); the stored value is the one-foot count, so it is halved.
+# Ride cadence is pedal rpm, swim cadence strokes per minute. Other activities have none.
+# Inputs: routing category, then the dicts to read in order (detail, list entry or a lap).
+def _cadence(category: str, *sources: dict) -> float | None:
+    keys = {
+        "run": ("averageRunCadence", "averageRunningCadenceInStepsPerMinute"),
+        "walk": ("averageRunCadence", "averageRunningCadenceInStepsPerMinute"),
+        "ride": ("averageBikeCadence", "averageBikingCadenceInRevPerMinute"),
+        "swim": ("averageSwimCadence", "averageSwimCadenceInStrokesPerMinute"),
+    }.get(category, ())
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value:
+                return round(value / 2, 1) if category in ("run", "walk") else value
+    return None
+
+
+# The IANA zone the activity was recorded in, from the detail's timeZoneUnitDTO. Falls back
+# to where B was at the time (system.timezone), then Asia/Singapore.
+def _timezone_name(summary: dict, started_at: datetime) -> str:
+    zone = summary.get("timeZoneUnitDTO") or {}
+    for name in (zone.get("timeZone"), zone.get("unitKey")):
+        if not name:
             continue
         try:
-            garmin_start = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
+            ZoneInfo(name)
+            return name
+        except Exception:
             continue
-        delta = abs(garmin_start - strava_start_dt)
-        if delta < best_delta:
-            best_delta = delta
-            best = activity
-
-    return best
+    return str(get_timezone(started_at))
 
 
-# Fetches full activity detail, exercise sets, and HR time series for one Garmin activity.
-# Makes three API calls: activity summary, exercise sets, and second-by-second details.
-# Inputs: logged-in Garmin client, Garmin activityId integer.
-# Outputs: (summary dict, exercise_sets list, hr_samples list).
-#   hr_samples: list of (timestamp_ms, hr_bpm) tuples sorted by time. Empty if unavailable.
-def fetch_garmin_detail(client, garmin_activity_id: int) -> tuple[dict, list, list]:
-    summary = client.connectapi(
-        f"/activity-service/activity/{garmin_activity_id}"
-    ) or {}
-
+# Fetches the raw exercise sets for one activity. Returns [] when there are none or the
+# call fails (logged) — the caller treats that as "sets not synced yet".
+def _fetch_exercise_sets(client, garmin_activity_id: int) -> list:
     try:
-        sets_response = client.connectapi(
-            f"/activity-service/activity/{garmin_activity_id}/exerciseSets"
-        )
-        if isinstance(sets_response, list):
-            exercise_sets = sets_response
-        elif isinstance(sets_response, dict):
-            exercise_sets = sets_response.get("exerciseSets", [])
-        else:
-            exercise_sets = []
+        response = client.connectapi(f"/activity-service/activity/{garmin_activity_id}/exerciseSets")
     except Exception as e:
         log_failure(logger, logging.WARNING, "garmin_exercise_sets_fetch_failed", e,
                     garmin_activity_id=garmin_activity_id)
-        exercise_sets = []
-
-    hr_samples = _fetch_activity_hr(client, garmin_activity_id)
-
-    return summary, exercise_sets, hr_samples
+        return []
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        return response.get("exerciseSets") or []
+    return []
 
 
 # Fetches the second-by-second HR time series from the activity details endpoint.
@@ -385,27 +464,51 @@ def _fetch_activity_hr(client, garmin_activity_id: int) -> list[tuple[float, flo
         return []
 
 
-# Inserts one row into system.garmin_inbound and returns the new garmin_inbound_id.
-# Inputs: Garmin activityId, full payload dict, strava_inbound_id for traceability.
-# Outputs: garmin_inbound_id of the inserted row.
-def _store_garmin_inbound(
-    object_id: int, payload: dict, strava_inbound_id: int
-) -> int:
+# When this activity was first fetched, from system.garmin_inbound; None if never.
+# Used to bound how long a strength session waits for its sets.
+def _first_fetch_at(garmin_activity_id: int) -> datetime | None:
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO system.garmin_inbound
-                        (object_id, payload, source, strava_inbound_id)
-                    VALUES (%s, %s, 'strava_trigger', %s)
-                    RETURNING garmin_inbound_id
-                    """,
-                    (object_id, json.dumps(payload), strava_inbound_id),
+                    "SELECT min(received_at) FROM system.garmin_inbound WHERE object_id = %s",
+                    (garmin_activity_id,),
                 )
                 return cur.fetchone()[0]
     finally:
         conn.close()
 
 
+# Inserts one row into system.garmin_inbound and returns the new garmin_inbound_id.
+# Inputs: Garmin activityId, the payload fetched for it, and why it was fetched.
+# Outputs: garmin_inbound_id of the inserted row.
+def _store_garmin_inbound(object_id: int, payload: dict, source: str) -> int:
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO system.garmin_inbound (object_id, payload, source)
+                    VALUES (%s, %s, %s)
+                    RETURNING garmin_inbound_id
+                    """,
+                    (object_id, json.dumps(payload), source),
+                )
+                return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+# Sends one proactive confirmation to B's chat and logs it to system.telegram_outbound.
+# A missing chat id or a failed send is logged; the saved row is unaffected.
+def _send_confirmation(text: str, garmin_activity_id) -> None:
+    chat_id = get_latest_chat_id()
+    if chat_id is None:
+        log_event(logger, logging.WARNING, "garmin_no_chat_id",
+                  garmin_activity_id=garmin_activity_id)
+        return
+    message_id = send_logged(chat_id, text)
+    log_event(logger, logging.INFO, "garmin_notification_sent",
+              garmin_activity_id=garmin_activity_id, chat_id=chat_id, message_id=message_id)

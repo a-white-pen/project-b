@@ -35,7 +35,7 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 | Sleep/wake | Logs sleep and wake events from commands or natural phrases, coordinates with attention sessions, and anchors each nutrition day from wake to next wake. |
 | Location | Stores location updates and resolves the timezone used by the other domains. Planner behaviour can switch between Bangkok and Singapore from one configuration value. |
 | Attention | Tracks one active session at a time across a two-level taxonomy, supports compound finish/start messages and quoted corrections, and reports the waking day's time allocation. |
-| Exercise | Receives Strava activity events. Cardio and other activities are stored directly; strength activities trigger a Garmin Connect fetch for exercises, sets, loads, and heart-rate data. |
+| Exercise | Checks Garmin Connect for new activities when Strava's webhook says one has landed, and on `/sync_garmin`. Cardio, strength (with exercises, sets, loads, and heart-rate data), and other activities are stored and confirmed on Telegram. Photos added in Garmin are copied to the site's media bucket for its Fitness card, and workouts deleted in Garmin are removed. |
 | Aligner | Tracks Invisalign IN/OUT wear, rolling wear time, and independent upper/lower tray timelines through Telegram buttons and quoted corrections. |
 | Expense | Logs spending from text, voice, receipts, payment screenshots, and photo albums. Stores original currency, resolves supported SGD conversions, and supports threaded corrections and deletion. |
 | Health planner | Builds a rolling week around actual training and pinned days, plans meals toward fixed calorie and protein ranges, generates run and strength details, pushes supported workouts to Garmin, and writes a weekly reflection. |
@@ -76,7 +76,7 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 
 ```
 telegram/    Telegram protocol — receive updates, route messages, send replies
-inbound/     External activity and menu ingestion — Strava, Garmin, restaurant sources
+inbound/     External activity and menu ingestion — Garmin, restaurant sources
 domains/     Input-agnostic business logic for each domain
 api/         Public read APIs and authenticated internal job endpoints
 outbound/    Effects to non-Telegram destinations — future reminders and calendar actions

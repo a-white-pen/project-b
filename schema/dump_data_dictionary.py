@@ -7,9 +7,8 @@ Functions:
   dump_data_dictionary()  — connects to the DB, queries all table/column metadata
                             and comments, writes data_dictionary.md
 
-Includes both tables (relkind='r') and views (relkind='v'). Views have their SQL definition
-emitted before the column table so runtime dependencies (e.g. b.latest_location used by the
-food service for timezone resolution) are visible in the schema reference.
+Includes both tables (relkind='r') and views (relkind='v'). A view is described by its comment
+and columns, not its SQL: the definitions live in the database.
 """
 
 import os
@@ -42,21 +41,6 @@ WHERE
     AND NOT a.attisdropped
 ORDER BY
     n.nspname, c.relkind DESC, c.relname, a.attnum
-"""
-
-# Fetches the SQL definition for every view so readers can see what each view computes.
-VIEW_DEF_QUERY = """
-SELECT
-    n.nspname  AS schema,
-    c.relname  AS view_name,
-    pg_get_viewdef(c.oid, true) AS definition
-FROM
-    pg_catalog.pg_class     c
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE
-    c.relkind = 'v'
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-ORDER BY n.nspname, c.relname
 """
 
 _PRIVATE_SKIPLIST_FILE = os.path.join(os.path.dirname(__file__), "private_relations.txt")
@@ -97,8 +81,8 @@ def build_contents(schemas: dict[str, dict[str, dict]]) -> list[str]:
     return lines
 
 
+# Connects using DATABASE_URL from environment, writes data_dictionary.md.
 def dump_data_dictionary():
-    # Connects using DATABASE_URL from environment, writes data_dictionary.md.
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         print("ERROR: DATABASE_URL not set", file=sys.stderr)
@@ -109,11 +93,6 @@ def dump_data_dictionary():
 
     cur.execute(QUERY)
     rows = cur.fetchall()
-
-    cur.execute(VIEW_DEF_QUERY)
-    view_defs: dict[tuple[str, str], str] = {
-        (schema, view): defn for schema, view, defn in cur.fetchall()
-    }
 
     conn.close()
 
@@ -153,12 +132,6 @@ def dump_data_dictionary():
                 lines.append(f"{meta['comment']}\n")
             if is_view:
                 view_count += 1
-                defn = view_defs.get((schema_name, rel_name), "")
-                if defn:
-                    lines.append("\n**View definition:**\n")
-                    lines.append("```sql\n")
-                    lines.append(defn.strip() + "\n")
-                    lines.append("```\n")
             else:
                 table_count += 1
             lines.append("\n| Column | Type | Nullable | Default | Notes |\n")

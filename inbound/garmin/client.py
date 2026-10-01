@@ -10,8 +10,10 @@ Auth flow:
   - di_token (~18h) is refreshed automatically via a plain POST to diauth.garmin.com
     — no Cloudflare bypass needed for refresh.
   - di_refresh_token rotates on each use (~30d lifetime). Refreshed token is
-    written back to system.garmin_tokens.
-  - Re-bootstrap needed only if refresh_token expires (no extraction for 30+ days).
+    written back to system.garmin_tokens. Refreshes are serialized across processes
+    with a Postgres advisory lock (see GarminApiClient._refresh_token).
+  - Re-bootstrap needed only if refresh_token expires (no Garmin call for 30+ days;
+    every workout's sync and the planner's pushes keep it in use).
 
 Token blob format in system.garmin_tokens:
   {
@@ -66,8 +68,10 @@ class GarminApiClient:
 
     Exposes .connectapi(path, params=None) (GET) to match the garth interface used
     by processor.py, plus .connectapi_post(path, payload) and .connectapi_delete(path)
-    for the workout uploaders (strength + run push). Automatically refreshes the
-    di_token on 401 and retries once, across all three verbs.
+    for the workout uploaders (strength + run push), .connectapi_put(path, payload)
+    for editing an activity's name and description, and .connectapi_upload(...) for
+    adding a photo to an activity. Automatically refreshes the di_token on 401 and
+    retries once, across every call.
     """
 
     # Initialises the client with DI OAuth2 credentials and a shared httpx session.
@@ -134,8 +138,55 @@ class GarminApiClient:
             return None
         return resp.json()
 
+    # PUTs a JSON body to connectapi.garmin.com{path}; mirrors connectapi_post(). Used to edit an
+    # activity the way the Garmin Connect app does: PUT /activity-service/activity/{id} with only
+    # the fields being changed, e.g. {"activityId": id, "activityName": "..."}.
+    def connectapi_put(self, path: str, payload: dict | None = None, **kwargs):
+        url = f"{CONNECTAPI_BASE}{path}"
+
+        def _put():
+            headers = {
+                "Authorization": f"Bearer {self.di_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            return self._session.put(url, json=payload, headers=headers, **kwargs)
+
+        resp = _put()
+        if resp.status_code == 401:
+            log_event(logger, logging.INFO, "garmin_di_token_expired_refreshing")
+            self._refresh_token()
+            resp = _put()
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.text.strip():
+            return None
+        return resp.json()
+
+    # POSTs one file as multipart form data (field "file") to connectapi.garmin.com{path}; otherwise
+    # mirrors connectapi_post(). Used to add a photo to an activity the way the Garmin Connect app
+    # does: POST /activity-service/activity/{id}/image.
+    # Inputs: path, the file's name, its bytes and its media type.
+    def connectapi_upload(self, path: str, filename: str, content: bytes, content_type: str, **kwargs):
+        url = f"{CONNECTAPI_BASE}{path}"
+
+        def _upload():
+            headers = {"Authorization": f"Bearer {self.di_token}", "Accept": "application/json"}
+            return self._session.post(url, files={"file": (filename, content, content_type)},
+                                      headers=headers, **kwargs)
+
+        resp = _upload()
+        if resp.status_code == 401:
+            log_event(logger, logging.INFO, "garmin_di_token_expired_refreshing")
+            self._refresh_token()
+            resp = _upload()
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.text.strip():
+            return None
+        return resp.json()
+
     # DELETEs connectapi.garmin.com{path}. Mirrors connectapi() including the 401 refresh-and-retry-once
-    # behaviour. Used to remove a resource, e.g. DELETE /workout-service/workout/{id}.
+    # behaviour. Used to remove a resource, e.g. DELETE /workout-service/workout/{id}, or a photo:
+    # DELETE /activity-service/activity/{id}/image/{imageId}.
     def connectapi_delete(self, path: str, **kwargs):
         url = f"{CONNECTAPI_BASE}{path}"
 
@@ -153,10 +204,34 @@ class GarminApiClient:
             return None
         return resp.json()
 
+    # Refreshes di_token, serialized across processes with an advisory lock: the refresh
+    # token rotates on every use, so two jobs refreshing at once (the activity sync, the
+    # sleep sync, a planner push) would leave one holding a spent token. A job that waited
+    # on the lock adopts the tokens the other just saved instead of refreshing again.
+    def _refresh_token(self) -> None:
+        conn = get_connection()
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_lock(hashtext('system.garmin_tokens'))")
+            try:
+                stored = _load_token_blob() or {}
+                if stored.get("di_token") and stored["di_token"] != self.di_token:
+                    self.di_token = stored["di_token"]
+                    self.di_refresh_token = stored.get("di_refresh_token", self.di_refresh_token)
+                    log_event(logger, logging.INFO, "garmin_di_token_reloaded")
+                    return
+                self._request_new_token()
+            finally:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(hashtext('system.garmin_tokens'))")
+        finally:
+            conn.close()
+
     # Refreshes di_token using di_refresh_token via a standard OAuth2 refresh grant.
     # No Cloudflare bypass needed — diauth.garmin.com is not behind the SSO WAF.
     # Rotates both tokens and persists back to system.garmin_tokens.
-    def _refresh_token(self) -> None:
+    def _request_new_token(self) -> None:
         basic = "Basic " + base64.b64encode(f"{self.di_client_id}:".encode()).decode()
         resp = httpx.post(
             DI_TOKEN_URL,

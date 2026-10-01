@@ -7,7 +7,7 @@ Telegram is the interface — B sends messages, the bot replies, and will eventu
 | Folder | Responsibility |
 |---|---|
 | `telegram/` | Everything Telegram — receive updates, route to domains, send replies |
-| `inbound/` | Push-based webhooks and triggered fetches from external services. Each source is a subfolder with `processor.py` (fetch + persist logic). Strava has a `webhook.py` (routes); Garmin has no webhook — it is triggered by the Strava processor when a strength activity lands. |
+| `inbound/` | Webhooks and scheduled fetches from external services. Each source is a subfolder with `processor.py` (fetch + persist logic). Garmin has `sync.py` (the activity sync and what starts it) and `photos.py` (copies workout photos to R2); Strava has `webhook.py` (the doorbell that starts a Garmin check); menus have `runner.py`; `strava_export/importer.py` is the one-off Strava history import. |
 | `domains/` | Business logic per event type; knows nothing about how data arrived |
 | `api/` | Public read APIs — one file per audience/purpose. `limiter.py` holds the shared slowapi instance. Current: `data_visualisation.py`. Future: `nutrition_external.py`, `location.py`. |
 | `outbound/` | Effects to non-Telegram destinations (reminders, calendar — future) |
@@ -40,47 +40,67 @@ Telegram servers
 
 **Deterministic recording taps:** the aligner domain docks a persistent reply keyboard (`🦷 IN` / `🍽️ OUT`). Taps arrive as plain TEXT whose exact labels `router.py` matches in `_BUTTON_MAP` — *before* the LLM classifier, alongside slash commands — and dispatches to `domains/aligner/service.py`. These handlers return an optional third tuple element (a `reply_markup` dict) that `webhook.py` passes to `send_reply` to keep the keyboard docked; all other domains return the usual `(reply, state)` and get no `reply_markup`. Routing priority: `callback_query → location → slash command → aligner button → voice transcription → quoted correction → LLM classifier`.
 
-### Flow 2 — Strava activity dispatch (three destinations)
+### Flow 2 — Garmin activity sync (three destinations)
 
-`inbound/strava/processor.process_activity_event` calls `domains.exercise.service.save_strava_activity` — the single dispatcher used by both the live webhook and the historical backfill. It classifies the Strava `sport_type` and writes to the right table (cardio or other), then sweeps sibling exercise tables AFTER the successful save so the activity lives in exactly one family (handles Strava re-tag scenarios). For `strength`, it returns without writing or sweeping — the processor itself handles the Garmin orchestration because only the processor has the `aspect_type` context needed to distinguish a benign update from a re-tag.
+Garmin cannot push to a personal app, so `inbound/garmin/sync.py` asks it. Two things start a check:
 
-| sport_type | Category returned | Destination | Sweep timing |
-|---|---|---|---|
-| Run / TrailRun / VirtualRun / Treadmill | `run` | `exercise.cardio_activities` + `exercise.cardio_splits` | post-save in `save_strava_activity` |
-| Walk / Hike | `walk` | same | post-save |
-| Ride / VirtualRide / EBikeRide / MountainBikeRide / GravelRide / Velomobile | `ride` | same | post-save |
-| Swim / OpenWaterSwim | `swim` | same | post-save |
-| WeightTraining / Workout / Crossfit | `strength` | handed off to Garmin (see below); no row written from `save_strava_activity` itself | post-fetch in `process_activity_event`, only if `strength_session_exists` returns True afterwards |
-| Everything else (Yoga, Pilates, RockClimbing, future Strava types) | `other` | `exercise.other_exercises` | post-save |
+- **Strava's webhook, the doorbell.** Garmin passes every workout on to Strava, and Strava still posts to `POST /strava/webhook` (`inbound/strava/webhook.py`) when one arrives. Reading the activity from Strava's API now needs a paid subscription (403 since 30 Sep 2026), so the event is only a signal: an activity `create` for B's athlete id (`STRAVA_OWNER_ID`) calls `ring_doorbell`, which checks Garmin in a background thread. One check normally does it, since Garmin had the workout before Strava did; it checks again a minute later while strength sets are still processing or a check failed or was busy, for ten minutes at most. One loop runs at a time, so a burst of posts costs at most one Garmin call a minute. Updates, deletes and other athletes' events are ignored, and nothing is read from Strava or stored. The subscription was registered while Strava's API was free, and Strava keeps delivering to it.
+- **`/sync_garmin`.** One check inside the command, then a short reply: how many workouts and photos were new, how many deleted workouts were removed, or nothing new.
 
-**Sweep-after-save discipline:** sibling sweeps run only after the destination row is confirmed to exist. A save failure (DB error, Garmin no-match, empty exercise sets) leaves the pre-existing row in the old sibling table untouched — better a recoverable duplicate than data loss, since the Strava webhook returns 200 OK before this code runs and Strava will not retry.
+Every check takes the same non-blocking advisory lock (an overlapping check returns `busy`), lists B's 20 newest Garmin activities, and hands every one not yet recorded to `inbound/garmin/processor.process_activity`, oldest first. The next check retries whatever was not saved. `system.garmin_inbound.source` records which trigger fetched each payload (`strava_trigger`, `command`; `manual` for a check run by hand).
 
-**Strength sub-flow:** when category is `strength`, the processor first checks `strength_session_exists(activity_id)`. If the row already exists AND `aspect_type` is `update`, this is a benign Strava-side edit (name, RPE) — skip the Garmin re-fetch to avoid duplicate raw inbound rows. Otherwise (CREATE or re-tag from another family) hand off to Garmin, then re-check `strength_session_exists` after the call. Sibling sweep runs only on the post-fetch check.
+There is no scheduled check. The doorbell runs in a background thread after its request returns, so it relies on the service keeping CPU between requests (`--no-cpu-throttling`, already required by the menu refresh — see `inbound/menus/AGENTS.md`); that same setting is why polling Garmin every few minutes would keep the instance running, and billed, around the clock. A workout Strava never pings about is recorded by the next check: `/sync_garmin`, or `inbound/garmin/backfill.py` run by hand.
+
+**Already recorded** means an exercise row carries the Garmin id (`source_app='garmin'`, `source_activity_id`), or a cardio/other row from another source (the Strava rows from before this sync) starts within 2 minutes. Strength rows have always carried the Garmin id. Renames made in Garmin Connect are copied to rows the sync created.
+
+**Deletions:** a workout B deletes in Garmin Connect is removed by the next check. A recorded workout (`source_app='garmin'`) counts as deleted when it is missing from the list the check fetched **and** Garmin answers 404 for it. Only the newest recorded workouts are compared: those that started at or after the oldest listed one, or the 20 newest when Garmin listed fewer than 20 (the list is then all there is). The row goes with its splits or sets; its raw payload stays in `system.garmin_inbound`, and its photos stay in R2. Then `week_planner.reconcile` runs, which reopens a plan the workout had completed (done by another workout that day, else planned or skipped) and removes an unplanned record made only for it, taking its kind off the day's plan. More than five at once looks like a Garmin fault, so none are removed and `/sync_garmin` says so. A deletion that fails is tried again by the next check and never fails the check.
+
+**Photos:** every check ends by copying the photos B added in Garmin Connect (`inbound/garmin/photos.py`). For the ten newest workouts the sync recorded, it reads Garmin's photo list and copies each photo not copied yet to the R2 media bucket — the original byte-for-byte plus a 600 px WebP display copy, at `media.awhitepen.com/activities/garmin/<garmin id>/<image id>` — then lists them on the row as `meta.presentation` (`"source": "garmin"`), in Garmin's order. The Fitness card shows the first. A photo removed in Garmin drops off the list (its R2 copy stays), and rows showing the Strava export's presentation are left alone. Garmin does not say when a photo is added, so a photo added after the workout's check is copied by the next one — `/sync_garmin`. A photo that fails to copy is tried again by the next check and never fails the check. Needs `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` (Secret Manager); without them no photo is copied.
+
+**Confirmations:** only activities that started in the last 24 hours get the Telegram message and planner nudge. Older ones — a watch that synced days late, or the backlog on the first run — are recorded silently. Every insert is `ON CONFLICT (source_app, source_activity_id) DO NOTHING`, and a message is sent only when the insert created the row, so a repeat can never double-send.
+
+`process_activity` maps the Garmin `activityType.typeKey` onto the existing `sport_type` vocabulary (`running` → Run, `treadmill_running` → Run + `is_treadmill`, `strength_training` → WeightTraining, `indoor_cardio` → Workout, unknown keys → CamelCase, e.g. `tai_chi` → TaiChi), then `domains.exercise.service.classify_activity` routes it:
+
+| sport_type | Category | Destination |
+|---|---|---|
+| Run / TrailRun / VirtualRun / Treadmill | `run` | `exercise.cardio_activities` + `exercise.cardio_splits` (Garmin laps) |
+| Walk / Hike | `walk` | same |
+| Ride / VirtualRide / EBikeRide / MountainBikeRide / GravelRide / Velomobile | `ride` | same |
+| Swim / OpenWaterSwim | `swim` | same |
+| WeightTraining / Workout / Crossfit | `strength` | `exercise.strength_sessions` + `exercise.strength_sets` when Garmin has exercise sets; a Workout without sets is saved as `other` |
+| Everything else (Yoga, Pilates, RockClimbing, unknown types) | `other` | `exercise.other_exercises` |
+
+Meditation and breathwork are not exercise and are skipped.
+
+**Strength sub-flow:** Garmin often lists a strength session before its sets are processed. A `strength_training` session with no active sets is left for the next run; its first fetch is stored in `system.garmin_inbound`, and 30 minutes after that it is saved without sets.
 
 ```
-Strava webhook
-  → POST /strava/webhook
-  → inbound/strava/processor.py
-      → save_strava_activity() returns (False, "strength") — no row written, no sweep
-      → if aspect_type=update AND strength_session_exists → log + return (benign update)
-      → inbound/garmin/processor.process_strength_event() [background, same thread]
-          → inbound/garmin/client.get_garmin_client()
-              → system.garmin_tokens          hydrate session (or login fresh + persist)
-          → Garmin Connect API               fetch activity list, match by start_time ±120s
-          → Garmin Connect API               get_activity() + get_activity_exercise_sets()
-          → system.garmin_inbound            store raw payload
-          → retries at +90s / +240s / +600s  if Garmin hasn't synced yet
-          → exercise.strength_sessions + exercise.strength_sets  if exercise_sets non-empty
-          → telegram/replies.py    proactive notification with per-exercise set tables + per-set HR
-      → if strength_session_exists post-fetch → ensure_single_exercise_family(keep="strength")
-          (re-tag cleanup; failed Garmin save leaves old cardio/other row in place)
+Strava webhook (new activity) → inbound/strava/webhook.py → sync.ring_doorbell
+                                 (background: one check, more while anything is pending)
+B sends /sync_garmin          → telegram/router.py  → sync.handle_sync_command
+  → one check                                    inbound/garmin/sync.py
+      → pg_try_advisory_lock                     one check at a time
+      → inbound/garmin/client.get_garmin_client()
+          → system.garmin_tokens                 DI token; refreshed under an advisory lock
+      → Garmin Connect API                       20 newest activities
+      → skip recorded (Garmin id / Strava-era start ±2 min)
+      → inbound/garmin/processor.process_activity(), oldest first
+          → Garmin Connect API                   detail (+ laps for cardio, sets + HR for strength)
+          → system.garmin_inbound                raw payload (source = strava_trigger / command)
+          → exercise.* row                       insert, no-op if already there
+          → telegram/replies.py                  confirmation (only if new and started < 24h ago)
+          → week_planner.activity_nudge          reconcile the day + tally nudge (cardio, strength)
+      → remove_deleted_activities()             missing from the list + Garmin 404 → row deleted
+          → week_planner.reconcile               reopen the plan it completed
+      → inbound/garmin/photos.sync_photos()      10 newest recorded workouts
+          → Garmin Connect API                   each one's photo list
+          → R2 (media.awhitepen.com)             new photos: original + 600 px WebP
+          → exercise.* meta.presentation         photo list, in Garmin's order
 ```
 
-No new webhook route needed — Garmin is polled in response to the Strava trigger.
+`inbound/garmin/backfill.py --since YYYY-MM-DD [--apply]` runs the same path over a date range with no confirmations (dry run by default).
 
-**Other sub-flow:** when category is `other`, `save_strava_activity` calls `save_other_exercise` (idempotent upsert via UNIQUE on `strava_activity_id`); on successful save, sweeps sibling tables; then the processor falls through to the same cardio notification path. No splits/sets sub-table; type-specific extras live in `meta`. The table is source-agnostic (same shape as `strength_sessions`) so future non-Strava ingestion plugs in without schema change.
-
-**Delete dispatch:** `process_delete_event` tries `delete_cardio_activity`, `delete_strength_session`, and `delete_other_exercise` — whichever finds a row deletes it. Strava doesn't tell us which family the deleted activity belonged to.
+**Strava-era presentation:** what only Strava had — B's titles, descriptions, photos and videos — lives on the matching exercise row as `meta.presentation`, written by `inbound/strava_export/importer.py` from the Strava data export. It matches by Strava id, else one row starting within 2 minutes of the same kind and duration; ambiguous cases are reported, never guessed. Dry run by default; `--apply` saves a backup first and `restore` undoes it. Its separate `garmin` command copies the Strava titles, descriptions and photos onto the Garmin activities themselves, through the same calls the Garmin Connect app makes (Garmin takes photos, not videos). Photos go only to an activity with none on Garmin, so a re-run never doubles them; each change is re-read and the run stops if anything else changed. It has its own backup, which records each photo's Garmin id as it lands, and the same `restore` takes those photos off again. Media is served from R2 (`media.awhitepen.com/activities/strava/<strava id>/`), and the importer writes a URL only once it answers 200. The site's Fitness card (`/api/data-visualisation/fitness`) shows `presentation.title` and the first photo's 600 px display copy.
 
 ### Flow 3 — Expense logging (text / voice / photo / album)
 
@@ -133,7 +153,8 @@ Cloud Tasks
 ```
 data_visualisation.* are live VIEWS over b.* / finances / nutrition — no snapshot tables,
 no refresh job. The public read endpoints query them directly; each view applies a
-15-minute publication lag.
+15-minute publication lag, except the footer's Fitness feed (fitness_activity_visualisation),
+which is live.
 
 Legacy (transitional): the /nutrition read route remains alongside its replacement
 /nutrition-new (same shape, same view) and will be retired once the dashboard moves over.
@@ -187,7 +208,7 @@ The health planner (`domains/health_agent/`) turns B's goals and actuals into a 
 ```
 health_agent.daily_plan        SPINE — 1 row/planned day: activity_type[] + meal_plan_provider (shop) + macro_target
    ├─ exercise.strength_plan   1/day  ↔ exercise.strength_sessions   (Garmin actuals)
-   ├─ exercise.cardio_plan     1/day  ↔ exercise.cardio_activities   (Strava actuals)
+   ├─ exercise.cardio_plan     1/day  ↔ exercise.cardio_activities   (Garmin actuals)
    └─ nutrition.meal_plan      lunch+dinner  →  nutrition.food_log    (consumed)
 health_agent.weekly_reflections  1/ISO week — narrative + carry-forward directives
 ```
@@ -229,7 +250,7 @@ health_agent.weekly_reflections  1/ISO week — narrative + carry-forward direct
 - Body weight does not influence meals, the week scaffold, strength planning, or calorie targets. The weekly reflection only shows the current 7-day average against the **54–56 kg reference band**; it does not calculate a trend, maintenance estimate, or cut/hold/gain direction.
 - `weekly_reflections` now stores narrative + carry-forward directives only. Its three nullable calibration columns remain in the live schema until the separate database cleanup is applied.
 
-**Reconcile — tally follows reality** (`week_planner/reconcile.py`): each past planned day is matched to actuals on its local date — a same-kind actual → `done` + link; none by 22:00 → `skipped`. The weekly 2+2 tally counts **actual sessions by kind, planned or not** (an unplanned run still counts; a planned strength done as cardio = strength skipped + cardio counted). It drives the next scaffold's remaining-session count.
+**Reconcile — tally follows reality** (`week_planner/reconcile.py`): each past planned day is matched to actuals on its local date — a same-kind actual → `done` + link; none by 22:00 → `skipped`. A linked workout that has since been deleted (in Garmin, or by hand) is undone first: its `done` plan is planned again and re-matched, and an `unplanned` record made for it is removed, with its kind taken off the day's plan (a day left empty is a rest day again). The weekly 2+2 tally counts **actual sessions by kind, planned or not** (an unplanned run still counts; a planned strength done as cardio = strength skipped + cardio counted). It drives the next scaffold's remaining-session count.
 
 **✓ Ate buttons** (`meal_planner/completion.py`): a tap posts the planned item(s) into `nutrition.food_log` through the food module's own pipeline (so the confirmation card, macro gap-fill, and quoted corrections are identical to a normal food log — editable + deletable), marks the slot `ate`, and edits the pinned card to drop that row. Each home staple has its OWN button and posts that staple alone. Idempotent (a server-side guard refuses a repeat); no Skip button.
 
