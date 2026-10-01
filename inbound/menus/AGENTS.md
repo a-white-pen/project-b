@@ -65,7 +65,9 @@ gcloud run services update project-b --region=asia-southeast1 --max-instances=1 
 ```
 
 Do not remove `--max-instances=1` without replacing the lock with a DB advisory lock or Cloud Tasks
-de-duplication. Do not remove `--no-cpu-throttling` without moving the scrape to a Cloud Run Job.
+de-duplication. Do not remove `--no-cpu-throttling` without moving the scrape to a Cloud Run Job. The Garmin
+doorbell (`inbound/garmin/sync.py`) also runs in a background thread after its request and relies
+on the same flag.
 
 ### 7. No new dependencies without asking B
 Current scraper dependencies beyond stdlib: `httpx`, `beautifulsoup4`, `lxml`,

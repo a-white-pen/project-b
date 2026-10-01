@@ -17,6 +17,8 @@ dependencies = [
     "matplotlib>=3.8",        # day-of strength PNG card (render.py)
     "fit-tool>=0.9.13",       # day-of strength .fit encoding (fit.py)
     "garmin-fit-sdk>=21.141", # .fit validation (fit.py)
+    "boto3>=1.35",            # Garmin photos to R2 (inbound/garmin/photos.py)
+    "pillow>=10.0",           # photo display copies (inbound/garmin/photos.py)
 ]
 
 [tool.pytest.ini_options]

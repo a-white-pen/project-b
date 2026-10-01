@@ -1,8 +1,9 @@
 """
 Public read API for the awhitepen.com status dashboards.
 
-One endpoint per tab: /today, /body, /fuel, /resources. Each runs its tab's
-statements on a single connection and returns {"refreshed_at", "data"}.
+One endpoint per tab: /today, /body, /fuel, /resources, plus /fitness for the
+site footer's Fitness card. Each runs its statements on a single connection and
+returns {"refreshed_at", "data"}.
 
 Two rules shape this file. Anything expressible in SQL belongs in the view, so
 the functions here only rename columns and serialize types. And a tab is sent
@@ -10,12 +11,12 @@ only what it draws — a field nothing renders is a field that should not leave
 the database.
 
 Functions:
-  register_routes(app)        — mounts the four routes and their rate limits
+  register_routes(app)        — mounts the five routes and their rate limits
   rate_limit_handler(req, e)  — re-adds CORS to slowapi's 429 so a browser can read it
   _get_cors_headers(request)  — builds the shared CORS response headers
   _serve(request, name, fn)   — runs a fetcher, wraps it in the response envelope
   _query(*statements)         — runs statements on one connection, in order
-  _fetch_<tab>()              — one per tab; assembles that tab's payload
+  _fetch_<tab>()              — one per tab (and _fetch_fitness); assembles its payload
   _shape_<view>()             — one per view; column names in, JSON out
 """
 
@@ -161,6 +162,13 @@ _SQL_RESOURCES_WINDOW = """
     FROM data_visualisation.resources_window_visualisation
 """
 
+_SQL_FITNESS = """
+    SELECT name, sport_type, distance_m, moving_seconds, started_at, timezone,
+           url, media_url, profile_url
+    FROM data_visualisation.fitness_activity_visualisation
+    ORDER BY started_at DESC
+"""
+
 
 # Returns the request's Origin when it is allowed, otherwise the production origin.
 # Used to build an explicit Access-Control-Allow-Origin value without a wildcard.
@@ -281,6 +289,16 @@ def register_routes(app: FastAPI) -> None:
     @limiter.limit("1000/day", key_func=_bucket("resources"))
     async def get_resources(request: Request) -> JSONResponse:
         return await _serve(request, "resources", _fetch_resources)
+
+    # Called server-side by the WordPress footer, which caches the result for a minute, so
+    # one IP makes every request: the daily cap allows a refetch every minute all day, and
+    # the shared cap covers the live site and B's local copy.
+    @app.get("/api/data-visualisation/fitness", status_code=status.HTTP_200_OK)
+    @limiter.limit("5/minute")
+    @limiter.limit("2000/day")
+    @limiter.limit("4000/day", key_func=_bucket("fitness"))
+    async def get_fitness(request: Request) -> JSONResponse:
+        return await _serve(request, "fitness", _fetch_fitness)
 
 
 # Everything the TODAY tab reads, using one connection. The body cells read the same
@@ -686,3 +704,29 @@ def _shape_resources_window(raw_rows: list[tuple], cols: list[str]) -> dict:
         "record_start": _iso_date(row["record_start"]),
         "window_start": _iso_date(row["window_start"]),
     }
+
+
+# The newest five sessions for the site footer's Fitness card, newest first, and B's
+# Garmin Connect profile for the card's heading link (null until the sync has seen one).
+# distance_m is null for a session without distance; moving_seconds falls back to the
+# elapsed time; timezone is where the session was recorded; url opens it on Garmin
+# Connect (Strava for a Strava-era row not yet linked); media_url is the first photo's
+# display copy (kept from the Strava export, or copied from Garmin), null without a photo.
+def _fetch_fitness() -> dict:
+    [(raw_rows, cols)] = _query(_SQL_FITNESS)
+    activities = []
+    profile_url = None
+    for raw in raw_rows:
+        row = dict(zip(cols, raw))
+        profile_url = profile_url or row["profile_url"]
+        activities.append({
+            "name": row["name"],
+            "sport_type": row["sport_type"],
+            "distance_m": _num(row["distance_m"]),
+            "moving_seconds": row["moving_seconds"],
+            "started_at": _iso_utc(row["started_at"]),
+            "timezone": row["timezone"],
+            "url": row["url"],
+            "media_url": row["media_url"],
+        })
+    return {"activities": activities, "profile_url": profile_url}

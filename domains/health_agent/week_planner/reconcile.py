@@ -1,7 +1,12 @@
 """Matches planned cardio and strength days to completed activities.
 
+A workout deleted after it was matched (in Garmin, which the Garmin sync mirrors, or by hand)
+is undone on the next pass: the plan it completed is open again, and a record made only
+because of it is removed.
+
 Functions:
   plan_reconciliation — decides which plans are done, skipped, or unplanned
+  _reopen_missing — undoes what earlier passes recorded for workouts that are gone
   _read_inputs — reads plans and completed activities for a date range
   _apply — applies reconciliation changes in one transaction
   reconcile_exercise — reads actuals and applies reconciliation changes
@@ -23,6 +28,11 @@ _CUTOFF_HOUR = 22
 _SAT = {
     "cardio": ("exercise.cardio_plan", "completed_cardio_activity_id"),
     "strength": ("exercise.strength_plan", "completed_strength_session_id"),
+}
+# Maps each activity kind to the table and key of its completed activities.
+_ACTUALS = {
+    "cardio": ("exercise.cardio_activities", "cardio_activity_id"),
+    "strength": ("exercise.strength_sessions", "strength_session_id"),
 }
 
 
@@ -52,6 +62,31 @@ def plan_reconciliation(existing: dict, cardio_by_date: dict, strength_by_date: 
                 unplanned.append((kind, date, ids[0]))
 
     return {"done": done, "skipped": skipped, "unplanned": unplanned}
+
+
+# Undoes what an earlier pass recorded for a workout that has since been deleted, using the
+# caller's transaction. A plan it completed is planned again, so this pass marks it done by
+# another workout that day, or skipped. A record made only because of it is removed, and its
+# kind leaves the day's plan (a day left with nothing is a rest day again).
+# Returns the number of plans reopened or removed.
+def _reopen_missing(cur, start, end) -> int:
+    changed = 0
+    for kind, (table, col) in _SAT.items():
+        actual_table, actual_key = _ACTUALS[kind]
+        gone = (f"p.{col} IS NOT NULL AND p.plan_date BETWEEN %s AND %s AND NOT EXISTS "
+                f"(SELECT 1 FROM {actual_table} a WHERE a.{actual_key} = p.{col})")
+        cur.execute(f"UPDATE {table} p SET status='planned', {col}=NULL, updated_at=now() "
+                    f"WHERE p.status='done' AND {gone}", (start, end))
+        changed += cur.rowcount
+        cur.execute(f"DELETE FROM {table} p WHERE p.status='unplanned' AND {gone} "
+                    "RETURNING p.plan_date", (start, end))
+        for (plan_date,) in cur.fetchall():
+            cur.execute(
+                "UPDATE health_agent.daily_plan SET activity_type="
+                "COALESCE(NULLIF(array_remove(activity_type, %s), '{}'), ARRAY['rest']), "
+                "updated_at=now() WHERE plan_date=%s", (kind, plan_date))
+            changed += 1
+    return changed
 
 
 # Reads plan statuses and completed activities for the date range using the caller's cursor.
@@ -120,7 +155,7 @@ def _apply(cur, decisions: dict) -> None:
 
 
 # Reconciles recent plans and actual activities in one transaction.
-# Returns counts for done, skipped, and unplanned changes.
+# Returns counts for done, skipped, unplanned and reopened changes.
 def reconcile_exercise(now_utc: datetime | None = None, lookback_days: int = 9) -> dict:
     now_utc = now_utc or datetime.now(timezone.utc)
     tz = get_timezone(now_utc)
@@ -132,13 +167,14 @@ def reconcile_exercise(now_utc: datetime | None = None, lookback_days: int = 9) 
     try:
         with conn:
             with conn.cursor() as cur:
+                reopened = _reopen_missing(cur, start, today)
                 existing, cardio_by_date, strength_by_date = _read_inputs(cur, start, today, str(tz))
                 decisions = plan_reconciliation(existing, cardio_by_date, strength_by_date,
                                                 today, cutoff_passed)
                 _apply(cur, decisions)
     finally:
         conn.close()
-    summary = {k: len(v) for k, v in decisions.items()}
+    summary = {**{k: len(v) for k, v in decisions.items()}, "reopened": reopened}
     log_event(logger, logging.INFO, "exercise_reconciled", today=str(today),
               cutoff_passed=cutoff_passed, **summary)
     return summary

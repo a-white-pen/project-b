@@ -2,7 +2,7 @@
 Routes normalized inbound messages to domain handlers based on LLM-classified intent.
 Callback query updates are routed deterministically from callback_data, not via the LLM.
 Slash commands are reserved for administrative or read/status actions (e.g. /refresh_menus,
-/aligner_status, /attention_status) and bypass the LLM — never for data logging.
+/sync_garmin, /aligner_status, /attention_status) and bypass the LLM — never for data logging.
 Free-form messages (text, photo, voice) are classified by the LLM.
 
 Functions:
@@ -62,6 +62,7 @@ from domains.sleep.correction import handle_sleep_wake_correction
 from domains.sleep.service import handle_sleep_log, handle_wake_log
 from domains.weight.correction import handle_weight_correction
 from domains.weight.service import handle_weight_log
+from inbound.garmin.sync import handle_sync_command
 from system.conversation_state import load_state
 from system.llm import (
     MODEL_FLASH,
@@ -93,6 +94,7 @@ class Intent(str, Enum):
     ASK_GENERAL = "ask_general"         # general question — use as an LLM, unrelated to personal data
     CORRECT = "correct"                 # correction to a previously logged item (quoted bot reply)
     REFRESH_MENUS = "refresh_menus"     # trigger full menu scrape across all sources
+    SYNC_GARMIN = "sync_garmin"         # /sync_garmin — check Garmin Connect for new workouts now
     VIEW_WEEK = "view_week"             # /week — read-only weekly plan view (+ Plan Week button)
     PLAN = "plan"                       # /plan — hub: run / strength / meal
     UNKNOWN = "unknown"                 # cannot determine intent
@@ -104,6 +106,7 @@ class Intent(str, Enum):
 # /command@BotName form (used in groups) is handled by stripping the @suffix.
 _COMMAND_MAP: dict[str, Intent] = {
     "/refresh_menus": Intent.REFRESH_MENUS,
+    "/sync_garmin": Intent.SYNC_GARMIN,
     "/aligner_status": Intent.ALIGNER_STATUS,
     "/attention_status": Intent.ATTENTION_STATUS,
     "/week": Intent.VIEW_WEEK,
@@ -561,6 +564,8 @@ def _dispatch(intent: Intent, msg: InboundMessage) -> list[tuple[str, dict | Non
         return [handle_general_ask(msg)]
     if intent == Intent.REFRESH_MENUS:
         return [handle_refresh_menus(msg)]
+    if intent == Intent.SYNC_GARMIN:
+        return [handle_sync_command(msg)]
     if intent == Intent.VIEW_WEEK:
         return handle_week_view(msg)  # already returns list
     if intent == Intent.PLAN:
