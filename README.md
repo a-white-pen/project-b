@@ -1,13 +1,8 @@
 # project-b
 
-A personal data and decision-support system. Built for one person.
+A personal data and decision-support system. Built by B, for B.
 
-Tracks nutrition, body metrics, training, attention, aligner wear, and spending. It turns those records into meal and workout plans, surfaces useful patterns, and automates routine decisions within rules I set — not to automate everything, but to stop spending mental energy on things that have obvious answers if you just look at the data.
-
-B remains the decision-maker. The system recommends, reminds, prioritizes, and automates within approved rules. B sets the goals and constraints, and can override at any time.
-
-This is not a product. No multi-user support. Not open-source.
-
+`B_extended` logs nutrition, body metrics, training, attention, aligner wear, and spending through Telegram. It uses those records to plan meals and workouts within B's goals and constraints. B can correct the records and override the plans.
 <p align="center">
   <a href="https://www.python.org/"><img height="28" alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&amp;logoColor=white"></a>
   <a href="https://fastapi.tiangolo.com/"><img height="28" alt="FastAPI" src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi&amp;logoColor=white"></a>
@@ -24,23 +19,26 @@ This is not a product. No multi-user support. Not open-source.
 
 ---
 
-## What's live
+## Project B in action
 
-Telegram bot (`B_extended`) receives messages and routes them to domain handlers:
+https://github.com/user-attachments/assets/967ae555-33bd-41eb-ad1d-b3762f05d104
+
+---
+
+## What it does
 
 | Domain | What it does |
 |---|---|
 | Food | Logs meals from text, voice, nutrition labels, macro screenshots, and food photos. Preserves user- or label-provided values, uses USDA and Open Food Facts where suitable, and falls back to Gemini estimation. Quoted-reply corrections supported. |
-| Weight | Logs weight from text or voice with range validation. Weight remains a weekly reference only and does not drive calorie targets. |
-| Sleep/wake | Logs sleep and wake events from commands or natural phrases, coordinates with attention sessions, and anchors each nutrition day from wake to next wake. |
+| Weight | Logs weight from text or voice with range validation. |
+| Sleep/wake | Logs sleep and wake events from commands or natural phrases and coordinates with attention sessions. |
 | Location | Stores location updates and resolves the timezone used by the other domains. Planner behaviour can switch between Bangkok and Singapore from one configuration value. |
 | Attention | Tracks one active session at a time across a two-level taxonomy, supports compound finish/start messages and quoted corrections, and reports the waking day's time allocation. |
-| Exercise | Checks Garmin Connect for new activities when Strava's webhook says one has landed, and on `/sync_garmin`. Cardio, strength (with exercises, sets, loads, and heart-rate data), and other activities are stored and confirmed on Telegram. Photos added in Garmin are copied to the site's media bucket for its Fitness card, and workouts deleted in Garmin are removed. |
+| Exercise | Syncs cardio, strength (with exercises, sets, loads, and heart-rate data), and other activities from Garmin Connect. Strava's webhook triggers a check without reading Strava's API; `/sync_garmin` checks manually. Recent activities get a Telegram confirmation. Photos added in Garmin appear on the site's Fitness card, and deleted workouts are removed with their completed plans reopened. |
 | Aligner | Tracks Invisalign IN/OUT wear, rolling wear time, and independent upper/lower tray timelines through Telegram buttons and quoted corrections. |
 | Expense | Logs spending from text, voice, receipts, payment screenshots, and photo albums. Stores original currency, resolves supported SGD conversions, and supports threaded corrections and deletion. |
 | Health planner | Builds a rolling week around actual training and pinned days, plans meals toward fixed calorie and protein ranges, generates run and strength details, pushes supported workouts to Garmin, and writes a weekly reflection. |
-| Menus | Refreshes supported Bangkok restaurant menus on a weekly schedule and uses the current dishes, prices, and nutrition values for meal planning. |
-| Read APIs | Serves rate-limited nutrition, aligner, weight, spend, location, and sleep views for external visualisations. |
+| Menus | Refreshes FitFuel and WongNai menu sources weekly for meal planning. Jones Salad uses a frozen menu batch rather than weekly refreshes. |
 
 ---
 
@@ -49,11 +47,28 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 - `/week` shows the current plan and can rebuild the next eight days around completed sessions and day-specific pins.
 - `/plan` opens the day-of run, strength, and meal planners.
 - Every day targets **1,600–1,700 kcal** and **90–110 g protein**. Fibre is displayed as a soft reference rather than a constraint.
-- Daily nutrition totals run from the first wake on one day to the first wake on the next, with a local 4 a.m. fallback.
+- Meal-planning totals run from the first wake-after-sleep on the plan date to the first on the next date, with a local 4 a.m. fallback.
 - Cloud Scheduler triggers menu refreshes, meal planning, run and strength details, weekly reflections, and the forward weekly scaffold.
-- Meal, exercise, and week cards remain independently pinned in Telegram and can be corrected by replying to the relevant card.
+- Meal, exercise, and week cards use separate Telegram pins. For workout corrections, request a plan through `/plan`, then reply to that card.
+- Each planned dish and home staple has its own logging button, which posts to the food log and supports the same corrections as a normal food entry.
 
-**Still planned:** proactive reminders, richer general questions and natural-language data queries, and additional low-stakes outbound actions.
+---
+
+## AWhitePen Observatory
+
+The rate-limited public read API powers AWhitePen Observatory's dashboard tabs and the site's Fitness card. Each endpoint reads live Postgres views and returns a `{refreshed_at, data}` envelope.
+
+All routes below use the `/api/data-visualisation` prefix:
+
+| Route | What it serves |
+|---|---|
+| `GET /today` | Macro and spend totals since the latest wake (local midnight fallback), location, sleep, attention, latest body readings, and planned/completed training. |
+| `GET /body` | Weight, body composition, aligner status, daily wear, and tray history. |
+| `GET /fuel` | Daily nutrition totals, meal summaries, and overnight fasting windows. |
+| `GET /resources` | Spending by local day, merchant, category, and everyday/one-off bucket. |
+| `GET /fitness` | The five newest workouts, activity links, photos, and a Garmin profile link. |
+
+The views generally apply a 15-minute publication delay; Fitness shows a workout as soon as it is recorded. Responses expose the fields the dashboard uses, without raw Telegram messages, exact coordinates, or private notes.
 
 ---
 
@@ -65,9 +80,10 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 | Interface | Telegram Bot API |
 | App | FastAPI on Cloud Run, webhook-based |
 | Database | Cloud SQL for PostgreSQL 16, `asia-southeast1` |
-| LLM | Gemini through the `google-genai` SDK |
+| LLM | Gemini through the shared `google-genai` client — Flash for logging and extraction, Pro for complex planning |
 | Scheduling | Cloud Scheduler calling authenticated internal endpoints |
-| Background work | FastAPI background tasks |
+| Background work | FastAPI background tasks and a Garmin webhook worker thread |
+| Media | Cloudflare R2 for workout photos and their display copies |
 | Secrets | Google Cloud Secret Manager |
 
 ---
@@ -76,10 +92,9 @@ Telegram bot (`B_extended`) receives messages and routes them to domain handlers
 
 ```
 telegram/    Telegram protocol — receive updates, route messages, send replies
-inbound/     External activity and menu ingestion — Garmin, restaurant sources
+inbound/     External ingestion — Garmin sync, Strava webhook trigger, restaurant menus
 domains/     Input-agnostic business logic for each domain
 api/         Public read APIs and authenticated internal job endpoints
-outbound/    Effects to non-Telegram destinations — future reminders and calendar actions
 system/      Shared database, configuration, LLM, logging, and auth plumbing
 schema/      Generated data dictionary and its dump script
 ```
@@ -88,44 +103,40 @@ schema/      Generated data dictionary and its dump script
 
 ## Local setup
 
+Use Python 3.13 locally to match the deployment Dockerfile. On first setup:
+
 ```bash
-# Python environment
-python3 -m venv .venv && source .venv/bin/activate
+python3.13 -m venv .venv
+source .venv/bin/activate
 pip install -e .
-
-# Environment variables
 cp .env.example .env
-# Fill in values — see .env.example for what's required
+```
 
-# Cloud SQL Auth Proxy (binary is gitignored — install via Homebrew)
-# Connection name: your GCP console → SQL → instance → "Connection name"
+Fill in `.env` using the placeholders in [`.env.example`](.env.example). In a separate terminal, start Cloud SQL Auth Proxy with the instance connection name from Cloud SQL Console; its port must match `DATABASE_URL`:
+
+```bash
 cloud-sql-proxy <PROJECT_ID>:<REGION>:<INSTANCE>
+```
 
-# Run locally
-uvicorn app:app --reload
+Then start the app in the activated environment, explicitly loading `.env`:
+
+```bash
+uvicorn app:app --env-file .env --reload --port 8080
 ```
 
 ---
 
 ## Health check
 
-`GET /health` — confirms the app is running and the database is reachable.
-
-Note: `/healthz` is intercepted by Google Cloud infrastructure — always use `/health`.
+`GET /health` checks the app and database connection. It returns HTTP 200 even when the database is unavailable, so inspect `status` (`ok` or `degraded`) and `db` in the response.
 
 ```bash
-# Production
-curl https://<BOT_URL>/health
-
-# Local (requires proxy running + .env set)
+# Local, with the app and proxy running
 curl http://localhost:8080/health
-```
 
-```json
-{"status": "ok", "db": "ok"}
+# Production, with BOT_URL set to the full HTTPS service URL
+curl "${BOT_URL%/}/health"
 ```
-
-Always returns HTTP 200 — check the `status` field, not the status code.
 
 ---
 
